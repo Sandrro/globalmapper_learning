@@ -1,59 +1,55 @@
+"""Graph neural network models used for generating urban block layouts.
+
+The architecture is based on a variational autoencoder that operates on grid
+graphs.  Extensive comments are provided to explain how the components interact
+and where to modify the code when adding new node attributes (e.g., functional
+zone labels or building features).
+"""
+
+import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch_geometric
 from torch_geometric.nn import GCNConv, global_mean_pool, MessagePassing
-import torch
-import torch.nn as nn
 from torch_geometric.nn import Sequential
 from torch_geometric.utils import add_self_loops, degree
 
 
 
 class NaiveMsgPass(MessagePassing):
+    """A minimal message passing layer used for experimentation."""
+
     def __init__(self, in_channels, out_channels):
-        super().__init__(aggr='mean')  # "Add" aggregation (Step 5).
+        super().__init__(aggr='mean')  # use mean aggregation of neighbour messages
         self.lin = torch.nn.Linear(in_channels * 2, out_channels)
 
     def forward(self, x, edge_index):
-        # x has shape [N, in_channels]
-        # edge_index has shape [2, E]
-
-        # # Step 1: Add self-loops to the adjacency matrix.
-        # edge_index, _ = add_self_loops(edge_index, num_nodes=x.size(0))
-
-        # Step 2: Linearly transform node feature matrix.
-        # x = self.lin(x)
-
-        # Step 3: Compute normalization.
-        # row, col = edge_index
-        # deg = degree(col, x.size(0), dtype=x.dtype)
-        # deg_inv_sqrt = deg
-        # deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-        # norm = (deg_inv_sqrt[row] + deg_inv_sqrt[col]).pow(-1.0)
-
-        # Step 4-5: Start propagating messages.
+        """Propagate information along ``edge_index``."""
+        # x has shape [N, in_channels]; edge_index has shape [2, E]
         return self.propagate(edge_index, x=x)
 
     def message(self, x_i, x_j):
-        # x_j has shape [E, out_channels]
+        # Combine features from source and target nodes then apply a linear map.
         tmp = torch.cat([x_i, x_j], dim=1)
         tmp = self.lin(tmp)
-
-        # Step 4: Normalize node features.
         return tmp
 
 
 
 class BlockGenerator(torch.nn.Module):
-    def __init__(self, opt, N = 80, T=3, frequency_num = 32, f_act = 'relu'):    
+    """Base class implementing a variational graph autoencoder."""
+
+    def __init__(self, opt, N=80, T=3, frequency_num=32, f_act='relu'):
         super(BlockGenerator, self).__init__()
-        self.N = N
+        self.N = N  # number of nodes in template graph
         self.device = opt['device']
         self.latent_dim = opt['latent_dim']
-        self.latent_ch = opt['n_ft_dim']
+        self.latent_ch = opt['n_ft_dim']  # channel width for internal features
         self.T = T
         self.blockshape_latent_dim = opt['block_latent_dim']
         
 
+        # Select global pooling operator according to configuration.
         if opt['aggr'] == 'Mean':
             self.global_pool = torch_geometric.nn.global_mean_pool
         elif opt['aggr'] == 'Max':
@@ -61,7 +57,7 @@ class BlockGenerator(torch.nn.Module):
         elif opt['aggr'] == 'Add':
             self.global_pool = torch_geometric.nn.global_add_pool
         elif opt['aggr'] == 'global_sort_pool':
-            self.global_pool = torch_geometric.nn.global_sort_pool     
+            self.global_pool = torch_geometric.nn.global_sort_pool
         elif opt['aggr'] == 'GlobalAttention':
             self.global_pool = torch_geometric.nn.GlobalAttention
         elif opt['aggr'] == 'Set2Set':
@@ -70,6 +66,8 @@ class BlockGenerator(torch.nn.Module):
             self.global_pool = torch_geometric.nn.GraphMultisetTransformer
 
 
+        # Select message passing layer.  To support new node attributes, adjust
+        # input dimensions of these layers accordingly.
         if opt['convlayer'] == 'GCNConv':
             self.convlayer = torch_geometric.nn.GCNConv
         elif opt['convlayer'] == 'NaiveMsgPass':
@@ -144,29 +142,45 @@ class BlockGenerator(torch.nn.Module):
 
 
     def encode(self, data):
-        ####### node level attributes and edge index
-        x, edge_index, pos, size, pos_org, size_org = data.x, data.edge_index, data.node_pos, data.node_size, data.org_node_pos, data.org_node_size
+        """Encode input graph ``data`` into latent Gaussian parameters.
+
+        The dataset provides node features ``data.x`` where the first channel is
+        existence.  To incorporate additional per-node attributes (e.g.
+        functional zone labels or building metadata) extend this section by
+        concatenating the new tensors to ``x`` and adjusting ``self.ex_init``
+        accordingly.
+        """
+        # Node level attributes and edge index
+        x, edge_index, pos, size, pos_org, size_org = (
+            data.x,
+            data.edge_index,
+            data.node_pos,
+            data.node_size,
+            data.org_node_pos,
+            data.org_node_size,
+        )
         b_shape, b_iou = data.b_shape, data.b_iou
         b_shape = self.enc_shape(b_shape)
         b_iou = self.enc_iou(b_iou)
         shape_feature = torch.cat((b_shape, b_iou), 1)
-        
-        ###### graph level attributes
-        org_asp_rto, org_long_side = data.asp_rto_gt.unsqueeze(1), data.long_side_gt.unsqueeze(1)            
+
+        # Graph level attributes
+        org_asp_rto, org_long_side = data.asp_rto_gt.unsqueeze(1), data.long_side_gt.unsqueeze(1)
         org_asp_rto = self.enc_asp_rto(org_asp_rto)
         org_long_side = self.enc_long_side(org_long_side)
 
-        org_block_shape, org_block_scale = data.blockshape_latent_gt.view(-1, self.blockshape_latent_dim), data.block_scale_gt.unsqueeze(1)  
+        org_block_shape, org_block_scale = (
+            data.blockshape_latent_gt.view(-1, self.blockshape_latent_dim),
+            data.block_scale_gt.unsqueeze(1),
+        )
         org_block_shape = F.relu(self.enc_block_shape_0(org_block_shape))
         org_block_shape = self.enc_block_shape_1(org_block_shape)
 
         org_block_scale = self.enc_block_scale(org_block_scale)
         org_graph_feature = torch.cat((org_block_shape, org_block_scale), 1)
 
-
         batch_size = data.ptr.shape[0] - 1
-        dat_size = x.shape[0]
-        
+
         pos = F.relu(self.pos_init(pos_org))
         size = F.relu(self.size_init(size_org))
 
@@ -175,20 +189,18 @@ class BlockGenerator(torch.nn.Module):
         one_hot = torch.eye(self.N, dtype=torch.float32).to(self.device).repeat(batch_size, 1)
         x = torch.cat([x, one_hot], 1)
 
-        
-        ft = F.relu(self.ft_init(x)) # encoding existence
+        ft = F.relu(self.ft_init(x))  # encoding existence and other features
 
-        n_embd_0 = torch.cat((shape_feature, size, pos, ft), 1)            
+        n_embd_0 = torch.cat((shape_feature, size, pos, ft), 1)
 
         n_embd_1 = F.relu(self.e_conv1(n_embd_0, edge_index))
         n_embd_2 = F.relu(self.e_conv2(n_embd_1, edge_index))
         n_embd_3 = F.relu(self.e_conv3(n_embd_2, edge_index))
-        
+
         g_embd_0 = self.global_pool(n_embd_0, data.batch)
         g_embd_1 = self.global_pool(n_embd_1, data.batch)
         g_embd_2 = self.global_pool(n_embd_2, data.batch)
         g_embd_3 = self.global_pool(n_embd_3, data.batch)
-
 
         g_embd = torch.cat((g_embd_0, g_embd_1, g_embd_2, g_embd_3, org_graph_feature), 1)
 
@@ -202,10 +214,11 @@ class BlockGenerator(torch.nn.Module):
 
 
     def decode(self, z, edge_index):
+        """Decode latent vectors ``z`` into node attributes."""
         batch_size = z.shape[0]
 
         z = self.d_ft_init(z).view(z.shape[0] * self.N, -1)
-    
+
         one_hot = torch.eye(self.N, dtype=torch.float32).to(self.device).repeat(batch_size, 1)
         z = torch.cat([z, one_hot], 1)
 
@@ -213,9 +226,9 @@ class BlockGenerator(torch.nn.Module):
         d_embd_1 = F.relu(self.d_conv1(d_embd_0, edge_index))
         d_embd_2 = F.relu(self.d_conv2(d_embd_1, edge_index))
         d_embd_3 = F.relu(self.d_conv3(d_embd_2, edge_index))
-        
+
         exist = self.d_exist_1(d_embd_3)
-    
+
         posx = F.relu(self.d_posx_0(d_embd_3))
         posx = self.d_posx_1(posx)
 

@@ -3,56 +3,90 @@ Official Pytorch Implementation of "GlobalMapper: Arbitrary-Shaped Urban Layout 
 
 [arXiv](https://arxiv.org/abs/2307.09693) | [BibTeX](#bibtex) | [Project Page](https://arking1995.github.io/GlobalMapper/)
 
-This repo contains codes for single GPU training for 
-[GlobalMapper: Arbitrary-Shaped Urban Layout Generation](https://arxiv.org/pdf/2307.09693.pdf)
-
-**Note that this repo is lack of code comments.**
-
+This repository contains an educational version of the code for
+[GlobalMapper: Arbitrary-Shaped Urban Layout Generation](https://arxiv.org/pdf/2307.09693.pdf).
+Every module has been richly annotated to serve as a tutorial for newcomers to
+graph-based generative models.
 
 ## Environment
-We provide required environments in "environment.yml". But practially we suggest to use below commands for crucial dependencies:
+
+The project uses PyTorch and PyTorch Geometric.  A minimal environment can be
+created with
+
 ```
 pip install torch==1.9.0+cu111 torchvision==0.10.0+cu111 torchaudio==0.9.0 -f https://download.pytorch.org/whl/torch_stable.html
 pip install torch-sparse -f https://data.pyg.org/whl/torch-1.9.0+cu111.html
 pip install torch-scatter -f https://data.pyg.org/whl/torch-1.9.0+cu111.html
 pip install torch-geometric
 ```
-Then you may install other dependencies like: matplotlib, yaml, pickle, etc.
+
+Additional packages such as `matplotlib`, `yaml` and `pickle` are required for
+visualisation and configuration.
 
 ## Dataset
-We provide a 10K dataset sample in the repo. You may directly unzip it ("dataset.tar.gz").
 
-The 120K dataset is provided [here](https://purdue0-my.sharepoint.com/:u:/g/personal/he425_purdue_edu/ET2gehuc9BhBhJd_4kIrhbYB0xJNuMDZE6mqVTZd9yDQ3Q?e=AwWMKy)
+A small sample dataset (10k blocks) is included as `dataset.tar.gz`.  Unzip it
+to `dataset/`.
 
-"processed" folder contains 10K preprocessed graph-represented city blocks. You may read them by "networkx.read_gpickle()". "raw_geo" contains 10K corresponding original building and block polygons (shapely.polygon format) of each city block (coordinates in UTM Zone projection). You may read it by "pickle.load()". Those original building polygons are directly acquired by "osmnx.geometries module" from [osmnx](https://osmnx.readthedocs.io/en/stable/user-reference.html).
+A larger 120k dataset is available [here](https://purdue0-my.sharepoint.com/:u:/g/personal/he425_purdue_edu/ET2gehuc9BhBhJd_4kIrhbYB0xJNuMDZE6mqVTZd9yDQ3Q?e=AwWMKy).
 
-Our canonical spatial transformation converts the original building polygons to the canonical version. After simple normalization by mean substraction and std dividing, coordinates and location information are encoded as node attributes in 2D grid graphs, then saved in "processed". Since the raw dataset is public accessible, we encourage users to implement their own preprocessing of original building polygons. It may facilitate better performance.
+Each graph in `processed/` contains node attributes describing building
+existence, size and position.  The `raw_geo/` directory holds the original
+polygons obtained via [osmnx](https://osmnx.readthedocs.io/en/stable/user-reference.html).
 
+## Training
 
-## How to train your model
-After set up your training parameters in "train_gnn.yaml". Simply run
-```
-python train.py
-```
+1. Adjust hyper‑parameters in `train_gnn.yaml`.
+2. Run
 
+   ```
+   python train.py
+   ```
 
-## How to test your model
-After you setup desired "dataset_path" and "epoch_name". Simply run
+   Checkpoints and logs are written to `epoch/` and `tensorboard/` when
+   `save_record` is enabled.
+
+## Testing / Reconstruction
+
+Set `dataset_path` and `epoch_name` in `test.py` and run
+
 ```
 python test.py
 ```
 
-## How to do canonical spatial transformation
-We provide a simple example in "example_canonical_transform.py". Details are provieded in our Supplemental [Supp](https://openaccess.thecvf.com/content/ICCV2023/supplemental/He_GlobalMapper_Arbitrary-Shaped_Urban_ICCV_2023_supplemental.pdf). We encourage users to commit their own realization.
+The script reconstructs blocks from the validation set or samples from the
+latent space depending on configuration flags.
 
+## Adding New Attributes
 
-## How to do visualization
-All maps in the paper are visualized by simple matplotlib draw functions that you may compose in minutes.
+Functional‑zone labels (7 classes) or additional building features can be
+incorporated by:
 
+1. **Dataset:**
+   - Extend `graph2vector_processed` and `graph_transform` in `urban_dataset.py`
+     to extract and append the new attributes to `node_feature`.
+   - Update the dimensions of tensors accordingly.
+2. **Model:**
+   - Increase the input size of `ex_init`/`ft_init` in `model.py` so the network
+     consumes the extended feature vectors.
+   - Add loss terms in `graph_trainer.py` and weights in `train_gnn.yaml` if the
+     new attributes require supervision.
 
-## BibTeX
+## Canonical Spatial Transformation
 
-If you use this code, please cite
+`example_canonical_transform.py` demonstrates how raw building polygons are
+normalised into the canonical frame used by the dataset.  Consult the
+[supplemental material](https://openaccess.thecvf.com/content/ICCV2023/supplemental/He_GlobalMapper_Arbitrary-Shaped_Urban_ICCV_2023_supplemental.pdf)
+for mathematical details.
+
+## Visualisation
+
+Simple matplotlib helpers for plotting graphs are provided in `graph_util.py`.
+
+## Citation
+
+If you use this code, please cite:
+
 ```text
 @InProceedings{He_2023_ICCV,
     author    = {He, Liu and Aliaga, Daniel},
