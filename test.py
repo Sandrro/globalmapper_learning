@@ -1,3 +1,10 @@
+"""Script for reconstructing or generating block graphs with trained models.
+
+This file mirrors the original repository's testing utility.  It is heavily
+commented so that users can adapt it for experimenting with new attributes
+such as functional-zone labels or building features.
+"""
+
 import torch, os
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader

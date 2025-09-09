@@ -7,6 +7,14 @@ import torch.nn.functional as F
 import torch.nn as nn
 from torch_geometric.data import Batch
 import numpy as np
+"""Entry point for training GlobalMapper models.
+
+The script orchestrates dataset preparation, model construction and the
+training/validation loop.  Extensive comments are included to help beginners
+understand each step and to point out where new features could be integrated
+into the pipeline.
+"""
+
 import random
 from tensorboard_logger import configure, log_value
 from torch.optim.lr_scheduler import MultiStepLR
@@ -17,23 +25,33 @@ from graph_util import read_train_yaml
 from graph_trainer import train, validation
 import yaml
 import warnings
+
+# Avoid cluttering the output with warnings from third-party libraries.
 warnings.filterwarnings("ignore")
 
 
 if __name__ == "__main__":
+    # Seed Python's RNG so dataset shuffling is repeatable.  When new features
+    # are added to the dataset (e.g. zone labels) this ensures consistent train
+    # / validation splits.
     random.seed(42) # make sure every time has the same training and validation sets
 
 
     root = os.getcwd()
 
+    # Location of the processed graphs.  Replace with your own dataset path if
+    # necessary.
     dataset_path = os.path.join(root, 'dataset')  ### you may set up your own dataset
 
+    # Load training options from YAML configuration.  Editing ``train_gnn.yaml``
+    # allows users to introduce new hyper-parameters or feature dimensions.
     train_opt = read_train_yaml(root, filename = "train_gnn.yaml")
     print(train_opt)
     is_resmue = train_opt['resume']
     gpu_ids = train_opt['gpu_ids']
 
     if is_resmue:
+        # When resuming training, restore saved hyper-parameters and weights.
         resume_epoch = train_opt['resume_epoch']
         resume_dir = train_opt['resume_dir']
         import_name = train_opt['import_name']
@@ -43,6 +61,10 @@ if __name__ == "__main__":
 
     notes = 'GlobalMapper'
         
+    # Total number of possible nodes in the grid-shaped template.  When
+    # including new node attributes (functional zones or building features) the
+    # template size typically stays the same, but the feature dimensionality
+    # per node will grow.
     maxlen = opt['template_width']
     N = maxlen * opt['template_height']
     min_bldg = 0   # >
@@ -52,7 +74,7 @@ if __name__ == "__main__":
     fname = opt['convlayer'] + '_' + opt['aggr'] + '_dim' + str(opt['n_ft_dim'])
     data_name = 'osm_cities' #Structure + '_Bldg'+str(min_bldg)+'-'+str(max_bldg)+'_ML'+str(maxlen) +'_N' + str(N)
 
-    opt['data_name'] = data_name 
+    opt['data_name'] = data_name
     print(data_name)
     device = torch.device('cuda:{}'.format(gpu_ids[0]))
     print(device)
@@ -60,6 +82,9 @@ if __name__ == "__main__":
     start_epoch = opt['start_epoch']
 
 
+    # Register all loss functions.  When you introduce new labels, such as
+    # functional zone categories, define and insert the corresponding loss
+    # modules here (e.g. another CrossEntropyLoss).
     loss_dict = {}
     loss_dict['Posloss'] = nn.MSELoss(reduction='sum')
     loss_dict['ShapeCEloss'] = nn.CrossEntropyLoss(reduction='sum')
@@ -70,6 +95,7 @@ if __name__ == "__main__":
     loss_dict['ExtSumloss'] = nn.MSELoss(reduction='sum')  # nn.SmoothL1Loss
 
 
+    # Prepare directories for checkpoints, TensorBoard logs and text logs.
     save_pth = os.path.join(root,'epoch')
     if not os.path.exists(save_pth):
         os.mkdir(save_pth)
@@ -85,12 +111,12 @@ if __name__ == "__main__":
     time = strftime("%Y-%m-%d %H:%M:%S", gmtime())
 
     if is_resmue:
-        save_name = notes + fname + '_lr{}_epochs{}_batch{}'.format(opt['lr'], opt['total_epochs'], opt['batch_size']) 
+        save_name = notes + fname + '_lr{}_epochs{}_batch{}'.format(opt['lr'], opt['total_epochs'], opt['batch_size'])
         save_pth = os.path.join(root,'epoch', resume_dir)
         log_file = os.path.join(root,'logs', resume_dir + '.log')
         tb_path = os.path.join(root,'tensorboard', resume_dir)
     else:
-        save_name = notes + fname + '_lr{}_epochs{}_batch{}_'.format(opt['lr'], opt['total_epochs'], opt['batch_size']) 
+        save_name = notes + fname + '_lr{}_epochs{}_batch{}_'.format(opt['lr'], opt['total_epochs'], opt['batch_size'])
         save_pth = os.path.join(root,'epoch', save_name + time)
         log_file = os.path.join(root,'logs', save_name + time + '.log')
         tb_path = os.path.join(root,'tensorboard', save_name + time)
@@ -100,12 +126,13 @@ if __name__ == "__main__":
         if not os.path.exists(save_pth):
             os.mkdir(save_pth)
 
+        # Reconfigure root logger for a clean log file.
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
 
         logging.basicConfig(
-            level=logging.INFO, 
-            format="[%(levelname)s] %(message)s - %(filename)s %(funcName)s %(asctime)s ", 
+            level=logging.INFO,
+            format="[%(levelname)s] %(message)s - %(filename)s %(funcName)s %(asctime)s ",
             filename = log_file)
         opt['save_path'] = save_pth
         opt['log_path'] = log_file
@@ -118,12 +145,15 @@ if __name__ == "__main__":
         with open(os.path.join(save_pth, yaml_fn), 'w') as outfile:
             yaml.dump(opt, outfile, default_flow_style=False)
 
+        # TensorBoard setup so losses/metrics are logged during training.
         configure(tb_path, flush_secs=5)
 
 
 
     torch.autograd.set_detect_anomaly(True)
 
+    # Image augmentation for the CNN branch (road conditions).  Users adding
+    # new raster attributes can extend ``get_transform`` in ``urban_dataset``.
     cnn_transform = get_transform(noise_range = 10.0, noise_type = 'gaussian', isaug = False, rescale_size = 64)
     dataset = UrbanGraphDataset(dataset_path,transform = graph_transform, cnn_transform = cnn_transform)
     num_data = len(dataset)
@@ -132,7 +162,7 @@ if __name__ == "__main__":
     print(num_data)
 
     ### get the validation data number
-    val_num = int(num_data * opt['val_ratio']) 
+    val_num = int(num_data * opt['val_ratio'])
     ### sample the validation data index
     val_idx = np.array(random.sample(range(num_data), val_num))
     ### remove the validation data index for training
@@ -148,6 +178,9 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=opt['batch_size'], shuffle=False, num_workers=8)
     train_loader = DataLoader(train_dataset, batch_size=opt['batch_size'], shuffle=True, num_workers=8)
 
+    # Instantiate the model variant depending on configuration flags.  Adding
+    # new input attributes may require adapting the constructors in ``model.py``
+    # (e.g., increasing input channel dimensions).
     if opt['is_blockplanner']:
         model = NaiveBlockGenerator(opt, N = N)
 
@@ -176,6 +209,7 @@ if __name__ == "__main__":
     scheduler = MultiStepLR(optimizer, milestones=[(opt['total_epochs'] - start_epoch) * 0.6, (opt['total_epochs']-start_epoch) * 0.8], gamma=0.3)
 
 
+    # Track the best metrics for checkpointing.
     best_val_acc = None
     best_train_acc = None
     best_train_loss = None
@@ -191,6 +225,7 @@ if __name__ == "__main__":
         v_acc, v_loss, v_loss_geo = validation(model, epoch, val_loader, device, opt, loss_dict, scheduler)
 
         if opt['save_record']:
+            # Update running best statistics and store checkpoints.
             if best_train_acc is None or t_acc >= best_train_acc:
                 best_train_acc = t_acc
 
@@ -214,13 +249,16 @@ if __name__ == "__main__":
 
             if epoch % opt['save_epoch'] == 0:
                 filn = os.path.join(save_pth, str(epoch) + "_save.pth")
-                torch.save(model.state_dict(), filn)            
+                torch.save(model.state_dict(), filn)
             logging.info('Epoch: {:03d}, Train Loss: {:.7f}, Train exist accuracy: {:.7f}, Valid Loss: {:.7f}, Valid exist accuracy: {:.7f}, valid geo loss {:.7f}'.format(epoch, t_loss, t_acc, v_loss, v_acc, v_loss_geo) )
             print('Epoch: {:03d}, Train Loss: {:.7f}, Train exist accuracy: {:.7f}, Valid Loss: {:.7f}, Valid exist accuracy: {:.7f}, valid geo loss {:.7f}'.format(epoch, t_loss, t_acc, v_loss, v_acc, v_loss_geo) )
 
+            # Always keep a copy of the latest model in case training is
+            # interrupted.
             filn = os.path.join(save_pth, "latest.pth")
-            torch.save(model.state_dict(), filn)  
+            torch.save(model.state_dict(), filn)
 
     if opt['save_record']:
+        # Final summary of the best metrics encountered during training.
         logging.info('Least Train Loss: {:.7f}, Best Train exist accuracy: {:.7f}, Least Valid Loss: {:.7f}, Best Valid exist accuracy: {:.7f}, best valid geo loss {:.7f}'.format(best_train_loss, best_train_acc, best_val_loss, best_val_acc, best_val_geo_loss))
         print('Least Train Loss: {:.7f}, Best Train exist accuracy: {:.7f}, Least Valid Loss: {:.7f}, Best Valid exist accuracy: {:.7f}, best valid geo loss {:.7f}'.format(best_train_loss, best_train_acc, best_val_loss, best_val_acc, best_val_geo_loss))

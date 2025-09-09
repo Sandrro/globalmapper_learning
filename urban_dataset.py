@@ -4,11 +4,18 @@ import networkx as nx
 import torch
 from torch_geometric.data import Dataset, download_url
 import numpy as np
+"""Dataset utilities for loading and transforming urban block graphs.
+
+The core class :class:`UrbanGraphDataset` reads graphs from disk and converts
+them into ``torch_geometric`` data objects.  Detailed comments explain each
+transformation step so that additional attributes (like functional-zone labels
+or building features) can be incorporated easily.
+"""
+
 from scipy import stats
 from torch_geometric.data import Data
 import torch.nn.functional as F
 from torch_geometric.loader import DataLoader
-# from Spatial_Encoder import TheoryGridCellSpatialRelationEncoder
 from PIL import Image
 import torchvision.transforms as transforms
 import math
@@ -31,7 +38,8 @@ def __add_gaussain_noise(img, scale):
     return img
 
 
-def get_transform(noise_range = 0.0, noise_type = None, isaug = False, rescale_size = 64):
+def get_transform(noise_range=0.0, noise_type=None, isaug=False, rescale_size=64):
+    """Return torchvision transform for block mask images."""
     transform_list = []
 
     if noise_type == 'gaussian':
@@ -111,6 +119,12 @@ def get_edge_attribute(g, keys, dtype, default = None):
 
 
 def graph2vector_processed(g):
+    """Convert a networkx graph into arrays of node features.
+
+    Returns arrays for node sizes, positions, attributes and edge indices.  When
+    additional attributes are stored in ``g`` (e.g. zone labels), extend this
+    function to extract them and include them in ``node_attr``.
+    """
     num_nodes = g.number_of_nodes()
 
     asp_rto = g.graph['aspect_ratio']
@@ -136,7 +150,7 @@ def graph2vector_processed(g):
     node_pos = np.stack((posx, posy), 1)
     node_size = np.stack((size_x, size_y), 1)
 
-    node_idx = np.stack((np.arange(num_nodes) / num_nodes, np.arange(num_nodes) / num_nodes), axis = 1)
+    node_idx = np.stack((np.arange(num_nodes) / num_nodes, np.arange(num_nodes) / num_nodes), axis=1)
 
     return node_size, node_pos, node_attr, edge_list, node_idx, asp_rto, longside, b_shape, b_iou
 
@@ -146,6 +160,7 @@ def graph2vector_processed(g):
 
 
 def test_graph_transform(data):
+    """Prepare a single graph for model input without augmentation."""
     num_nodes = data.x.shape[0]
     node_feature = data.x
     edge_idx = data.edge_index
@@ -163,35 +178,51 @@ def test_graph_transform(data):
     node_pos = node_pos.squeeze(0)
 
     b_shape_gt = torch.tensor(data.b_shape, dtype=torch.int64)
-    b_shape = torch.tensor(F.one_hot(b_shape_gt.clone().detach(), num_classes = 6), dtype=torch.float32)
+    b_shape = torch.tensor(F.one_hot(b_shape_gt.clone().detach(), num_classes=6), dtype=torch.float32)
     b_iou = torch.tensor(data.b_iou, dtype=torch.float32).unsqueeze(1)
 
     node_feature = torch.tensor(node_feature, dtype=torch.float32)
 
     edge_idx = torch.tensor(edge_idx, dtype=torch.long)
-    
+
     node_idx = torch.tensor(data.node_idx, dtype=torch.float32)
     node_idx = np.expand_dims(data.node_idx, axis=0)
     node_idx = node_idx.squeeze(0)
 
-    long_side =  torch.tensor(data.long_side, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
-    asp_rto =  torch.tensor(data.asp_rto, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
+    long_side = torch.tensor(data.long_side, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
+    asp_rto = torch.tensor(data.asp_rto, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
 
     long_side_gt = torch.tensor(data.long_side, dtype=torch.float32)
-    asp_rto_gt =  torch.tensor(data.asp_rto, dtype=torch.float32)
+    asp_rto_gt = torch.tensor(data.asp_rto, dtype=torch.float32)
 
-    blockshape_latent =  torch.tensor(data.blockshape_latent / 10.0, dtype=torch.float32).repeat(num_nodes, 1)
-    block_scale =  torch.tensor(data.block_scale / 100.0, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
+    blockshape_latent = torch.tensor(data.blockshape_latent / 10.0, dtype=torch.float32).repeat(num_nodes, 1)
+    block_scale = torch.tensor(data.block_scale / 100.0, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
 
     blockshape_latent_gt = torch.tensor(data.blockshape_latent / 10.0, dtype=torch.float32)
-    block_scale_gt =  torch.tensor(data.block_scale / 100.0, dtype=torch.float32)
+    block_scale_gt = torch.tensor(data.block_scale / 100.0, dtype=torch.float32)
 
-    trans_data = Data(x=node_feature, edge_index = edge_idx, node_pos = node_pos, org_node_pos = org_node_pos, node_size = node_size, org_node_size = org_node_size, 
-                        node_idx = node_idx, asp_rto = asp_rto, long_side = long_side, asp_rto_gt = asp_rto_gt, long_side_gt = long_side_gt, 
-                        b_shape = b_shape, b_iou = b_iou, b_shape_gt = b_shape_gt,
-                        blockshape_latent = blockshape_latent, blockshape_latent_gt = blockshape_latent_gt, block_scale = block_scale, block_scale_gt = block_scale_gt,
-                        block_condition = data.block_condition, org_binary_mask = data.org_binary_mask,
-                    )
+    trans_data = Data(
+        x=node_feature,
+        edge_index=edge_idx,
+        node_pos=node_pos,
+        org_node_pos=org_node_pos,
+        node_size=node_size,
+        org_node_size=org_node_size,
+        node_idx=node_idx,
+        asp_rto=asp_rto,
+        long_side=long_side,
+        asp_rto_gt=asp_rto_gt,
+        long_side_gt=long_side_gt,
+        b_shape=b_shape,
+        b_iou=b_iou,
+        b_shape_gt=b_shape_gt,
+        blockshape_latent=blockshape_latent,
+        blockshape_latent_gt=blockshape_latent_gt,
+        block_scale=block_scale,
+        block_scale_gt=block_scale_gt,
+        block_condition=data.block_condition,
+        org_binary_mask=data.org_binary_mask,
+    )
 
     return trans_data
 
@@ -200,16 +231,17 @@ def test_graph_transform(data):
 
 
 def graph_transform(data):
+    """Training transform with random flipping for data augmentation."""
     num_nodes = data.x.shape[0]
     node_feature = data.x
     edge_idx = data.edge_index
 
-        
     org_node_size = data.node_size
     org_node_pos = data.node_pos
     b_shape_org = data.b_shape
     b_iou = data.b_iou
-    
+
+    # Randomly flip node order to augment orientation.
     randm = torch.rand(1)
     if randm < 0.5:
         org_node_size = np.flip(org_node_size, 0).copy()
@@ -218,10 +250,8 @@ def graph_transform(data):
         b_iou = np.flip(b_iou, 0).copy()
         node_feature = np.flip(node_feature, 0).copy()
 
-
     org_node_size = torch.tensor(org_node_size, dtype=torch.float32)
 
-    # node_size = spa_enc(np.expand_dims(org_node_size, axis=0))
     node_size = np.expand_dims(org_node_size, axis=0)
     node_size = node_size.squeeze(0)
 
@@ -231,37 +261,52 @@ def graph_transform(data):
     node_pos = node_pos.squeeze(0)
 
     b_shape_gt = torch.tensor(b_shape_org, dtype=torch.int64)
-    b_shape = torch.tensor(F.one_hot(b_shape_gt.clone().detach(), num_classes = 6), dtype=torch.float32)
+    b_shape = torch.tensor(F.one_hot(b_shape_gt.clone().detach(), num_classes=6), dtype=torch.float32)
 
     b_iou = torch.tensor(b_iou, dtype=torch.float32).unsqueeze(1)
 
     node_feature = torch.tensor(node_feature, dtype=torch.float32)
 
     edge_idx = torch.tensor(edge_idx, dtype=torch.long)
-    
+
     node_idx = torch.tensor(data.node_idx, dtype=torch.float32)
-    # node_idx = idx_enc(np.expand_dims(data.node_idx, axis=0))
     node_idx = np.expand_dims(data.node_idx, axis=0)
     node_idx = node_idx.squeeze(0)
 
-    long_side =  torch.tensor(data.long_side, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
-    asp_rto =  torch.tensor(data.asp_rto, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
+    long_side = torch.tensor(data.long_side, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
+    asp_rto = torch.tensor(data.asp_rto, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
 
     long_side_gt = torch.tensor(data.long_side, dtype=torch.float32)
-    asp_rto_gt =  torch.tensor(data.asp_rto, dtype=torch.float32)
+    asp_rto_gt = torch.tensor(data.asp_rto, dtype=torch.float32)
 
-    blockshape_latent =  torch.tensor(data.blockshape_latent / 10.0, dtype=torch.float32).repeat(num_nodes, 1)
-    block_scale =  torch.tensor(data.block_scale / 100.0, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
+    blockshape_latent = torch.tensor(data.blockshape_latent / 10.0, dtype=torch.float32).repeat(num_nodes, 1)
+    block_scale = torch.tensor(data.block_scale / 100.0, dtype=torch.float32).repeat(num_nodes).unsqueeze(1)
 
     blockshape_latent_gt = torch.tensor(data.blockshape_latent / 10.0, dtype=torch.float32)
-    block_scale_gt =  torch.tensor(data.block_scale / 100.0, dtype=torch.float32)
+    block_scale_gt = torch.tensor(data.block_scale / 100.0, dtype=torch.float32)
 
-    trans_data = Data(x=node_feature, edge_index = edge_idx, node_pos = node_pos, org_node_pos = org_node_pos, node_size = node_size, org_node_size = org_node_size, 
-                        node_idx = node_idx, asp_rto = asp_rto, long_side = long_side, asp_rto_gt = asp_rto_gt, long_side_gt = long_side_gt, 
-                        b_shape = b_shape, b_iou = b_iou, b_shape_gt = b_shape_gt,
-                        blockshape_latent = blockshape_latent, blockshape_latent_gt = blockshape_latent_gt, block_scale = block_scale, block_scale_gt = block_scale_gt,
-                        block_condition = data.block_condition, org_binary_mask = data.org_binary_mask,
-                        )
+    trans_data = Data(
+        x=node_feature,
+        edge_index=edge_idx,
+        node_pos=node_pos,
+        org_node_pos=org_node_pos,
+        node_size=node_size,
+        org_node_size=org_node_size,
+        node_idx=node_idx,
+        asp_rto=asp_rto,
+        long_side=long_side,
+        asp_rto_gt=asp_rto_gt,
+        long_side_gt=long_side_gt,
+        b_shape=b_shape,
+        b_iou=b_iou,
+        b_shape_gt=b_shape_gt,
+        blockshape_latent=blockshape_latent,
+        blockshape_latent_gt=blockshape_latent_gt,
+        block_scale=block_scale,
+        block_scale_gt=block_scale_gt,
+        block_condition=data.block_condition,
+        org_binary_mask=data.org_binary_mask,
+    )
 
     return trans_data
 
@@ -272,7 +317,9 @@ def graph_transform(data):
 
 
 class UrbanGraphDataset(Dataset):
-    def __init__(self, root, transform=None, pre_transform=None, cnn_transform = None, is_multigpu = False):
+    """Dataset for training the GlobalMapper models."""
+
+    def __init__(self, root, transform=None, pre_transform=None, cnn_transform=None, is_multigpu=False):
         super().__init__(root, transform, pre_transform)
         self.root_data_path = root
         self.cnn_transforms = cnn_transform

@@ -8,6 +8,14 @@ import pickle
 import shapely
 from os import listdir
 from os.path import isfile, join
+"""Example code demonstrating canonical transformations and skeletonization.
+
+The original repository includes this script as a playground for experimenting
+with shapely/CGAL based geometry processing.  It constructs skeleton graphs
+from binary images and contains many helper utilities.  The extensive comments
+should help readers follow the rather involved geometry logic.
+"""
+
 import json
 import shapely.geometry as sg
 import shapely.affinity as sa
@@ -20,12 +28,16 @@ import collections
 import multiprocessing
 import skgeom
 import warnings
+
+# Silence warnings coming from shapely or skgeom to keep output clean.
 warnings.filterwarnings("ignore")
 import random
 
 
 
 class Vertex:
+    """Light‑weight vertex used when building skeleton graphs from images."""
+
     def __init__(self, point, degree=0, edges=None):
         self.point = np.asarray(point)
         self.degree = degree
@@ -39,6 +51,7 @@ class Vertex:
 
 
 class Edge:
+    """Edge connecting two :class:`Vertex` instances in the skeleton graph."""
 
     def __init__(self, start, end=None, pixels=None):
         self.start = start
@@ -50,16 +63,24 @@ class Edge:
 
 
 def buildTree(img, start=None):
+    """Convert a binary skeleton image into a networkx graph.
+
+    Parameters
+    ----------
+    img : ndarray of bool
+        Binary image where ``True`` pixels represent the skeleton.
+    start : tuple, optional
+        Starting pixel.  If omitted the first white pixel is chosen.
+    """
     # copy image since we set visited pixels to black
     img = img.copy()
     shape = img.shape
     nWhitePixels = np.sum(img)
 
-    # neighbor offsets (8 nbors)
-    nbPxOff = np.array([[-1, -1], [-1, 0], [-1, 1],
-                        [0, -1], [0, 1],
-                        [1, -1], [1, 0], [1, 1]
-                        ])
+    # neighbor offsets (8 neighbours)
+    nbPxOff = np.array(
+        [[-1, -1], [-1, 0], [-1, 1], [0, -1], [0, 1], [1, -1], [1, 0], [1, 1]]
+    )
 
     queue = collections.deque()
 
@@ -72,7 +93,7 @@ def buildTree(img, start=None):
 
         # if start not given: determine the first white pixel
         if start is None:
-            it = np.nditer(img, flags=['multi_index'])
+            it = np.nditer(img, flags=["multi_index"])
             while not it[0]:
                 it.iternext()
 
@@ -90,29 +111,29 @@ def buildTree(img, start=None):
         G = nx.Graph()
         G.add_node(startV)
 
-        # build graph in a breath-first manner by adding
-        # new nodes to the right and popping handled nodes to the left in queue
+        # build graph in a breadth-first manner by adding new nodes to the right
+        # and popping handled nodes to the left in queue
         while len(queue):
-            currV = queue[0];  # get current vertex
-            # print("Current vertex: ", currV)
+            currV = queue[0]  # get current vertex
 
-            # check all neigboor pixels
+            # check all neighbour pixels
             for nbOff in nbPxOff:
 
                 # pixel index
                 pxIdx = currV.point + nbOff
 
-                if (pxIdx[0] < 0 or pxIdx[0] >= shape[0]) or (pxIdx[1] < 0 or pxIdx[1] >= shape[1]):
-                    continue;  # current neigbor pixel out of image
+                if (
+                    (pxIdx[0] < 0 or pxIdx[0] >= shape[0])
+                    or (pxIdx[1] < 0 or pxIdx[1] >= shape[1])
+                ):
+                    continue  # current neighbour pixel out of image
 
                 if img[pxIdx[0], pxIdx[1]]:
-                    # print( "nb: ", pxIdx, " white ")
-                    # pixel is white
+                    # pixel is white -> create a new vertex
                     newV = Vertex([pxIdx[0], pxIdx[1]])
 
                     # add edge from currV <-> newV
                     G.add_edge(currV, newV, object=Edge(currV, newV))
-                    # G.add_edge(newV,currV)
 
                     # add node newV
                     G.add_node(newV)
@@ -128,26 +149,27 @@ def buildTree(img, start=None):
             queue.popleft()
         # end while
 
-        # empty queue
-        # current graph is finished ->store it
+        # current graph is finished -> store it
         graphs.append(G)
 
-        # reset start
+        # reset start so the next component finds a new starting pixel
         start = None
-
-    # end while
 
     return graphs, img
 
 
 def getEndNodes(g):
-    # return [n for n in nx.nodes_iter(g) if nx.degree(g, n) == 1]
+    """Return all vertices of degree one in ``g``."""
     return [n for n in list(g.nodes()) if nx.degree(g, n) == 1]
 
 
 
 def mergeEdges(graph):
-    # copy the graph
+    """Merge chains of degree‑2 vertices into single edges.
+
+    Skeletonisation often produces many intermediate vertices along a straight
+    line.  This function collapses them so subsequent processing is simpler.
+    """
     g = graph.copy()
 
     # v0 -----edge 0--- v1 ----edge 1---- v2
@@ -180,37 +202,35 @@ def mergeEdges(graph):
             continue
 
         counter = 0
-        v1 = startNNbs[counter]  # next nb of v0
+        v1 = startNNbs[counter]  # next neighbour of v0
         while True:
 
             if nx.degree(g, v1) == 2:
-                # we have a node which has 2 edges = this is a line segement
-                # make new edge from the two neighbors
+                # v1 lies on a straight line: replace v0-v1 and v1-v2 by a
+                # single edge v0-v2.
                 nbs = nx.neighbors(g, v1)
                 nbs = list(nbs)
-                # if the first neihbor is not n, make it so!
                 if nbs[0] != v0:
                     nbs.reverse()
 
-                pxL0 = g[v0][v1]["object"].pixels  # the pixel list of the edge 0
-                pxL1 = g[v1][nbs[1]]["object"].pixels  # the pixel list of the edge 1
+                pxL0 = g[v0][v1]["object"].pixels  # pixels of first edge
+                pxL1 = g[v1][nbs[1]]["object"].pixels  # pixels of second edge
 
-                # fuse the pixel list from right and left and add our pixel n.point
-                g.add_edge(v0, nbs[1],
-                           object=Edge(v0, nbs[1], pixels=pxL0 + [v1.point] + pxL1)
-                           )
+                # fuse pixel lists and create new edge
+                g.add_edge(
+                    v0,
+                    nbs[1],
+                    object=Edge(v0, nbs[1], pixels=pxL0 + [v1.point] + pxL1),
+                )
 
-                # delete the node n
                 g.remove_node(v1)
-
-                # set v1 to new left node
                 v1 = nbs[1]
 
             else:
                 counter += 1
                 if counter == len(startNNbs):
                     break
-                v1 = startNNbs[counter]  # next nb of v0
+                v1 = startNNbs[counter]  # next neighbour of v0
 
     # weight the edges according to their number of pixels
     for u, v, o in g.edges(data="object"):
@@ -220,73 +240,62 @@ def mergeEdges(graph):
 
 
 def getLongestPath(graph, endNodes):
-    """
-        graph is a fully reachable graph = every node can be reached from every node
-    """
+    """Return the geodesic longest path between any pair of ``endNodes``."""
 
     if len(endNodes) < 2:
         raise ValueError("endNodes need to contain at least 2 nodes!")
 
-    # get all shortest paths from each endpoint to another endpoint
     allEndPointsComb = itertools.combinations(endNodes, 2)
 
     maxLength = 0
     maxPath = None
 
     for ePoints in allEndPointsComb:
-
-        # get shortest path for these end points pairs
         try:
-            sL = nx.dijkstra_path_length(graph,
-                                        source=ePoints[0],
-                                        target=ePoints[1])
-        except:
+            sL = nx.dijkstra_path_length(graph, source=ePoints[0], target=ePoints[1])
+        except Exception:
             continue
-        # dijkstra can throw if now path, but we are sure we have a path
 
-        # store maximum
-        if (sL > maxLength):
+        if sL > maxLength:
             maxPath = ePoints
             maxLength = sL
 
     if maxPath is None:
         raise ValueError("No path found!")
 
-    return nx.dijkstra_path(graph,
-                            source=maxPath[0],
-                            target=maxPath[1]), maxLength
+    return nx.dijkstra_path(graph, source=maxPath[0], target=maxPath[1]), maxLength
 
 ###############################################################
 def get_insert_position(arr, K):
-    # Traverse the array
-    for i in range(arr.shape[0]):         
-        # If K is found
+    """Helper: find index where ``K`` should be inserted in sorted ``arr``."""
+    for i in range(arr.shape[0]):
         if arr[i] == K:
             return np.int16(i)
-        # If arr[i] exceeds K
         elif arr[i] >= K:
             return np.int16(i)
     return np.int16(arr.shape[0])
 
 # ###############################################################
 def is_on_contour(polygon, pt):
+    """Check if a ``skgeom`` point lies on the polygon boundary."""
     for i in polygon.coords:
         if np.linalg.norm(i - np.array((pt.x(), pt.y()), dtype=np.float32)) < 0.01:
             return True
     return False
 
 def skgeom_dist(p1, p2):
-    return np.sqrt((float(p1.x()) - float(p2.x())) **2 + (float(p1.y()) - float(p2.y())) **2)
+    """Euclidean distance between two ``skgeom`` points."""
+    return np.sqrt((float(p1.x()) - float(p2.x())) ** 2 + (float(p1.y()) - float(p2.y())) ** 2)
 
 
 def get_polyskeleton_longest_path(skeleton, polygon):
-    # skgeom.draw.draw(polygon)
+    """Construct graph from ``skgeom`` skeleton and find its longest path."""
     interior_skel_vertices = {}
     interior_skel_time = {}
     exterior_vertices = {}
     connect_dict = {}
 
-    G = nx.Graph() 
+    G = nx.Graph()
     end_nodes = []
 
     for v in skeleton.vertices:
@@ -296,33 +305,35 @@ def get_polyskeleton_longest_path(skeleton, polygon):
         else:
             exterior_vertices[v.id] = Point(v.point.x(), v.point.y())
             end_nodes.append(v.id)
-        G.add_node(v.id, posx = float(v.point.x()), posy = float(v.point.y()) )
+        G.add_node(v.id, posx=float(v.point.x()), posy=float(v.point.y()))
 
     for h in skeleton.halfedges:
         if h.is_bisector:
             p1 = h.vertex.point
             p2 = h.opposite.vertex.point
-            # plt.plot([p1.x(), p2.x()], [p1.y(), p2.y()], 'r-', lw=2)
             if not (is_on_contour(polygon, p1) and is_on_contour(polygon, p2)):
-                G.add_edge(h.vertex.id, h.opposite.vertex.id, weight = skgeom_dist(p1, p2))
+                G.add_edge(
+                    h.vertex.id,
+                    h.opposite.vertex.id,
+                    weight=skgeom_dist(p1, p2),
+                )
 
-    
     path, length = getLongestPath(G, end_nodes)
     longest_skel = []
     for i in path:
         longest_skel.append((G.nodes[i]['posx'], G.nodes[i]['posy']))
     longest_skel = LineString(longest_skel)
 
-
     return G, longest_skel
 
 def get_modified_nodes(coords):
+    """Heuristic to find significant direction changes along a polyline."""
     default = 1
     for i in range(coords.shape[1] - 2):
-        k1 = get_k_angle(Point(coords[:,i]), Point(coords[:,i+1]) )
-        k2 = get_k_angle(Point(coords[:,i+1]), Point(coords[:,i+2]) )
-        if np.abs(k1 - k2) > 2 * np.pi/36.0:  # 5 degree
-            return i+1
+        k1 = get_k_angle(Point(coords[:, i]), Point(coords[:, i + 1]))
+        k2 = get_k_angle(Point(coords[:, i + 1]), Point(coords[:, i + 2]))
+        if np.abs(k1 - k2) > 2 * np.pi / 36.0:  # 5 degree
+            return i + 1
     return default
 
 def _azimuth(point1, point2):
@@ -445,38 +456,43 @@ def get_extend_line(a, b, block, isfront, is_extend_from_end = False):
     return line_to_contour
 
 def modified_skel_to_medaxis(longest_skel, block):
+    """Convert longest skeleton into a full medial axis of the block."""
     coords = np.array(longest_skel.coords.xy)
-    if coords.shape[1] <=3:
+    if coords.shape[1] <= 3:
         return longest_skel
     elif coords.shape[1] == 4:
         front_start = 1
         end_start = 1
-
     else:
-        flip_coords = np.flip(coords,1)
+        flip_coords = np.flip(coords, 1)
         front_start = get_modified_nodes(coords)
         end_start = get_modified_nodes(flip_coords)
 
-    p2 = Point(coords[:,front_start])
-    p3 = Point(coords[:,front_start + 1])
-    p_2 = Point(coords[:,-end_start -1])
-    p_3 = Point(coords[:,-end_start -2])
+    p2 = Point(coords[:, front_start])
+    p3 = Point(coords[:, front_start + 1])
+    p_2 = Point(coords[:, -end_start - 1])
+    p_3 = Point(coords[:, -end_start - 2])
 
     extended_line_front = get_extend_line(p2, p3, block, True)
     extended_line_back = get_extend_line(p_2, p_3, block, False)
 
-    if len(longest_skel.coords[front_start:-end_start]) <=1:
+    if len(longest_skel.coords[front_start:-end_start]) <= 1:
         midaxis_miss_bothend = LineString(longest_skel.coords[1:-1])
         print('no enough point on medaxis')
     else:
-        midaxis_miss_bothend = LineString(longest_skel.coords[front_start:-end_start])
+        midaxis_miss_bothend = LineString(
+            longest_skel.coords[front_start:-end_start]
+        )
 
-    modfied_midaxis = linemerge([extended_line_front, midaxis_miss_bothend, extended_line_back])
+    modfied_midaxis = linemerge(
+        [extended_line_front, midaxis_miss_bothend, extended_line_back]
+    )
 
     return modfied_midaxis
 
 ###############################################################
 def warp_bldg_by_midaxis(bldg, block, midaxis):
+    """Normalize building positions and sizes relative to a block mid-axis."""
     bldgnum = len(bldg)
     normalized_size = []
     midaxis_length = midaxis.length
@@ -574,41 +590,36 @@ def warp_bldg_by_midaxis(bldg, block, midaxis):
 
 
 if __name__ == '__main__':
-    ### Normalize your block and building polygons to block center
-    #### norm_blk_poly : city block shaply.Polygon
-    #### norm_bldg_poly : list of building shaply.Polygon
+    # Example usage demonstrating how to normalise building polygons relative to
+    # a block.  Real applications would replace these toy polygons with data
+    # from the dataset.
 
-    #### a random shaply.Polygon
     norm_blk_poly = Polygon([(0, 0), (0, 5), (5, 5), (5, 0)])
 
-    #### a random list of shaply.Polygon
-    norm_bldg_poly = []
-    norm_bldg_poly.append(Polygon([(1, 1), (1, 2), (2, 2), (2, 1)]))
+    norm_bldg_poly = [Polygon([(1, 1), (1, 2), (2, 2), (2, 1)])]
 
     exterior_polyline = list(norm_blk_poly.exterior.coords)[:-1]
     exterior_polyline.reverse()
-    poly_list = []
-    for ix in range(len(exterior_polyline)):
-        poly_list.append(exterior_polyline[ix])
+    poly_list = [exterior_polyline[ix] for ix in range(len(exterior_polyline))]
     sk_norm_blk_poly = skgeom.Polygon(poly_list)
 
-    #### get the skeleton of block
     skel = skgeom.skeleton.create_interior_straight_skeleton(sk_norm_blk_poly)
     G, longest_skel = get_polyskeleton_longest_path(skel, sk_norm_blk_poly)
 
-    ### get the medial axis of block
     medaxis = modified_skel_to_medaxis(longest_skel, norm_blk_poly)
 
-    #############   wrap all building locations and sizes ###############################################################
-    pos_xsorted, size_xsorted, xsort_idx, aspect_rto = warp_bldg_by_midaxis(norm_bldg_poly, norm_blk_poly, medaxis)
+    pos_xsorted, size_xsorted, xsort_idx, aspect_rto = warp_bldg_by_midaxis(
+        norm_bldg_poly, norm_blk_poly, medaxis
+    )
 
-    ### pos_xsorted : normalized building locations, size_xsorted : normalized building sizes, xsort_idx : sorted index of building locations in graph
-    ### aspect_rto : aspect ratio of block
-    ######################################################################################################################
+    # ``pos_xsorted`` : normalized building locations
+    # ``size_xsorted``: normalized building sizes
+    # ``xsort_idx``   : sorted index of building locations in graph
+    # ``aspect_rto``  : aspect ratio of block
 
-    ### Then pos, size and aspect_rto are the used to generate graph by networkx.graph()
-
-    ##### The position, and size attributes in provided graph is further normalized by minus mean and divided std of the entire dataset. But that is not necessary for performance.
+    # The position and size attributes in the dataset are further normalised by
+    # subtracting the global mean and dividing by standard deviation, which is
+    # optional for reproduction of the method.
 
 
 

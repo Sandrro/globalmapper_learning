@@ -1,4 +1,18 @@
 import networkx as nx
+"""Utility helpers for visualising and manipulating street block graphs.
+
+This module mainly contains plotting routines and small helpers for converting
+between networkx graphs and tensor representations.  The comments highlight
+what each function expects and produces so the data flow across the repository
+is clear.
+
+Note
+----
+`networkx` is required for these utilities.  The import is assumed to happen
+outside this file in the original project; when running standalone remember to
+``import networkx as nx``.
+"""
+
 import matplotlib.pyplot as plt
 import os, re
 import pickle
@@ -8,28 +22,49 @@ from matplotlib.patches import Rectangle
 import matplotlib.lines as mlines
 import yaml
 
+# Configure matplotlib for large figures; helps when plotting dense graphs.
 plt.subplots(figsize=(20, 4))
 
 
 def visual_grid_graph(G, filepath, filename):
+    """Plot a grid graph to a PNG file.
+
+    Parameters
+    ----------
+    G : networkx.Graph
+        Graph whose nodes contain ``posx``/``posy`` attributes.
+    filepath : str
+        Directory where the figure will be saved.
+    filename : str
+        Name of the output image (without extension).
+    """
     pos = {}
     G = nx.convert_node_labels_to_integers(G, first_label=0, ordering='default')
     for ee in range(G.number_of_nodes()):
         pos[ee] = (G.nodes[ee]['posx'], G.nodes[ee]['posy'])
 
-    nx.draw_networkx(G, pos=pos,
-            node_color='lightgreen',
-            with_labels=True,
-            node_size=600)
-    plt.savefig(os.path.join(filepath,filename))
+    nx.draw_networkx(
+        G,
+        pos=pos,
+        node_color='lightgreen',
+        with_labels=True,
+        node_size=600,
+    )
+    plt.savefig(os.path.join(filepath, filename))
     plt.clf()
 
 
 
 def sparse_generate_graph_from_ftsarray(height, width, x_pos, y_pos, h_out, w_out, exist, asp_rto, long_side, b_shape, b_iou, b_height = None):
+    """Create a networkx grid graph from arrays of node attributes.
+
+    The decoder in ``model.py`` predicts arrays describing each node's
+    geometry.  This helper converts those arrays back into a graph structure so
+    they can be visualised or exported.
+    """
     max_node = height * width
     g = nx.grid_2d_graph(height, width)
-    G = nx.convert_node_labels_to_integers(g, first_label=0, ordering='default', label_attribute = 'old_label')
+    G = nx.convert_node_labels_to_integers(g, first_label=0, ordering='default', label_attribute='old_label')
     G.graph['aspect_ratio'] = asp_rto
     G.graph['long_side'] = long_side
 
@@ -55,7 +90,12 @@ def sparse_generate_graph_from_ftsarray(height, width, x_pos, y_pos, h_out, w_ou
 
 
 def recover_graph_features(g, existed, merge, posx, posy):
-    G = nx.convert_node_labels_to_integers(g, first_label=0, ordering='default', label_attribute = 'old_label')
+    """Update a graph with new node feature arrays.
+
+    Useful for applying model predictions back onto an existing template
+    graph.
+    """
+    G = nx.convert_node_labels_to_integers(g, first_label=0, ordering='default', label_attribute='old_label')
 
     for i in range(g.number_of_nodes()):
         G.nodes[i]['posy'] = posy[i, 0]
@@ -67,7 +107,12 @@ def recover_graph_features(g, existed, merge, posx, posy):
 
 
 
-def visual_block_graph(G, filepath, filename, draw_edge = False, draw_nonexist = False):
+def visual_block_graph(G, filepath, filename, draw_edge=False, draw_nonexist=False):
+    """Visualise a block graph with rectangles representing buildings.
+
+    Parameters control whether edges or non-existent nodes are drawn.  This is
+    helpful when debugging model outputs or viewing ground-truth samples.
+    """
     pos = []
     size = []
     edge = []
@@ -75,7 +120,7 @@ def visual_block_graph(G, filepath, filename, draw_edge = False, draw_nonexist =
 
     if not draw_nonexist:
         for i in range(G.number_of_nodes()):
-            if G.nodes[i]['exist'] == 0: # or abs(G.nodes[i]['size_x']) < 1e-2 or abs(G.nodes[i]['size_y']) < 1e-2 s
+            if G.nodes[i]['exist'] == 0:  # remove predicted empty cells
                 G.remove_node(i)
 
     G = nx.convert_node_labels_to_integers(G, first_label=0, ordering='default')
@@ -86,28 +131,46 @@ def visual_block_graph(G, filepath, filename, draw_edge = False, draw_nonexist =
     for e in G.edges:
         edge.append(e)
 
-    pos = np.array(pos, dtype = np.double)    
-    size = np.array(size, dtype = np.double)
-    edge = np.array(edge, dtype = np.int16)
+    pos = np.array(pos, dtype=np.double)
+    size = np.array(size, dtype=np.double)
+    edge = np.array(edge, dtype=np.int16)
     print(pos.shape, len(pos))
 
     if len(pos) > 0:
-        plt.scatter(pos[:, 0], pos[:, 1], c = 'red', s=50)
+        plt.scatter(pos[:, 0], pos[:, 1], c='red', s=50)
         ax = plt.gca()
         for i in range(size.shape[0]):
-            ax.add_patch(Rectangle((pos[i, 0] - size[i, 0] / 2.0, pos[i, 1] - size[i, 1] / 2.0), size[i, 0], size[i, 1], linewidth=2, edgecolor='r', facecolor='b', alpha=0.3)) 
+            ax.add_patch(
+                Rectangle(
+                    (pos[i, 0] - size[i, 0] / 2.0, pos[i, 1] - size[i, 1] / 2.0),
+                    size[i, 0],
+                    size[i, 1],
+                    linewidth=2,
+                    edgecolor='r',
+                    facecolor='b',
+                    alpha=0.3,
+                )
+            )
 
         if draw_edge:
             for i in range(edge.shape[0]):
-                l = mlines.Line2D([pos[edge[i, 0], 0], pos[edge[i, 1], 0]], [pos[edge[i, 0], 1], pos[edge[i, 1], 1]])
+                l = mlines.Line2D(
+                    [pos[edge[i, 0], 0], pos[edge[i, 1], 0]],
+                    [pos[edge[i, 0], 1], pos[edge[i, 1], 1]],
+                )
                 ax.add_line(l)
 
-    plt.savefig(os.path.join(filepath,filename + '.png'))
+    plt.savefig(os.path.join(filepath, filename + '.png'))
     plt.clf()
 
 
 
-def visual_existence_template(G, filepath, filename, coord_scale = 1, template_width = 25, template_height = 2):
+def visual_existence_template(G, filepath, filename, coord_scale=1, template_width=25, template_height=2):
+    """Visualise which template cells contain buildings.
+
+    Cells are coloured green if a building exists and red otherwise.  This view
+    is helpful when debugging existence predictions.
+    """
     unit_w = np.double(2 * coord_scale) / np.double(template_width)
     unit_h = np.double(2 * coord_scale) / np.double(template_height)
 
@@ -119,20 +182,28 @@ def visual_existence_template(G, filepath, filename, coord_scale = 1, template_w
 
     for i in range(G.number_of_nodes()):
         exist.append(G.nodes[i]['exist'])
-    
+
     for i in range(template_height):
         for j in range(template_width):
             if exist[template_width * i + j] == 0:
-                plt.scatter(w_anchor[j], h_anchor[i], c = 'red', s=100)
+                plt.scatter(w_anchor[j], h_anchor[i], c='red', s=100)
             else:
-                plt.scatter(w_anchor[j], h_anchor[i], c = 'green', s=100)
+                plt.scatter(w_anchor[j], h_anchor[i], c='green', s=100)
 
-
-    plt.savefig(os.path.join(filepath,filename + '.png'))
+    plt.savefig(os.path.join(filepath, filename + '.png'))
     plt.clf()
 
 
-def read_train_yaml(checkpoint_name, filename = "train.yaml"):
+def read_train_yaml(checkpoint_name, filename="train.yaml"):
+    """Load a YAML configuration file.
+
+    Parameters
+    ----------
+    checkpoint_name : str
+        Directory containing the YAML file.
+    filename : str, optional
+        Name of the YAML file, defaults to ``train.yaml``.
+    """
     with open(os.path.join(checkpoint_name, filename), "rb") as stream:
         try:
             opt = yaml.safe_load(stream)

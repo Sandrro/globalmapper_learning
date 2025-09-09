@@ -1,3 +1,10 @@
+"""Geometric helper functions used throughout the GlobalMapper project.
+
+The routines here operate on ``shapely`` geometries to derive measurements such
+as aspect ratios, block widths and orientation.  Extensive comments are provided
+to clarify each step of the geometry calculations.
+"""
+
 import shapely.affinity as sa
 from shapely.geometry import Point, LineString, Polygon, MultiPolygon, box, MultiLineString
 import numpy as np
@@ -8,7 +15,21 @@ from sklearn.neighbors import NearestNeighbors
 
 
 ##########################################################################
-def get_extend_line(a, b, block, isfront, is_extend_from_end = False):
+def get_extend_line(a, b, block, isfront, is_extend_from_end=False):
+    """Extend a line segment until it hits the boundary of ``block``.
+
+    Parameters
+    ----------
+    a, b : :class:`shapely.geometry.Point`
+        Endpoints of the original segment.  The line is extended from either
+        ``a`` or ``b`` depending on ``is_extend_from_end``.
+    block : :class:`shapely.geometry.Polygon`
+        Polygon representing the city block boundary.
+    isfront : bool
+        Direction flag controlling the output orientation.
+    is_extend_from_end : bool, optional
+        If ``True`` the line is extended from ``b`` instead of ``a``.
+    """
     minx, miny, maxx, maxy = block.bounds
     if a.x == b.x:  # vertical line
         if a.y <= b.y:
@@ -86,6 +107,11 @@ def get_extend_line(a, b, block, isfront, is_extend_from_end = False):
 
 ################################################################
 def get_block_width_from_pt_on_midaxis(block, vector_midaxis, pt_on_midaxis):
+    """Measure block width at a specific point along the mid-axis.
+
+    A perpendicular line through ``pt_on_midaxis`` is extended until both sides
+    hit the block boundary.  The sum of the two lengths yields the width.
+    """
     unit_v =  vector_midaxis / np.linalg.norm(vector_midaxis)
     left_v = np.array([-unit_v[1], unit_v[0]])
     right_v = np.array([unit_v[1], -unit_v[0]])
@@ -100,6 +126,7 @@ def get_block_width_from_pt_on_midaxis(block, vector_midaxis, pt_on_midaxis):
 
 ###############################################################
 def get_block_aspect_ratio(block, midaxis):
+    """Approximate the aspect ratio of a block given its medial axis."""
     coords = np.array(midaxis.coords.xy)
     midaxis_length = midaxis.length
 
@@ -134,6 +161,7 @@ def get_block_aspect_ratio(block, midaxis):
 
 
 def norm_block_to_horizonal(bldg, azimuth, bbx):
+    """Translate and rotate buildings so the block is axis-aligned."""
     blk_offset_x = np.double(bbx.centroid.x)
     blk_offset_y = np.double(bbx.centroid.y)
 
@@ -144,26 +172,27 @@ def norm_block_to_horizonal(bldg, azimuth, bbx):
     return bldg
 
 def get_block_parameters(block):
+    """Return orientation and bounding box for a block polygon."""
     bbx = block.minimum_rotated_rectangle
     azimuth = get_azimuth(bbx)
-    return azimuth, bbx 
+    return azimuth, bbx
 
 
 def _azimuth(point1, point2):
-    """azimuth between 2 points (interval 0 - 180)"""
+    """Azimuth between two points (interval 0‑180 degrees)."""
     import numpy as np
 
     angle = np.arctan2(point2[0] - point1[0], point2[1] - point1[1])
     return np.degrees(angle) if angle > 0 else np.degrees(angle) + 180
 
 def _dist(a, b):
-    """distance between points"""
+    """Euclidean distance between two 2D points."""
     import math
 
     return math.hypot(b[0] - a[0], b[1] - a[1])
 
 def get_azimuth(mrr):
-    """azimuth of minimum_rotated_rectangle"""
+    """Azimuth of the longest side of a minimum rotated rectangle."""
     mrr = mrr.minimum_rotated_rectangle
     bbox = list(mrr.exterior.coords)
     axis1 = _dist(bbox[0], bbox[3])
@@ -177,10 +206,11 @@ def get_azimuth(mrr):
 
 
 def get_bbx(pos, size):
-    bl = ( pos[0] - size[0] / 2.0, pos[1] - size[1] / 2.0)
-    br = ( pos[0] + size[0] / 2.0, pos[1] - size[1] / 2.0)
-    ur = ( pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0)
-    ul = ( pos[0] - size[0] / 2.0, pos[1] + size[1] / 2.0)
+    """Compute bounding-box corner coordinates from centre ``pos`` and ``size``."""
+    bl = (pos[0] - size[0] / 2.0, pos[1] - size[1] / 2.0)
+    br = (pos[0] + size[0] / 2.0, pos[1] - size[1] / 2.0)
+    ur = (pos[0] + size[0] / 2.0, pos[1] + size[1] / 2.0)
+    ul = (pos[0] - size[0] / 2.0, pos[1] + size[1] / 2.0)
     return bl, br, ur, ul
 
 
@@ -188,12 +218,10 @@ def get_bbx(pos, size):
 
 ###############################################################
 def get_insert_position(arr, K):
-    # Traverse the array
-    for i in range(arr.shape[0]):         
-        # If K is found
+    """Return index where value ``K`` should be inserted to keep ``arr`` sorted."""
+    for i in range(arr.shape[0]):
         if arr[i] == K:
             return np.int16(i)
-        # If arr[i] exceeds K
         elif arr[i] >= K:
             return np.int16(i)
     return np.int16(arr.shape[0])
