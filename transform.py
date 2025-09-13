@@ -4,14 +4,17 @@
 """
 transform.py
 Иерархическая канонизация → HF parquet.
-Быстрый assign зданий к кварталам:
-  - Shapely ≥2: STRtree.query_bulk + векторный contains
-  - Shapely 1.x: STRtree.query (батчи) + prepared.contains, затем fallback по poly∩block (max area)
-Подробный logger и параллельная обработка.
 
-Выход:
-  - blocks.parquet, branches.parquet, nodes_fixed.parquet, edges.parquet
-  - masks/{block_id}.png
+Обновления:
+- Быстрый assign зданий к кварталам (STRtree + prepared.contains + fallback по площади пересечения).
+- Параллельная обработка кварталов с мягким UNIX-таймаутом на каждый квартал (по умолчанию 300 сек).
+- КАЖДЫЙ квартал обрабатывается и сохраняется в отдельные parquet-файлы:
+    out/by_block/<block_id>/{blocks,branches,nodes_fixed,edges}.parquet
+  В конце все per-block-файлы собираются в общие 4 файла в корне out/.
+- Сохранение orphaned_buildings.geojson и orphaned_blocks.geojson.
+- Сохранение timeout.geojson (кварталы, не уложившиеся в таймаут, + их здания).
+- Исправлен NameError: _cand_len в воркере, аккуратные проверки без этой функции.
+- Исправлена сериализация списков с np.int64/np.float64 в timeout.geojson.
 """
 
 import os, sys, math, time, logging, argparse, multiprocessing as mp
@@ -26,6 +29,8 @@ from shapely.strtree import STRtree
 from PIL import Image, ImageDraw
 import networkx as nx
 import json
+import signal
+from contextlib import contextmanager
 
 # --- tqdm (optional) ---
 try:
@@ -141,7 +146,6 @@ def _largest_polygon(geom):
     if isinstance(geom, MultiPolygon):
         geoms = [g for g in geom.geoms if (g is not None and not g.is_empty)]
         return max(geoms, key=lambda g: g.area) if geoms else None
-    # на всякий случай
     try:
         hull = geom.convex_hull
         return hull if isinstance(hull, Polygon) else None
@@ -335,85 +339,22 @@ def evenly_subsample(idx: np.ndarray, k: int) -> np.ndarray:
     pos = np.linspace(0, len(idx)-1, k).round().astype(int)
     return idx[pos]
 
-# --- helper: корректная проверка пустоты для list/ndarray ---
-def _cand_len(cands) -> int:
+# ----------------- TIMEOUT helper -----------------
+@contextmanager
+def time_limit(seconds: int):
+    """Unix-only soft таймаут. В воркере (отдельный процесс) безопасно."""
+    def _handler(signum, frame):
+        raise TimeoutError("worker timeout")
+    old = signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(max(1, int(seconds)))
     try:
-        # numpy array
-        return int(cands.size)
-    except Exception:
-        # list/tuple
-        try:
-            return len(cands)
-        except Exception:
-            return 0
-
-def preflight_overlap_check(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, sample: int = 5000):
-    # bbox
-    bx = blocks.total_bounds  # minx, miny, maxx, maxy
-    gx = bldgs.total_bounds
-    log.info(f"blocks bbox: minx={bx[0]:.1f}, miny={bx[1]:.1f}, maxx={bx[2]:.1f}, maxy={bx[3]:.1f}")
-    log.info(f"bldgs  bbox: minx={gx[0]:.1f}, miny={gx[1]:.1f}, maxx={gx[2]:.1f}, maxy={gx[3]:.1f}")
-
-    if blocks.sindex is None:
-        log.warning("blocks.sindex is None — GeoPandas не смог создать пространственный индекс")
-        return
-
-    # грубая оценка перекрытий по сэмплу зданий
-    idx = np.arange(len(bldgs))
-    if len(idx) > sample:
-        idx = np.random.RandomState(42).choice(idx, size=sample, replace=False)
-    try:
-        inp, blk = blocks.sindex.query_bulk(bldgs.geometry.iloc[idx], predicate="intersects")
-        hit_ratio = (len(np.unique(inp)) / len(idx)) if len(idx) else 0.0
-        log.info(f"preflight: пересекается {hit_ratio*100:.2f}% выборки зданий со слоями blocks")
-        if hit_ratio < 0.5:
-            log.warning("Очень низкая доля пересечений. Похоже, слои мало (или вовсе не) перекрываются "
-                        "(возможно, поданы не те 'blocks', например функциональные зоны).")
-    except Exception as e:
-        log.warning(f"preflight: не удалось оценить пересечения через sindex.query_bulk: {e}")
-
-def _to_wkb_bytes(geom) -> bytes:
-    try:
-        import shapely
-        return shapely.to_wkb(geom)     # Shapely 2.x
-    except Exception:
-        from shapely import wkb
-        return wkb.dumps(geom)          # Shapely 1.x
-
-def _preflight_overlap_check_compat(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, sample: int = 4000):
-    bx = blocks.total_bounds; gx = bldgs.total_bounds
-    log.info(f"blocks bbox: minx={bx[0]:.1f}, miny={bx[1]:.1f}, maxx={bx[2]:.1f}, maxy={bx[3]:.1f}")
-    log.info(f"bldgs  bbox: minx={gx[0]:.1f}, miny={gx[1]:.1f}, maxx={gx[2]:.1f}, maxy={gx[3]:.1f}")
-    try:
-        # Современный путь (если доступен)
-        if hasattr(blocks.sindex, "query_bulk"):
-            idx_inp, _ = blocks.sindex.query_bulk(
-                bldgs.geometry.sample(min(sample, len(bldgs)), random_state=42),
-                predicate="intersects"
-            )
-            hit = (len(np.unique(idx_inp)) / max(1, min(sample, len(bldgs))))
-            log.info(f"preflight(query_bulk): ≈{hit*100:.2f}% зданий пересекают blocks")
-        else:
-            # Старый API: rtree.Index.intersection(bbox)
-            rs = np.random.RandomState(42)
-            ids = rs.choice(len(bldgs), size=min(sample, len(bldgs)), replace=False)
-            hits = 0
-            for i in ids:
-                b = bldgs.geometry.iloc[i]
-                cand = list(blocks.sindex.intersection(b.bounds))
-                if any(blocks.geometry.iloc[j].intersects(b) for j in cand):
-                    hits += 1
-            hit = hits / max(1, len(ids))
-            log.info(f"preflight(intersection): ≈{hit*100:.2f}% зданий пересекают blocks")
-        if hit < 0.5:
-            log.warning("Низкая доля пересечений — возможно, подан слой, который почти не перекрывается со зданиями.")
-    except Exception as e:
-        log.warning(f"preflight: не удалось оценить пересечения: {e}")
-
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
 
 # ---------- helpers for parallel assign ----------
 from shapely import wkb as _shp_wkb
-import multiprocessing as mp
 
 _ASSIGN_STATE = {
     "blk_ids": None,
@@ -423,11 +364,8 @@ _ASSIGN_STATE = {
 }
 
 def _init_assign_worker(blk_wkbs, blk_ids):
-    """Инициализатор пула: один раз на процесс.
-    Собираем геометрии блоков, пространственный индекс и prepared-предикаты.
-    """
     geoms = [ _shp_wkb.loads(b) for b in blk_wkbs ]
-    gs = gpd.GeoSeries(geoms, crs=None)   # CRS тут не нужен, всё уже в метрах
+    gs = gpd.GeoSeries(geoms, crs=None)
     from shapely.prepared import prep
     _ASSIGN_STATE["blk_ids"] = np.asarray(blk_ids)
     _ASSIGN_STATE["blk_geoms"] = geoms
@@ -435,10 +373,6 @@ def _init_assign_worker(blk_wkbs, blk_ids):
     _ASSIGN_STATE["blk_prepared"] = [prep(g) for g in geoms]
 
 def _assign_chunk(args):
-    """Обрабатывает чанк зданий в одном воркере.
-    args: (global_idx_np[int], bldg_wkbs[List[bytes]])
-    return: (global_idx_np[int], assigned_block_ix_np[int])
-    """
     idx_global, wkbs = args
     geoms_b = [ _shp_wkb.loads(b) for b in wkbs ]
     centroids = [ g.centroid for g in geoms_b ]
@@ -482,12 +416,8 @@ def _assign_chunk(args):
     return idx_global, assigned
 
 def fast_assign_blocks(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, log_prefix="", num_workers: int = 1, chunk_size: int = 20000) -> pd.Series:
-    """Параллельное присвоение block_id зданиям.
-    Совместимо с любыми версиями GeoPandas/Rtree (использует sindex.intersection).
-    """
     t0 = time.perf_counter()
 
-    # фильтрация валидных геометрий блоков
     valid = blocks.geometry.notna() & (~blocks.geometry.is_empty)
     blocks_v = blocks.loc[valid].copy()
     if blocks_v.empty:
@@ -495,31 +425,27 @@ def fast_assign_blocks(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, log_pr
         return pd.Series(pd.NA, index=bldgs.index, dtype="object")
 
     blk_ids_v = blocks_v["block_id"].to_numpy()
-    blk_wkbs  = [ geom_to_wkb(g) for g in blocks_v.geometry.values ]  # bytes
+    blk_wkbs  = [ geom_to_wkb(g) for g in blocks_v.geometry.values ]
 
-    # подготовим WKB чанк зданий
     n = len(bldgs)
     all_idx = np.arange(n, dtype=np.int64)
     b_wkbs  = [ geom_to_wkb(g) for g in bldgs.geometry.values ]
 
-    # последовательный путь (на всякий случай)
     if num_workers <= 1:
         _init_assign_worker(blk_wkbs, blk_ids_v)
         assigned_ix = np.full(n, -1, dtype=np.int64)
-        for start in (tqdm(range(0, n, chunk_size), desc=f"{log_prefix}assign chanks") if TQDM else range(0, n, chunk_size)):
+        rng = tqdm(range(0, n, chunk_size), desc=f"{log_prefix}assign chunks") if TQDM else range(0, n, chunk_size)
+        for start in rng:
             end = min(start + chunk_size, n)
             ig, ax = _assign_chunk((all_idx[start:end], b_wkbs[start:end]))
             assigned_ix[ig] = ax
     else:
-        # параллельный путь
         log.info(f"{log_prefix}parallel assign: workers={num_workers}, chunk_size={chunk_size}")
         assigned_ix = np.full(n, -1, dtype=np.int64)
-
         tasks = []
         for start in range(0, n, chunk_size):
             end = min(start + chunk_size, n)
             tasks.append((all_idx[start:end], b_wkbs[start:end]))
-
         with mp.get_context("spawn").Pool(
             processes=num_workers,
             initializer=_init_assign_worker,
@@ -535,12 +461,12 @@ def fast_assign_blocks(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, log_pr
     t1 = time.perf_counter()
     log.info(f"{log_prefix}assigned total: {n_assigned}/{n} in {t1 - t0:.2f}s")
 
-    # собираем Series block_id
     out = pd.Series(pd.NA, index=bldgs.index, dtype="object")
     ok = assigned_ix >= 0
     out.iloc[np.where(ok)[0]] = blk_ids_v[assigned_ix[ok]]
     return out
 
+# ----------------- EMPTY PAYLOAD HELPER -----------------
 def _empty_block_payload(blk_id: str, zone, mask_path: str, N: int) -> Dict[str, Any]:
     block_row = {
         "block_id": blk_id, "zone": zone,
@@ -555,51 +481,52 @@ def _empty_block_payload(blk_id: str, zone, mask_path: str, N: int) -> Dict[str,
     } for i in range(N)]
     return {"block": block_row, "branches": [], "nodes": nodes, "edges": []}
 
-# ----------------- WORKER -----------------
+# ----------------- worker: per-block save + timeout -----------------
+def _safe_len(x) -> int:
+    try:
+        return len(x)
+    except Exception:
+        try:
+            return int(x.size)
+        except Exception:
+            return 0
+
+def _block_dir(out_dir: str, blk_id: str) -> str:
+    return os.path.join(out_dir, "by_block", str(blk_id))
+
+def _write_block_parquets(out_dir: str, blk_id: str, block_row: dict, branches_rows: list, nodes_rows: list, edges_rows: list):
+    bdir = _block_dir(out_dir, blk_id)
+    os.makedirs(bdir, exist_ok=True)
+    pd.DataFrame([block_row]).to_parquet(os.path.join(bdir, "blocks.parquet"), index=False)
+    pd.DataFrame(branches_rows).to_parquet(os.path.join(bdir, "branches.parquet"), index=False)
+    nodes_df = pd.DataFrame(nodes_rows)
+    if "floors_num" in nodes_df.columns:
+        nodes_df["floors_num"] = nodes_df["floors_num"].astype("Int64")
+    nodes_df.to_parquet(os.path.join(bdir, "nodes_fixed.parquet"), index=False)
+    pd.DataFrame(edges_rows).to_parquet(os.path.join(bdir, "edges.parquet"), index=False)
+
+
 def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Обрабатывает один квартал:
-      - poly_wkb -> Polygon (крупнейшая часть из MultiPolygon)
-      - маска 64x64
-      - скелет -> ветви; fallback к диагонали MRR
-      - канон. координаты/размеры/дельта-угол по ветвям
-      - паддинг до N; рёбра решётки
-    Возвращает dict с ключами: block, branches, nodes, edges (всегда).
-    """
     blk_id      = task["block_id"]
     zone        = task["zone"]
     poly_wkb    = task["poly_wkb"]
-    rows_bldgs  = task["bldgs_rows"]  # список dict с geometry=WKB и атрибутами
+    rows_bldgs  = task["bldgs_rows"]
     N           = int(task["N"])
     mask_size   = int(task["mask_size"])
     mask_dir    = task["mask_dir"]
+    timeout_sec = int(task.get("timeout_sec", 300))
+    out_dir     = task["out_dir"]
 
     mask_path = os.path.join(mask_dir, f"{blk_id}.png")
 
-    # --- локальный хелпер: пустой payload с паддингом ---
-    def _empty_payload(scale_l: float = 0.0) -> Dict[str, Any]:
-        block_row = {
-            "block_id": blk_id, "zone": zone,
-            "n_buildings": 0, "n_branches": 0,
-            "scale_l": float(scale_l), "mask_path": mask_path
-        }
-        nodes = [{
-            "block_id": blk_id, "slot_id": i, "e_i": 0, "branch_local_id": -1,
-            "posx": 0.0, "posy": 0.0, "size_x": 0.0, "size_y": 0.0, "phi_resid": 0.0,
-            "s_i": 0, "a_i": 0.0, "floors_num": pd.NA, "living_area": 0.0,
-            "is_living": False, "has_floors": False,
-            "services_present": [], "services_capacity": [], "aspect_ratio": 0.0
-        } for i in range(N)]
-        return {"block": block_row, "branches": [], "nodes": nodes, "edges": []}
-
-    # --- геометрия квартала ---
+    # квартальная геометрия
     try:
         poly = geom_from_wkb(poly_wkb)
     except Exception:
         poly = None
     poly = _largest_polygon(poly)
 
-    # --- маска 64x64 (чёрная, если геометрии нет) ---
+    # mask
     ok_mask = False
     if poly is not None:
         try:
@@ -607,207 +534,228 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             ok_mask = False
     if not ok_mask:
-        # создаём пустую маску вручную
         try:
             os.makedirs(os.path.dirname(mask_path), exist_ok=True)
             Image.new("L", (mask_size, mask_size), 0).save(mask_path)
         except Exception:
             pass
-        # если квартал пустой — возвращаем пустой payload
         if poly is None:
-            return _empty_payload(0.0)
+            # пустой квартал
+            payload = _empty_block_payload(blk_id, zone, mask_path, N)
+            _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
+            return {"block_id": blk_id, "status": "ok_empty"}
 
-    # --- если в квартале нет зданий — вернуть паддинг с корректным scale_l ---
     if not rows_bldgs:
         scale_l = float(block_scale_l(poly, [])) if poly is not None else 0.0
-        return _empty_payload(scale_l)
+        payload = _empty_block_payload(blk_id, zone, mask_path, N)
+        payload["block"]["scale_l"] = scale_l
+        _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
+        return {"block_id": blk_id, "status": "ok_empty"}
 
-    # --- скелет и ветви; надёжный fallback ---
     try:
-        skel = build_straight_skeleton(poly)
-        G = skeleton_to_graph(skel)
-        branches = extract_branches(G)
+        with time_limit(timeout_sec):
+            # 1) skeleton & branches
+            try:
+                skel = build_straight_skeleton(poly)
+                G = skeleton_to_graph(skel)
+                branches = extract_branches(G)
+            except Exception:
+                branches = []
+            if not branches:
+                mrr = poly.minimum_rotated_rectangle
+                coords = list(mrr.exterior.coords)
+                branches = [LineString([coords[0], coords[2]])]
+            valid_branches = [(i, br) for i, br in enumerate(branches)
+                              if isinstance(br, LineString) and br.length > 0]
+            scale_l = float(block_scale_l(poly, [br for _, br in valid_branches]))
+
+            # 2) buildings from WKB
+            g_geoms, attrs = [], []
+            for r in rows_bldgs:
+                try:
+                    g = geom_from_wkb(r["geometry"])
+                except Exception:
+                    g = None
+                if g is None or g.is_empty:
+                    continue
+                g_geoms.append(g)
+                a = dict(r); a.pop("geometry", None)
+                attrs.append(a)
+            if len(g_geoms) == 0:
+                payload = _empty_block_payload(blk_id, zone, mask_path, N)
+                payload["block"]["scale_l"] = scale_l
+                _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
+                return {"block_id": blk_id, "status": "ok_empty"}
+
+            df = pd.DataFrame(attrs)
+            gdf = gpd.GeoDataFrame(df, geometry=g_geoms, crs=None)
+
+            # 3) nearest branch by centroid
+            cent = gdf.geometry.centroid
+            nearest_idx = []
+            for p in cent:
+                dists = [br.distance(p) for _, br in valid_branches]
+                nearest_idx.append(int(np.argmin(dists)) if dists else 0)
+            gdf["branch_local_id"] = nearest_idx
+
+            # 4) per-branch features
+            per_branch: Dict[int, dict] = {}
+            branches_rows = [{"block_id": blk_id, "branch_local_id": i, "length": float(br.length)}
+                             for i, br in valid_branches]
+            counts = []
+            branch_ids_sorted = []
+            for j, br in valid_branches:
+                rows = gdf[gdf["branch_local_id"] == j].reset_index(drop=True)
+                if rows.empty:
+                    per_branch[j] = {
+                        "rows": rows, "pos": np.zeros((0, 2)), "size": np.zeros((0, 2)),
+                        "phi": np.zeros((0,)), "aspect": np.zeros((0,)), "s": np.zeros((0,), int),
+                        "a": np.zeros((0,), float)
+                    }
+                    cnt = 0
+                else:
+                    pos, size, phi, aspect = canon_by_branch(list(rows.geometry.values), poly, br)
+                    s_labels, a_vals = [], []
+                    for geom in rows.geometry.values:
+                        try: s_labels.append(int(classify_shape(geom)))
+                        except Exception: s_labels.append(0)
+                        try: a_vals.append(float(occupancy_ratio(geom)))
+                        except Exception: a_vals.append(0.0)
+                    per_branch[j] = {
+                        "rows": rows, "pos": pos, "size": size, "phi": phi, "aspect": aspect,
+                        "s": np.array(s_labels, int), "a": np.array(a_vals, float)
+                    }
+                    cnt = len(rows)
+                counts.append(cnt)
+                branch_ids_sorted.append(j)
+
+            # 5) allocate N slots & choose
+            alloc = allocate_slots_per_branch(counts, N)
+            slot_meta = []
+            slot = 0
+            for j, cnt, kslots in zip(branch_ids_sorted, counts, alloc):
+                feat = per_branch[j]
+                if cnt == 0 or kslots == 0:
+                    continue
+                order = np.argsort(feat["pos"][:, 0])
+                chosen = evenly_subsample(order, kslots)
+                posx = feat["pos"][chosen, 0]
+                ord2 = np.argsort(posx)
+                for k in chosen[ord2]:
+                    slot_meta.append((slot, j, int(k)))
+                    slot += 1
+                    if slot >= N: break
+                if slot >= N: break
+
+            # 6) nodes
+            nodes = []
+            for slot_id, j, k in slot_meta:
+                feat = per_branch[j]
+                r = feat["rows"].iloc[k]
+                s_vec = feat.get("s", [])
+                a_vec = feat.get("a", [])
+                s_i = int(s_vec[k]) if isinstance(s_vec, (list, tuple, np.ndarray)) and _safe_len(s_vec) > k else 0
+                a_i = float(a_vec[k]) if isinstance(a_vec, (list, tuple, np.ndarray)) and _safe_len(a_vec) > k else 0.0
+                nodes.append({
+                    "block_id": blk_id, "slot_id": slot_id, "e_i": 1,
+                    "branch_local_id": int(j),
+                    "posx": float(feat["pos"][k, 0]), "posy": float(feat["pos"][k, 1]),
+                    "size_x": float(feat["size"][k, 0]), "size_y": float(feat["size"][k, 1]),
+                    "phi_resid": float(feat["phi"][k]),
+                    "s_i": s_i,
+                    "a_i": a_i,
+                    "floors_num": (pd.NA if pd.isna(r.get("floors_num")) else int(r.get("floors_num"))),
+                    "living_area": float(r.get("living_area", 0.0)),
+                    "is_living": bool(r.get("is_living", False)),
+                    "has_floors": bool(r.get("has_floors", False)),
+                    "services_present": list(r.get("services_present", [])),
+                    "services_capacity": list(r.get("services_capacity", [])),
+                    "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", []))>k else 0.0,
+                })
+
+            for slot_id in range(len(nodes), N):
+                nodes.append({
+                    "block_id": blk_id, "slot_id": slot_id, "e_i": 0,
+                    "branch_local_id": -1,
+                    "posx": 0.0, "posy": 0.0, "size_x": 0.0, "size_y": 0.0, "phi_resid": 0.0,
+                    "s_i": 0, "a_i": 0.0, "floors_num": pd.NA, "living_area": 0.0,
+                    "is_living": False, "has_floors": False,
+                    "services_present": [], "services_capacity": [], "aspect_ratio": 0.0
+                })
+
+            # 7) edges
+            edges = []
+            slots_by_branch: Dict[int, list] = {}
+            for slot_id, j, k in slot_meta:
+                slots_by_branch.setdefault(j, []).append((slot_id, k))
+
+            for j, lst in slots_by_branch.items():
+                feat = per_branch[j]
+                lst_sorted = sorted(lst, key=lambda t: float(feat["pos"][t[1], 0]))
+                for a in range(len(lst_sorted) - 1):
+                    s1 = lst_sorted[a][0]; s2 = lst_sorted[a + 1][0]
+                    edges.append({"block_id": blk_id, "src_slot": s1, "dst_slot": s2})
+                    edges.append({"block_id": blk_id, "src_slot": s2, "dst_slot": s1})
+
+            for idx in range(len(branch_ids_sorted) - 1):
+                j1 = branch_ids_sorted[idx]; j2 = branch_ids_sorted[idx + 1]
+                if j1 not in slots_by_branch or j2 not in slots_by_branch: continue
+                f1 = per_branch[j1]; f2 = per_branch[j2]
+                A = sorted(slots_by_branch[j1], key=lambda t: float(f1["pos"][t[1], 0]))
+                B = sorted(slots_by_branch[j2], key=lambda t: float(f2["pos"][t[1], 0]))
+                m = min(len(A), len(B))
+                for rnk in range(m):
+                    a = int(round((len(A) - 1) * rnk / max(m - 1, 1)))
+                    b = int(round((len(B) - 1) * rnk / max(m - 1, 1)))
+                    s1 = A[a][0]; s2 = B[b][0]
+                    edges.append({"block_id": blk_id, "src_slot": s1, "dst_slot": s2})
+                    edges.append({"block_id": blk_id, "src_slot": s2, "dst_slot": s1})
+
+            block_row = {
+                "block_id": blk_id, "zone": zone,
+                "n_buildings": int(len(gdf)), "n_branches": int(len(valid_branches)),
+                "scale_l": scale_l, "mask_path": mask_path
+            }
+
+            # записать per-block parquet
+            _write_block_parquets(out_dir, blk_id, block_row, branches_rows, nodes, edges)
+            return {"block_id": blk_id, "status": "ok"}
+
+    except TimeoutError:
+        return {
+            "status": "timeout",
+            "block_id": blk_id,
+            "zone": zone,
+            "poly_wkb": poly_wkb,
+            "bldgs_rows": rows_bldgs,
+        }
+
+# ----------------- ORPHANS / TIMEOUT DUMPS -----------------
+def _json_safe_list(v) -> str:
+    try:
+        if v is None:
+            return "[]"
+        lst = list(v)
+        out = []
+        for x in lst:
+            if isinstance(x, (np.integer,)):
+                out.append(int(x))
+            elif isinstance(x, (np.floating,)):
+                out.append(float(x))
+            else:
+                out.append(x)
+        return json.dumps(out)
     except Exception:
-        branches = []
-    if not branches:
-        # fallback: главная диагональ minimum_rotated_rectangle
-        mrr = poly.minimum_rotated_rectangle
-        coords = list(mrr.exterior.coords)
-        branches = [LineString([coords[0], coords[2]])]
-    valid_branches = [(i, br) for i, br in enumerate(branches)
-                      if isinstance(br, LineString) and br.length > 0]
-    scale_l = float(block_scale_l(poly, [br for _, br in valid_branches]))
-
-    # --- здания: из WKB -> GeoDataFrame ---
-    g_geoms = []
-    attrs = []
-    for r in rows_bldgs:
-        try:
-            g = geom_from_wkb(r["geometry"])
-            if g is None or g.is_empty:
-                continue
-            g_geoms.append(g)
-            # копия без geometry
-            a = dict(r)
-            a.pop("geometry", None)
-            attrs.append(a)
-        except Exception:
-            continue
-
-    if len(g_geoms) == 0:
-        # все здания оказались пустыми/битими
-        return _empty_payload(scale_l)
-
-    df = pd.DataFrame(attrs)
-    gdf = gpd.GeoDataFrame(df, geometry=g_geoms, crs=None)
-
-    # --- привязка зданий к ближайшей ветви по центроиду ---
-    cent = gdf.geometry.centroid
-    nearest_idx = []
-    for p in cent:
-        dists = [br.distance(p) for _, br in valid_branches]
-        nearest_idx.append(int(np.argmin(dists)) if dists else 0)
-    gdf["branch_local_id"] = nearest_idx
-
-    # --- канонические признаки по ветвям ---
-    per_branch: Dict[int, dict] = {}
-    branches_rows = [{"block_id": blk_id, "branch_local_id": i, "length": float(br.length)}
-                     for i, br in valid_branches]
-    counts = []
-    branch_ids_sorted = []
-    for j, br in valid_branches:
-        rows = gdf[gdf["branch_local_id"] == j].reset_index(drop=True)
-        if rows.empty:
-            per_branch[j] = {
-                "rows": rows, "pos": np.zeros((0, 2)), "size": np.zeros((0, 2)),
-                "phi": np.zeros((0,)), "aspect": np.zeros((0,)), "s": np.zeros((0,), int),
-                "a": np.zeros((0,), float)
-            }
-            cnt = 0
-        else:
-            pos, size, phi, aspect = canon_by_branch(list(rows.geometry.values), poly, br)
-            s_labels, a_vals = [], []
-            for geom in rows.geometry.values:
-                try:
-                    s_labels.append(classify_shape(geom))
-                except Exception:
-                    s_labels.append(0)
-                try:
-                    a_vals.append(occupancy_ratio(geom))
-                except Exception:
-                    a_vals.append(0.0)
-            per_branch[j] = {
-                "rows": rows, "pos": pos, "size": size, "phi": phi, "aspect": aspect,
-                "s": np.array(s_labels, int), "a": np.array(a_vals, float)
-            }
-            cnt = len(rows)
-        counts.append(cnt)
-        branch_ids_sorted.append(j)
-
-    # --- распределение N слотов между ветвями и выбор узлов ---
-    alloc = allocate_slots_per_branch(counts, N)
-    slot_meta = []
-    slot = 0
-    for j, cnt, kslots in zip(branch_ids_sorted, counts, alloc):
-        feat = per_branch[j]
-        if cnt == 0 or kslots == 0:
-            continue
-        order = np.argsort(feat["pos"][:, 0])  # слева-направо
-        chosen = evenly_subsample(order, kslots)
-        posx = feat["pos"][chosen, 0]
-        ord2 = np.argsort(posx)
-        for k in chosen[ord2]:
-            slot_meta.append((slot, j, int(k)))
-            slot += 1
-            if slot >= N:
-                break
-        if slot >= N:
-            break
-
-    # --- узлы ---
-    nodes = []
-    for slot_id, j, k in slot_meta:
-        feat = per_branch[j]
-        r = feat["rows"].iloc[k]
-        nodes.append({
-            "block_id": blk_id, "slot_id": slot_id, "e_i": 1,
-            "branch_local_id": int(j),
-            "posx": float(feat["pos"][k, 0]), "posy": float(feat["pos"][k, 1]),
-            "size_x": float(feat["size"][k, 0]), "size_y": float(feat["size"][k, 1]),
-            "phi_resid": float(feat["phi"][k]),
-            "s_i": int(feat["s"][k]) if "s" in feat else 0,
-            "a_i": float(feat["a"][k]) if "a" in feat else 0.0,
-            "floors_num": (pd.NA if pd.isna(r.get("floors_num")) else int(r.get("floors_num"))),
-            "living_area": float(r.get("living_area", 0.0)),
-            "is_living": bool(r.get("is_living", False)),
-            "has_floors": bool(r.get("has_floors", False)),
-            "services_present": list(r.get("services_present", [])),
-            "services_capacity": list(r.get("services_capacity", [])),
-            "aspect_ratio": float(feat["aspect"][k]),
-        })
-
-    # паддинг до N
-    for slot_id in range(len(nodes), N):
-        nodes.append({
-            "block_id": blk_id, "slot_id": slot_id, "e_i": 0,
-            "branch_local_id": -1,
-            "posx": 0.0, "posy": 0.0, "size_x": 0.0, "size_y": 0.0, "phi_resid": 0.0,
-            "s_i": 0, "a_i": 0.0, "floors_num": pd.NA, "living_area": 0.0,
-            "is_living": False, "has_floors": False,
-            "services_present": [], "services_capacity": [], "aspect_ratio": 0.0
-        })
-
-    # --- рёбра: вдоль веток + межветочные (решётка) ---
-    edges = []
-    slots_by_branch: Dict[int, list] = {}
-    for slot_id, j, k in slot_meta:
-        slots_by_branch.setdefault(j, []).append((slot_id, k))
-
-    # по ветке
-    for j, lst in slots_by_branch.items():
-        feat = per_branch[j]
-        lst_sorted = sorted(lst, key=lambda t: float(feat["pos"][t[1], 0]))
-        for a in range(len(lst_sorted) - 1):
-            s1 = lst_sorted[a][0]; s2 = lst_sorted[a + 1][0]
-            edges.append({"block_id": blk_id, "src_slot": s1, "dst_slot": s2})
-            edges.append({"block_id": blk_id, "src_slot": s2, "dst_slot": s1})
-
-    # меж веток (грубая «решётка»)
-    for idx in range(len(branch_ids_sorted) - 1):
-        j1 = branch_ids_sorted[idx]
-        j2 = branch_ids_sorted[idx + 1]
-        if j1 not in slots_by_branch or j2 not in slots_by_branch:
-            continue
-        f1 = per_branch[j1]; f2 = per_branch[j2]
-        A = sorted(slots_by_branch[j1], key=lambda t: float(f1["pos"][t[1], 0]))
-        B = sorted(slots_by_branch[j2], key=lambda t: float(f2["pos"][t[1], 0]))
-        m = min(len(A), len(B))
-        for rnk in range(m):
-            a = int(round((len(A) - 1) * rnk / max(m - 1, 1)))
-            b = int(round((len(B) - 1) * rnk / max(m - 1, 1)))
-            s1 = A[a][0]; s2 = B[b][0]
-            edges.append({"block_id": blk_id, "src_slot": s1, "dst_slot": s2})
-            edges.append({"block_id": blk_id, "src_slot": s2, "dst_slot": s1})
-
-    block_row = {
-        "block_id": blk_id, "zone": zone,
-        "n_buildings": int(len(gdf)), "n_branches": int(len(valid_branches)),
-        "scale_l": scale_l, "mask_path": mask_path
-    }
-    return {"block": block_row, "branches": branches_rows, "nodes": nodes, "edges": edges}
+        return "[]"
 
 def _dump_orphans(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
 
-    # --- здания без привязки ---
     orphan_b = bldgs[bldgs["block_id"].isna()].copy()
     if not orphan_b.empty:
-        # списки → строки (GeoJSON не любит массивы в полях)
         for col in ("services_present", "services_capacity"):
             if col in orphan_b.columns:
-                orphan_b[col] = orphan_b[col].apply(
-                    lambda v: json.dumps(v) if isinstance(v, list) else json.dumps([])
-                )
+                orphan_b[col] = orphan_b[col].apply(_json_safe_list)
         outb = os.path.join(out_dir, "orphaned_buildings.geojson")
         try:
             orphan_b.to_file(outb, driver="GeoJSON")
@@ -815,7 +763,6 @@ def _dump_orphans(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, out_dir: st
         except Exception as e:
             log.warning(f"orphaned_buildings: не удалось сохранить GeoJSON: {e}")
 
-    # --- кварталы без зданий ---
     used = set(bldgs["block_id"].dropna().unique().tolist())
     orphan_blk = blocks[~blocks["block_id"].isin(used)].copy()
     if not orphan_blk.empty:
@@ -826,9 +773,75 @@ def _dump_orphans(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, out_dir: st
         except Exception as e:
             log.warning(f"orphaned_blocks: не удалось сохранить GeoJSON: {e}")
 
+def _dump_timeouts(timeout_packets: List[Dict[str, Any]], out_dir: str, crs) -> None:
+    if not timeout_packets: return
+    rows = []
+    for item in timeout_packets:
+        blk_id = item.get("block_id")
+        zone   = item.get("zone")
+        try:
+            poly = geom_from_wkb(item.get("poly_wkb"))
+        except Exception:
+            poly = None
+        if poly is not None and not poly.is_empty:
+            rows.append({"kind": "block", "block_id": blk_id, "zone": zone, "geometry": poly})
+        for r in (item.get("bldgs_rows") or []):
+            try:
+                g = geom_from_wkb(r.get("geometry"))
+            except Exception:
+                g = None
+            if g is None or g.is_empty:
+                continue
+            rows.append({
+                "kind": "building",
+                "block_id": blk_id,
+                "building_id": r.get("building_id"),
+                "floors_num": (None if pd.isna(r.get("floors_num")) else int(r.get("floors_num"))),
+                "living_area": float(r.get("living_area", 0.0)),
+                "is_living": bool(r.get("is_living", False)),
+                "has_floors": bool(r.get("has_floors", False)),
+                "services_present": _json_safe_list(r.get("services_present", [])),
+                "services_capacity": _json_safe_list(r.get("services_capacity", [])),
+                "geometry": g,
+            })
+    if not rows: return
+    gdf = gpd.GeoDataFrame(pd.DataFrame(rows), geometry="geometry", crs=crs)
+    outp = os.path.join(out_dir, "timeout.geojson")
+    try:
+        gdf.to_file(outp, driver="GeoJSON")
+        log.info(f"timeout.geojson: сохранено {len(gdf)} объектов (блоки+здания) → {outp}")
+    except Exception as e:
+        log.warning(f"timeout.geojson: не удалось сохранить GeoJSON: {e}")
+
+# ----------------- MERGE per-block parquet -----------------
+from glob import glob
+
+def _merge_parquet_tree(by_block_root: str, rel_name: str, out_path: str):
+    paths = sorted(glob(os.path.join(by_block_root, "*", rel_name)))
+    if not paths:
+        pd.DataFrame([]).to_parquet(out_path, index=False)
+        return 0
+    dfs = []
+    for p in (tqdm(paths, desc=f"merge {rel_name}") if TQDM else paths):
+        try:
+            dfs.append(pd.read_parquet(p))
+        except Exception:
+            pass
+    if not dfs:
+        pd.DataFrame([]).to_parquet(out_path, index=False)
+        return 0
+    df = pd.concat(dfs, ignore_index=True)
+    if rel_name == "nodes_fixed.parquet" and "floors_num" in df.columns:
+        try:
+            df["floors_num"] = df["floors_num"].astype("Int64")
+        except Exception:
+            pass
+    df.to_parquet(out_path, index=False)
+    return len(df)
+
 # ----------------- MAIN -----------------
 def main():
-    ap = argparse.ArgumentParser("Иерархическая канонизация → HF parquet (адаптивный fast assign + logger + multiprocessing)")
+    ap = argparse.ArgumentParser("Иерархическая канонизация → HF parquet (assign + per-block save + timeout)")
     ap.add_argument("--blocks", required=True)
     ap.add_argument("--buildings", required=True)
     ap.add_argument("--target-crs", required=True)
@@ -836,6 +849,7 @@ def main():
     ap.add_argument("--N", type=int, default=120)
     ap.add_argument("--mask-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=4)
+    ap.add_argument("--block-timeout-sec", type=int, default=300, help="Таймаут на обработку одного квартала (сек)")
     ap.add_argument("--log-level", type=str, default="INFO")
     args = ap.parse_args()
 
@@ -844,6 +858,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     mask_dir = os.path.join(args.out_dir, "masks")
     os.makedirs(mask_dir, exist_ok=True)
+    by_block_root = os.path.join(args.out_dir, "by_block")
+    os.makedirs(by_block_root, exist_ok=True)
 
     log.info("Загрузка данных…")
     blocks = load_vector(args.blocks)
@@ -864,13 +880,13 @@ def main():
     if "zone" not in blocks.columns:
         blocks["zone"] = pd.NA
 
-    # ---------- FAST ASSIGN вместо sjoin within ----------
+    # ---------- FAST ASSIGN ----------
     log.info("Быстрое присвоение зданий кварталам (STRtree)…")
     t0 = time.perf_counter()
     bldgs["block_id"] = fast_assign_blocks(
-    bldgs, blocks, log_prefix="assign: ",
-    num_workers=max(1, int(args.num_workers)),   # берём уже существующий CLI-параметр
-    chunk_size=20000                              # можно подвинтить под ОЗУ/CPU
+        bldgs, blocks, log_prefix="assign: ",
+        num_workers=max(1, int(args.num_workers)),
+        chunk_size=20000
     )
     n_unassigned = int(bldgs["block_id"].isna().sum())
     if n_unassigned:
@@ -898,7 +914,7 @@ def main():
     bldgs["services_present"]  = bldgs["services_present"].apply(_as_list)
     bldgs["services_capacity"] = bldgs["services_capacity"].apply(_as_list)
 
-    # ---------- ЗАДАЧИ ДЛЯ ВОРКЕРОВ ----------
+    # ---------- задачи для воркеров ----------
     log.info("Формирование заданий по кварталам…")
     block_records = blocks[["block_id","zone","geometry"]].copy()
     block_records["poly_wkb"] = block_records.geometry.apply(geom_to_wkb)
@@ -924,7 +940,8 @@ def main():
                 })
         tasks.append({
             "block_id": blk_id, "zone": row["zone"], "poly_wkb": row["poly_wkb"],
-            "bldgs_rows": rows_bldgs, "N": args.N, "mask_size": args.mask_size, "mask_dir": mask_dir
+            "bldgs_rows": rows_bldgs, "N": args.N, "mask_size": args.mask_size, "mask_dir": mask_dir,
+            "timeout_sec": int(args.block_timeout_sec), "out_dir": args.out_dir
         })
 
     num_workers = max(1, int(args.num_workers))
@@ -935,33 +952,47 @@ def main():
         with mp.get_context("spawn").Pool(processes=num_workers) as pool:
             results = list(tqdm(pool.imap_unordered(worker_process_block, tasks), total=len(tasks), disable=not TQDM))
 
-    # ---------- СБОРКА И ЗАПИСЬ ----------
+    # собрать таймауты
+    timeouts = [r for r in results if r and r.get("status") == "timeout"]
+    _dump_timeouts(timeouts, args.out_dir, crs=blocks.crs)
+
+    # ---------- Мердж per-block parquet в общие 4 файла ----------
     log.info("Сборка результатов и запись Parquet…")
-    blocks_rows=[]; branches_rows=[]; nodes_rows=[]; edges_rows=[]
-    for res in results:
-        blocks_rows.append(res["block"])
-        branches_rows.extend(res["branches"])
-        nodes_rows.extend(res["nodes"])
-        edges_rows.extend(res["edges"])
+    out_root = args.out_dir
 
-    blocks_df   = pd.DataFrame(blocks_rows)
-    branches_df = pd.DataFrame(branches_rows)
-    nodes_df    = pd.DataFrame(nodes_rows)
-    edges_df    = pd.DataFrame(edges_rows)
-    if "floors_num" in nodes_df.columns:
-        nodes_df["floors_num"] = nodes_df["floors_num"].astype("Int64")
+    # Merge per-block parquet trees → global 4 files
+    blocks_total   = _merge_parquet_tree(by_block_root, "blocks.parquet",   os.path.join(out_root, "blocks.parquet"))
+    branches_total = _merge_parquet_tree(by_block_root, "branches.parquet", os.path.join(out_root, "branches.parquet"))
+    nodes_total    = _merge_parquet_tree(by_block_root, "nodes_fixed.parquet", os.path.join(out_root, "nodes_fixed.parquet"))
+    edges_total    = _merge_parquet_tree(by_block_root, "edges.parquet",    os.path.join(out_root, "edges.parquet"))
 
-    out = args.out_dir
-    blocks_df.to_parquet(os.path.join(out, "blocks.parquet"), index=False)
-    branches_df.to_parquet(os.path.join(out, "branches.parquet"), index=False)
-    nodes_df.to_parquet(os.path.join(out, "nodes_fixed.parquet"), index=False)
-    edges_df.to_parquet(os.path.join(out, "edges.parquet"), index=False)
-
-    log.info(f"[ok] saved {os.path.join(out,'blocks.parquet')}     rows={len(blocks_df)}")
-    log.info(f"[ok] saved {os.path.join(out,'branches.parquet')}   rows={len(branches_df)}")
-    log.info(f"[ok] saved {os.path.join(out,'nodes_fixed.parquet')} rows={len(nodes_df)}")
-    log.info(f"[ok] saved {os.path.join(out,'edges.parquet')}      rows={len(edges_df)}")
+    log.info(f"[ok] saved {os.path.join(out_root,'blocks.parquet')}     rows={blocks_total}")
+    log.info(f"[ok] saved {os.path.join(out_root,'branches.parquet')}   rows={branches_total}")
+    log.info(f"[ok] saved {os.path.join(out_root,'nodes_fixed.parquet')} rows={nodes_total}")
+    log.info(f"[ok] saved {os.path.join(out_root,'edges.parquet')}      rows={edges_total}")
+    log.info(f"[note] per-block parquet in {by_block_root}")
     log.info(f"[note] masks in {mask_dir}")
+
+    # Ensure orphaned_blocks is written even if there were no orphaned buildings
+    try:
+        used_blocks = set(bldgs["block_id"].dropna().unique().tolist())
+        orphan_blk = blocks[~blocks["block_id"].isin(used_blocks)].copy()
+        if not orphan_blk.empty:
+            outk = os.path.join(out_root, "orphaned_blocks.geojson")
+            try:
+                orphan_blk.to_file(outk, driver="GeoJSON")
+                log.info(f"orphaned_blocks: сохранено {len(orphan_blk)} → {outk}")
+            except Exception as e:
+                log.warning(f"orphaned_blocks: не удалось сохранить GeoJSON: {e}")
+    except Exception:
+        pass
+
+    # Summary on timeouts
+    if timeouts:
+        unique_timeout_blocks = sorted({t.get("block_id") for t in timeouts if t})
+        log.warning(f"Timeout on {len(unique_timeout_blocks)} blocks → see timeout.geojson")
+
+    log.info("Готово.")
 
 if __name__ == "__main__":
     sys.exit(main())
