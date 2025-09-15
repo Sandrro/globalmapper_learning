@@ -1,62 +1,158 @@
-###############################  Training setting   ############################
-# GPU indices to use for training
-gpu_ids :
-  - 0
+# train_gnn.yaml — конфигурация обучения GNN под иерархическую канонизацию
+#
+# Ключевые моменты:
+# - Вход: квартал (маска 64×64, label функциональной зоны, scale_l),
+#         иерархические узлы (ветка → узлы) с признаками из transform.py:
+#         e_i, branch_local_id, posx/posy, size_x/size_y, phi_resid, s_i, a_i,
+#         has_floors, floors_num, is_living, living_area,
+#         services_present(one-hot), services_capacity (маскированная регрессия), aspect_ratio.
+# - Выход: предсказания по узлам и рёбрам (для генерации полигонов),
+#          учитывается зона и требования по сервисам/жилплощади на квартал.
+# - Лоссы и весовые коэффициенты настраиваются ниже.
 
-clean_cache : False
-# When True, TensorBoard logs and checkpoints are written to disk
-save_record : False
-is_multigpu : False
+experiment: graphgen_hcanon_v1
+seed: 42
 
-save_epoch : 50              # save model every N epochs
-val_ratio : 0.2              # fraction of data used for validation
-total_epochs : 1000
-start_epoch : 0
+paths:
+  data_dir: ./dataset                           # директория с blocks.parquet, branches.parquet, nodes_fixed.parquet, edges.parquet, masks/
+  by_block_dir: ./dataset/by_block              # если нужен инкрементальный режим
+  model_ckpt: ./dataset/checkpoints/graphgen_hcanon_v1.pt
+  artifacts_dir: ./dataset/artifacts            # куда складывать вспомогательные файлы (zones.json, services.json, config снапшот)
+  zones_json: ./dataset/zones.json              # автогенерация при первом запуске
+  services_json: ./dataset/services.json        # автогенерация при первом запуске
+  tb_log_dir: ./runs                            # TensorBoard логи
 
+# Описание данных и препроцессинг
+data:
+  n_slots: 120                  # максимальное число узлов на квартал (из transform.py)
+  mask_size: 64                 # размер маски квартала (из transform.py)
+  use_masks: true               # подавать ли маску квартала в модель
+  zone_as_categorical: true     # кодировать zone в embedding
 
-###################################   GlobalMapper setting   #######################################
-is_Teaser : False  ### test for full continuous generation
-is_conditional_block : False
-is_input_road: True
-encode_cnn : True
-is_blockplanner : False
+  # Нормализация/маскирование скалярных признаков
+  normalization:
+    pos: [-1.0, 1.0]           # posx/posy уже в этом диапазоне
+    size_clip: [0.0, 2.0]       # клип размеров к разумным пределам (по отношению к scale_l/mean_width)
+    phi_clip_rad: 1.57079632679 # ±π/2 для остаточного угла
+    living_area_scale: 0.001    # масштаб для целей регрессии (кв. м → тысячи кв. м)
+    capacity_scale: 1.0         # масштаб для вместимости (оставьте 1.0, если не нужно)
 
-# Convolutional layers that support attention heads
-attten_net :
-  - 'TransformerConv'
-  - 'GATConv'
-  - 'SAGEConv'
+  # Отсутствующие значения
+  missing:
+    floors_strategy: two_head   # has_floors (BCE) + floors_num (MAE) под маской has_floors==True
+    living_if_absent_area_zero: true  # если is_living=False → living_area=0 и исключаем из регрессии
 
-# GNN layer and pooling configuration
-convlayer : 'GATConv' #'ResGatedGraphConv' #'SuperGATConv' #'GATv2Conv' # 'GPSConv'   #'GCNConv' #'NaiveMsgPass'  #'TransformerConv'  #'GATConv'  #'SAGEConv'    #'NaiveMsgPass'  #'SAGEConv'
-aggr : 'Max'  # 'Mean'
-lr : 0.001
-n_ft_dim : 256
-block_latent_dim : 20
-head_num : 12  # only for GAT
-batch_size : 200
-latent_dim: 512
-template_width : 30
-template_height : 4
+  # Раширение сервисов (вытягивается из services.json). Если список пуст, будет определён автоматически.
+  services:
+    vocab: []                   # опционально: зафиксируйте список сервисов ["school","kindergarten",...]
+    min_count: 5                # игнорировать редкие сервисы при построении one-hot (если vocab пуст)
 
+  # Валидация/сплит
+  split:
+    val_ratio: 0.1
+    shuffle: true
 
-################################    weight setting  #########################################################
-# Loss weights for different prediction components
-exist_weight : 3.0
-pos_weight : 4.0
-kld_weight : 0.5
-size_weight : 4.0
-extsum_weight : 2.0
-shape_weight : 0.05
-iou_weight : 1.0
-height_weight : 4.0
+training:
+  batch_size: 8
+  epochs: 5
+  device: cuda                  # cuda|cpu|cuda:0
+  lr: 2.0e-4
+  optimizer: adamw
+  betas: [0.9, 0.999]
+  weight_decay: 1.0e-4
+  scheduler:
+    name: cosine                 # none|cosine|plateau
+    warmup_steps: 500
+    min_lr_mult: 0.1             # итоговый LR = lr * min_lr_mult
+  grad_clip: 1.0
+  mixed_precision: true          # torch.cuda.amp
+  num_workers: 8                 # DataLoader workers
+  pin_memory: true
+  persistent_workers: true
+  accumulate_steps: 1            # градиентная аккумуляция
 
+losses:
+  # Типы лоссов (модель подбирает по ключу)
+  types:
+    e: bce                       # e_i (узел существует)
+    pos: smooth_l1               # (posx,posy)
+    sz: smooth_l1                # (size_x,size_y)
+    phi: smooth_l1               # phi_resid
+    s: ce                        # shape class (0/1/2/3)
+    a: smooth_l1                 # occupancy ratio (0..1)
+    hf: bce                      # has_floors
+    fl: l1_masked                # floors_num (под маской has_floors)
+    il: bce                      # is_living
+    la: l1_masked                # living_area_scaled (под маской is_living)
+    sv: bce_multilabel           # services one-hot
+    svc: l1_masked_multi         # services capacity (под маской присутствующих сервисов)
+    ar: smooth_l1                # aspect_ratio
+    coll: soft_collision         # штраф за пересечения/слишком малые интервалы
 
+  # Веса лоссов (тонкая настройка важности задач)
+  weights:
+    e: 1.0
+    pos: 2.0
+    sz: 2.0
+    phi: 0.5
+    s: 0.5
+    a: 0.2
+    hf: 0.2
+    fl: 0.5
+    il: 0.2
+    la: 1.0
+    sv: 0.5
+    svc: 1.0
+    ar: 0.2
+    coll: 0.5
 
+  # Настройки коллизий/геометрических ограничений
+  collision:
+    min_spacing_m: 3.0           # минимальный «зазор» между центрами проекций на ветку (в метрах)
+    penalty_margin: 0.5          # ширина мягкой зоны перед штрафом
 
-####################################     resume setting     #####################################################
-resume : False
-resume_dir : 'Your resume folder'
-import_name : 'latest'
-resume_epoch : 400
+model:
+  arch: gatv2                    # gcn|gat|gatv2|graphunet (выбирает класс из train.py)
+  emb_dim: 128
+  hidden_dim: 256
+  gnn_layers: 6
+  attn_heads: 4
+  dropout: 0.1
+  # Декодеры по головам
+  heads:
+    e: 2                         # логиты существования
+    pos: 2
+    sz: 2
+    phi: 1
+    s: 4                         # классов (Rect/L/X/U)
+    a: 1
+    hf: 1
+    fl: 1
+    il: 1
+    la: 1
+    sv: auto                     # будет равен |services_vocab|
+    svc: auto                    # будет равен |services_vocab|
+    ar: 1
 
+inference:
+  temperature: 0.7
+  n_candidates: 1
+  snap_to_skeleton: true
+  nms_min_dist_m: 2.0            # подавление близких объектов
+  keep_inside_block: true
+  non_overlap: true
+
+checkpointing:
+  save_every_n_epochs: 5
+  keep_last_n: 3
+  resume_from: null              # путь к .pt для продолжения
+
+logging:
+  log_level: INFO
+  tqdm: true
+
+hf:
+  push: false
+  repo_id: your-username/graphgen-hcanon-v1
+  private: true
+  token_env: HF_TOKEN            # переменная окружения с токеном

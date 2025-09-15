@@ -1,264 +1,727 @@
-import torch, os
-from torch_geometric.data import Data
-from torch_geometric.loader import DataLoader, DataListLoader
-from urban_dataset import UrbanGraphDataset, graph_transform, get_transform
-from model import *
-import torch.nn.functional as F
-import torch.nn as nn
-from torch_geometric.data import Batch
-import numpy as np
-"""Entry point for training GlobalMapper models.
-
-The script orchestrates dataset preparation, model construction and the
-training/validation loop.  Extensive comments are included to help beginners
-understand each step and to point out where new features could be integrated
-into the pipeline.
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
+train.py — обучение граф-генератора на иерархической канонизации
 
-import random
-from tensorboard_logger import configure, log_value
-from torch.optim.lr_scheduler import MultiStepLR
-from time import gmtime, strftime
-import shutil
-import logging
-from graph_util import read_train_yaml
-from graph_trainer import train, validation
-import yaml
-import warnings
+Что добавлено:
+- Поддержка YAML-конфига через --config (CLI-параметры перекрывают YAML)
+- Логгер с этапами обучения + прогресс-бары tqdm
+- TensorBoard (./runs/<exp>_<timestamp>) — логи лоссов/метрик
+- Выгрузка артефактов на Hugging Face Hub (repo_id, token)
+- Совместимость с PyTorch Geometric (если установлен), иначе fallback на простой MLP по узлам
+- Обработка новых признаков из transform.py: zone label, e_i, pos/size/phi/s_i/a_i,
+  floors_num/has_floors/is_living/living_area, services_present (one-hot), services_capacity (суммарные по словарю)
 
-# Avoid cluttering the output with warnings from third-party libraries.
-warnings.filterwarnings("ignore")
+Ожидаемая структура датасета (из transform.py):
+  data_dir/
+    blocks.parquet [block_id, zone, scale_l, mask_path]
+    branches.parquet [block_id, branch_local_id, length]
+    nodes_fixed.parquet [block_id, slot_id, e_i, branch_local_id, posx, posy,
+      size_x, size_y, phi_resid, s_i, a_i, floors_num, living_area, is_living,
+      has_floors, services_present, services_capacity, aspect_ratio]
+    edges.parquet [block_id, src_slot, dst_slot]
+
+Пример:
+  python train.py --config ./train_gnn.yaml
+"""
+from __future__ import annotations
+import os, sys, json, math, time, argparse, logging, random
+from datetime import datetime
+from typing import Dict, Any, List, Tuple
+
+# --- логгер ---
+log = logging.getLogger("train")
+
+def setup_logger(level: str = "INFO"):
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    logging.basicConfig(
+        level=lvl,
+        format="%(asctime)s | %(levelname)s | %(processName)s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+# --- зависимости ---
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import yaml  # pyyaml
+except Exception as e:
+    yaml = None
+
+# PyG опционально
+_PYG_OK = False
+try:
+    from torch_geometric.data import Data as GeomData
+    from torch_geometric.loader import DataLoader as GeomLoader
+    from torch_geometric.nn import GraphSAGE
+    _PYG_OK = True
+except Exception:
+    _PYG_OK = False
+
+# HuggingFace Hub опционально
+_HF_OK = False
+try:
+    from huggingface_hub import HfApi, HfFolder, create_repo, upload_folder
+    _HF_OK = True
+except Exception:
+    _HF_OK = False
+
+# ----------------------
+# Конфиг через YAML + CLI
+# ----------------------
+_DEF_CFG: Dict[str, Any] = {
+    "experiment": "graphgen_hcanon_v1",
+    "paths": {
+        "data_dir": "./dataset",
+        "model_ckpt": "./dataset/model_graphgen.pt",
+        "zones_json": "./dataset/zones.json",
+        "services_json": "./dataset/services.json",
+    },
+    "training": {
+        "batch_size": 8,
+        "epochs": 50,
+        "lr": 2.0e-4,
+        "device": "cuda",
+        "loss_weights": {
+            "e": 1.0, "pos": 2.0, "sz": 2.0, "phi": 0.5,
+            "s": 0.5, "a": 0.2, "fl": 0.5, "hf": 0.2,
+            "il": 0.2, "la": 1.0, "sv1": 0.5, "svc": 1.0, "coll": 0.5
+        }
+    },
+    "model": {
+        "emb_dim": 128,
+        "hidden": 256,
+    },
+    "hf": {
+        "push": False,
+        "repo_id": None,
+        "token": None,
+        "private": True,
+    }
+}
+
+# предварительный парсер только для --config
+_p0 = argparse.ArgumentParser(add_help=False)
+_p0.add_argument("--config", type=str, default=None)
+_cfg_args, _ = _p0.parse_known_args()
+
+_CFG = _DEF_CFG.copy()
+if _cfg_args.config and yaml is not None:
+    with open(_cfg_args.config, "r", encoding="utf-8") as f:
+        user_cfg = yaml.safe_load(f) or {}
+    # рекурсивный мердж
+    def _merge(a, b):
+        for k, v in b.items():
+            if isinstance(v, dict) and isinstance(a.get(k), dict):
+                _merge(a[k], v)
+            else:
+                a[k] = v
+    _merge(_CFG, user_cfg)
+
+# основной парсер
+parser = argparse.ArgumentParser(parents=[_p0])
+parser.add_argument("--data-dir", default=_CFG["paths"]["data_dir"])
+parser.add_argument("--zones-json", default=_CFG["paths"]["zones_json"])
+parser.add_argument("--services-json", default=_CFG["paths"]["services_json"])
+parser.add_argument("--model-ckpt", default=_CFG["paths"]["model_ckpt"])
+parser.add_argument("--batch-size", type=int, default=_CFG["training"]["batch_size"])
+parser.add_argument("--epochs", type=int, default=_CFG["training"]["epochs"])
+parser.add_argument("--lr", type=float, default=_CFG["training"]["lr"])
+parser.add_argument("--device", default=_CFG["training"]["device"])
+parser.add_argument("--mode", choices=["train", "infer"], default="train")
+parser.add_argument("--infer-geojson-in")
+parser.add_argument("--infer-out")
+# hf
+parser.add_argument("--hf-push", action="store_true", default=_CFG.get("hf",{}).get("push", False))
+parser.add_argument("--hf-repo-id", default=_CFG.get("hf",{}).get("repo_id"))
+parser.add_argument("--hf-token", default=_CFG.get("hf",{}).get("token"))
+parser.add_argument("--hf-private", action="store_true", default=_CFG.get("hf",{}).get("private", True))
+# misc
+parser.add_argument("--log-level", default="INFO")
+args = parser.parse_args()
+
+setup_logger(args.log_level)
+log.info("Запуск train.py (YAML+CLI) …")
+
+# ----------------------
+# Утилиты
+# ----------------------
+SEED = 42
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+
+def _ensure_dir(p: str):
+    os.makedirs(os.path.dirname(p) if os.path.splitext(p)[1] else p, exist_ok=True)
+
+
+def _maybe_json_to_list(x):
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return []
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return []
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    return []
+
+
+# ----------------------
+# Датасет
+# ----------------------
+class HCanonGraphDataset(Dataset):
+    def __init__(self, data_dir: str, zones_json: str, services_json: str, split: str = "train", split_ratio: float = 0.9):
+        super().__init__()
+        # загрузка таблиц
+        self.blocks = pd.read_parquet(os.path.join(data_dir, "blocks.parquet"))
+        self.nodes  = pd.read_parquet(os.path.join(data_dir, "nodes_fixed.parquet"))
+        self.edges  = pd.read_parquet(os.path.join(data_dir, "edges.parquet"))
+        # ветви (необяз.)
+        self.branches = None
+        bp = os.path.join(data_dir, "branches.parquet")
+        if os.path.exists(bp):
+            try:
+                self.branches = pd.read_parquet(bp)
+            except Exception:
+                self.branches = None
+
+        # словарь зон
+        if os.path.exists(zones_json):
+            with open(zones_json, "r", encoding="utf-8") as f:
+                self.zone2id = json.load(f)
+        else:
+            uniq = sorted([str(z) for z in self.blocks["zone"].fillna("nan").unique().tolist()])
+            self.zone2id = {z:i for i,z in enumerate(uniq)}
+            _ensure_dir(zones_json)
+            with open(zones_json, "w", encoding="utf-8") as f:
+                json.dump(self.zone2id, f, ensure_ascii=False, indent=2)
+        self.id2zone = {v:k for k,v in self.zone2id.items()}
+
+        # словарь сервисов
+        if os.path.exists(services_json):
+            with open(services_json, "r", encoding="utf-8") as f:
+                self.service2id = json.load(f)
+        else:
+            vocab = set()
+            for x in self.nodes["services_present"].fillna("").values.tolist():
+                lst = _maybe_json_to_list(x)
+                for s in lst:
+                    vocab.add(str(s))
+            self.service2id = {s:i for i,s in enumerate(sorted(vocab))}
+            _ensure_dir(services_json)
+            with open(services_json, "w", encoding="utf-8") as f:
+                json.dump(self.service2id, f, ensure_ascii=False, indent=2)
+        self.id2service = {v:k for k,v in self.service2id.items()}
+        self.num_services = len(self.service2id)
+
+        # индексы блоков и сплит
+        self.block_ids = sorted(self.blocks["block_id"].astype(str).unique().tolist())
+        n = len(self.block_ids)
+        n_train = int(round(n * split_ratio))
+        self.split = split
+        if split == "train":
+            self.block_ids = self.block_ids[:n_train]
+        else:
+            self.block_ids = self.block_ids[n_train:]
+
+        # кэш блок→зона
+        self.block_zone = {r.block_id: r.zone for r in self.blocks.itertuples(index=False)}
+
+        log.info(f"Dataset[{split}] blocks={len(self.block_ids)} nodes={len(self.nodes)} edges={len(self.edges)} services={self.num_services}")
+
+    def __len__(self):
+        return len(self.block_ids)
+
+    def _one_hot(self, idx: int, K: int) -> np.ndarray:
+        v = np.zeros((K,), dtype=np.float32)
+        if idx is not None and 0 <= idx < K:
+            v[idx] = 1.0
+        return v
+
+    def _services_vecs(self, present_raw, cap_raw) -> Tuple[np.ndarray, np.ndarray]:
+        present = _maybe_json_to_list(present_raw)
+        cap = _maybe_json_to_list(cap_raw)
+        # present → multi-hot
+        mhot = np.zeros((self.num_services,), dtype=np.float32)
+        for s in present:
+            sid = self.service2id.get(str(s))
+            if sid is not None:
+                mhot[sid] = 1.0
+        # capacity → aligned vector (если cap был списком float/ints)
+        cap_vec = np.zeros((self.num_services,), dtype=np.float32)
+        if isinstance(cap, list):
+            # допускаем cap в формате [{name:..., value:...}] или [v0, v1, ...]
+            if cap and isinstance(cap[0], dict):
+                for it in cap:
+                    sid = self.service2id.get(str(it.get("name")))
+                    if sid is not None:
+                        try:
+                            cap_vec[sid] = float(it.get("value", 0.0))
+                        except Exception:
+                            pass
+            else:
+                # если просто список значений, но без имён — запишем в первые позиции
+                for i,v in enumerate(cap[:self.num_services]):
+                    try: cap_vec[i] = float(v)
+                    except Exception: pass
+        return mhot, cap_vec
+
+    def _node_targets(self, df_nodes_block: pd.DataFrame) -> Dict[str, torch.Tensor]:
+        # Цели (y):
+        #   e_i (mask), pos(x,y), size(x,y), phi, s_i (class), a_i,
+        #   has_floors, floors_num, is_living, living_area,
+        #   services_present(one-hot), services_capacity(aligned)
+        e = torch.as_tensor(df_nodes_block["e_i"].values, dtype=torch.float32)
+        pos = torch.as_tensor(df_nodes_block[["posx","posy"]].values, dtype=torch.float32)
+        sz  = torch.as_tensor(df_nodes_block[["size_x","size_y"]].values, dtype=torch.float32)
+        phi = torch.as_tensor(df_nodes_block[["phi_resid"]].values, dtype=torch.float32)
+        s   = torch.as_tensor(df_nodes_block[["s_i"]].fillna(0).values, dtype=torch.long).view(-1)
+        a   = torch.as_tensor(df_nodes_block[["a_i"]].fillna(0.0).values, dtype=torch.float32)
+        hf  = torch.as_tensor(df_nodes_block[["has_floors"]].astype(bool).values, dtype=torch.float32)
+        # floors_num может быть отсутствующим (Int64), используем -1 и маску
+        fl_raw = df_nodes_block["floors_num"].astype("Int64").fillna(-1).astype(int).values
+        fl = torch.as_tensor(fl_raw, dtype=torch.long)
+        il  = torch.as_tensor(df_nodes_block[["is_living"]].astype(bool).values, dtype=torch.float32)
+        # living_area: если is_living==False → treat как 0 и mark как missing в лоссе (маска il)
+        la_vals = pd.to_numeric(df_nodes_block["living_area"], errors="coerce").fillna(0.0).values
+        la  = torch.as_tensor(la_vals, dtype=torch.float32).view(-1,1)
+
+        # services
+        mhot_list = []
+        cap_list  = []
+        for r in df_nodes_block.itertuples(index=False):
+            m, c = self._services_vecs(getattr(r, "services_present", None), getattr(r, "services_capacity", None))
+            mhot_list.append(m); cap_list.append(c)
+        sv1 = torch.as_tensor(np.vstack(mhot_list) if mhot_list else np.zeros((len(df_nodes_block), self.num_services), np.float32))
+        svc = torch.as_tensor(np.vstack(cap_list)  if cap_list  else np.zeros((len(df_nodes_block), self.num_services), np.float32))
+
+        return {"e": e, "pos": pos, "sz": sz, "phi": phi, "s": s, "a": a, "hf": hf, "fl": fl, "il": il, "la": la, "sv1": sv1, "svc": svc}
+
+    def __getitem__(self, idx: int):
+        blk_id = self.block_ids[idx]
+        # узлы этого блока в slot_id порядке
+        nodes_b = self.nodes[self.nodes["block_id"] == blk_id].sort_values("slot_id").reset_index(drop=True)
+        # графовые рёбра
+        edges_b = self.edges[self.edges["block_id"] == blk_id]
+        src = torch.as_tensor(edges_b["src_slot"].values, dtype=torch.long)
+        dst = torch.as_tensor(edges_b["dst_slot"].values, dtype=torch.long)
+        edge_index = torch.stack([src, dst], dim=0) if len(src) else torch.zeros((2,0), dtype=torch.long)
+
+        # зона
+        zone_label = str(self.block_zone.get(blk_id, "nan"))
+        zone_id = self.zone2id.get(zone_label, 0)
+        zone_onehot = torch.as_tensor(self._one_hot(zone_id, len(self.zone2id)))  # (Z,)
+
+        # входные признаки X (маска e_i + one-hot зоны)
+        x_in = torch.cat([
+            torch.as_tensor(nodes_b[["e_i"]].values, dtype=torch.float32),  # (N,1)
+            torch.tile(zone_onehot.view(1,-1), (len(nodes_b), 1)),          # (N,Z)
+        ], dim=1)
+
+        # Таргеты по узлам
+        targets = self._node_targets(nodes_b)
+
+        if _PYG_OK:
+            # ---- ВАЖНО: каждый таргет отдельным атрибутом ----
+            data = GeomData(x=x_in, edge_index=edge_index)
+            data.num_nodes = x_in.shape[0]
+            data.block_id = blk_id
+            data.zone_id = zone_id
+
+            # Тензоры с правильными формами:
+            # e:(N,1), pos:(N,2), sz:(N,2), phi:(N,1), s:(N,), a:(N,1), hf:(N,1),
+            # fl:(N,), il:(N,1), la:(N,1), sv1:(N,S), svc:(N,S)
+            data.y_e   = targets["e"].view(-1,1)
+            data.y_pos = targets["pos"].view(-1,2)
+            data.y_sz  = targets["sz"].view(-1,2)
+            data.y_phi = targets["phi"].view(-1,1)
+            data.y_s   = targets["s"].view(-1)        # классы как вектор длины N
+            data.y_a   = targets["a"].view(-1,1)
+            data.y_hf  = targets["hf"].view(-1,1)
+            data.y_fl  = targets["fl"].view(-1)       # целевая этажность как int, N
+            data.y_il  = targets["il"].view(-1,1)
+            data.y_la  = targets["la"].view(-1,1)
+            data.y_sv1 = targets["sv1"].view(-1, self.num_services) if self.num_services > 0 else torch.zeros((len(nodes_b),0))
+            data.y_svc = targets["svc"].view(-1, self.num_services) if self.num_services > 0 else torch.zeros((len(nodes_b),0))
+            return data
+        else:
+            # Fallback без PyG — как было, но в y словарь уже корректных форм
+            return {
+                "x": x_in, "edge_index": edge_index, "y": targets,
+                "num_nodes": x_in.shape[0], "block_id": blk_id, "zone_id": zone_id
+            }
+
+# ----------------------
+# Модель
+# ----------------------
+class NodeHead(nn.Module):
+    """Голова предсказаний по узлам — реконструирует все целевые атрибуты."""
+    def __init__(self, in_dim: int, hidden: int, num_services: int):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden), nn.ReLU(),
+            nn.Linear(hidden, hidden), nn.ReLU(),
+        )
+        # выходы
+        self.e  = nn.Linear(hidden, 1)
+        self.pos = nn.Linear(hidden, 2)
+        self.sz  = nn.Linear(hidden, 2)
+        self.phi = nn.Linear(hidden, 1)
+        self.s   = nn.Linear(hidden, 4)  # классы форм (Rect/L/U/X)
+        self.a   = nn.Linear(hidden, 1)
+        self.hf  = nn.Linear(hidden, 1)
+        self.fl  = nn.Linear(hidden, 1)  # регресс _условной_ этажности (софт)
+        self.il  = nn.Linear(hidden, 1)
+        self.la  = nn.Linear(hidden, 1)
+        self.sv1 = nn.Linear(hidden, num_services)
+        self.svc = nn.Linear(hidden, num_services)
+
+    def forward(self, x):
+        h = self.mlp(x)
+        return {
+            "e": self.e(h), "pos": self.pos(h), "sz": self.sz(h), "phi": self.phi(h),
+            "s": self.s(h), "a": self.a(h), "hf": self.hf(h), "fl": self.fl(h),
+            "il": self.il(h), "la": self.la(h), "sv1": self.sv1(h), "svc": self.svc(h)
+        }
+
+
+class GraphModel(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, num_services: int):
+        super().__init__()
+        self.use_pyg = _PYG_OK
+        if self.use_pyg:
+            self.gnn = GraphSAGE(in_channels=in_dim, hidden_channels=hidden, num_layers=3, out_channels=hidden)
+            head_in = hidden
+        else:
+            # без PyG: простой MLP по узлам
+            self.gnn = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, hidden), nn.ReLU())
+            head_in = hidden
+        self.head = NodeHead(head_in, hidden, num_services)
+
+    def forward(self, x, edge_index=None):
+        if self.use_pyg:
+            h = self.gnn(x, edge_index)
+        else:
+            h = self.gnn(x)
+        return self.head(h)
+
+# ----------------------
+# Лоссы
+# ----------------------
+class LossComputer:
+    def __init__(self, w: Dict[str, float]):
+        self.w = w
+        self.ce = nn.CrossEntropyLoss(reduction='none')
+        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.l1 = nn.L1Loss(reduction='none')
+        self.mse = nn.MSELoss(reduction='none')
+
+    def __call__(self, pred: Dict[str, torch.Tensor], y: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str,float]]:
+        """
+        Возвращает:
+          total_loss  — СКАЛЯРНЫЙ ТЕНЗОР (requires_grad=True)
+          parts(float) — словарь для логов
+        """
+        # Маски
+        e_mask = (y["e"] > 0.5).float()           # (N,1) — активные узлы
+        denom_nodes = e_mask.sum() + 1e-6         # скаляр
+
+        # Бинарные
+        e_loss_t  = self.bce(pred["e"], y["e"]).mean()                               # (1,)
+        hf_loss_t = (self.bce(pred["hf"], y["hf"]) * e_mask).sum() / denom_nodes     # (1,)
+        il_loss_t = (self.bce(pred["il"], y["il"]) * e_mask).sum() / denom_nodes     # (1,)
+
+        # Регрессии
+        pos_loss_t = (self.l1(pred["pos"], y["pos"]) * e_mask).sum() / denom_nodes   # (1,)
+        sz_loss_t  = (self.l1(pred["sz"],  y["sz"])  * e_mask).sum() / denom_nodes   # (1,)
+        phi_loss_t = (self.l1(pred["phi"], y["phi"]) * e_mask).sum() / denom_nodes   # (1,)
+        a_loss_t   = (self.l1(pred["a"],   y["a"])   * e_mask).sum() / denom_nodes   # (1,)
+
+        # Жилая площадь считаем только для жилых (il==1)
+        il_mask = y["il"]                        # (N,1)
+        denom_living = il_mask.sum() + 1e-6
+        la_loss_t = (self.l1(pred["la"], y["la"]) * il_mask).sum() / denom_living
+
+        # Этажность: считаем, если есть сведения о этажности (has_floors == 1)
+        fl_mask = y["hf"].view(-1,1)             # (N,1)
+        denom_fl = fl_mask.sum() + 1e-6
+        fl_tgt  = y["fl"].clamp(min=0).float().view(-1,1)  # (N,1)
+        fl_pred = pred["fl"].view(-1,1)                      # (N,1)
+        fl_loss_t = (self.l1(fl_pred, fl_tgt) * fl_mask).sum() / denom_fl
+
+        # Классы форм
+        # pred["s"]:(N,4), y["s"]:(N,)
+        s_loss_vec = self.ce(pred["s"], y["s"].long()).view(-1)   # (N,)
+        s_loss_t   = (s_loss_vec * e_mask.view(-1)).sum() / denom_nodes
+
+        # Сервисы: могут отсутствовать → (N,0), даём нулевой вклад
+        if y["sv1"].numel() > 0:
+            sv1_loss_t = (self.bce(pred["sv1"], y["sv1"]) * e_mask).sum() / denom_nodes
+        else:
+            sv1_loss_t = torch.zeros((), device=pred["e"].device)
+
+        if y["svc"].numel() > 0:
+            svc_loss_t = (self.l1(pred["svc"], y["svc"]) * e_mask).sum() / denom_nodes
+        else:
+            svc_loss_t = torch.zeros((), device=pred["e"].device)
+
+        # Собираем тензорные лоссы в словарь
+        t_losses = {
+            "e": e_loss_t, "pos": pos_loss_t, "sz": sz_loss_t, "phi": phi_loss_t,
+            "s": s_loss_t, "a": a_loss_t, "fl": fl_loss_t, "hf": hf_loss_t,
+            "il": il_loss_t, "la": la_loss_t, "sv1": sv1_loss_t, "svc": svc_loss_t
+        }
+
+        # Итог как сумма ТЕНЗОРОВ (а не float'ов)
+        total_t = torch.zeros((), device=pred["e"].device)
+        for k, t in t_losses.items():
+            if k in self.w:
+                total_t = total_t + float(self.w[k]) * t
+
+        # parts — только для логирования (float)
+        parts = {k: float(v.detach().item()) for k, v in t_losses.items()}
+
+        return total_t, parts
+
+# ----------------------
+# Тренировка
+# ----------------------
+
+def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dict[str,Any], save_ckpt_path: str, writer: SummaryWriter):
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["lr"]))
+    loss_comp = LossComputer(cfg["training"]["loss_weights"])
+
+    global_step = 0
+    best_val = float('inf')
+
+    for epoch in range(1, int(cfg["training"]["epochs"]) + 1):
+        model.train()
+        log.info(f"[Epoch {epoch}] — обучение…")
+        from tqdm import tqdm as _tqdm
+        pbar = _tqdm(train_loader, total=len(train_loader), leave=False)
+        epoch_loss = 0.0
+
+        for batch in pbar:
+            opt.zero_grad()
+            if _PYG_OK:
+                x = batch.x.to(device)
+                ei = batch.edge_index.to(device)
+                # соберём y из атрибутов y_*
+                y = {
+                    "e":   batch.y_e.to(device),                          # (N,1)
+                    "pos": batch.y_pos.to(device),                        # (N,2)
+                    "sz":  batch.y_sz.to(device),                         # (N,2)
+                    "phi": batch.y_phi.to(device),                        # (N,1)
+                    "s":   batch.y_s.to(device).long().view(-1),          # (N,)
+                    "a":   batch.y_a.to(device),                          # (N,1)
+                    "hf":  batch.y_hf.to(device),                         # (N,1)
+                    "fl":  batch.y_fl.to(device).long().view(-1),         # (N,)
+                    "il":  batch.y_il.to(device),                         # (N,1)
+                    "la":  batch.y_la.to(device),                         # (N,1)
+                    "sv1": batch.y_sv1.to(device),                        # (N,S) (S может быть 0)
+                    "svc": batch.y_svc.to(device),                        # (N,S)
+                }
+            else:
+                x = batch["x"].to(device)
+                ei = batch["edge_index"].to(device)
+                y = {k: v.to(device) for k,v in batch["y"].items()}
+                # приведение форм безопасности на случай старых сохранённых датасетов
+                if y["pos"].ndim == 2 and y["pos"].shape[0] == 2 and y["pos"].shape[1] != 2:
+                    y["pos"] = y["pos"].T
+                if y["sz"].ndim == 2 and y["sz"].shape[0] == 2 and y["sz"].shape[1] != 2:
+                    y["sz"] = y["sz"].T
+
+            pred = model(x, ei)
+            loss, parts = loss_comp(pred, y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+            epoch_loss += float(loss.item())
+
+            # TB
+            writer.add_scalar("train/total", float(loss.item()), global_step)
+            for k,v in parts.items():
+                writer.add_scalar(f"train/{k}", float(v), global_step)
+            global_step += 1
+            pbar.set_description(f"loss={loss.item():.4f}")
+        epoch_loss /= max(1, len(train_loader))
+
+        # Валидация
+        model.eval()
+        with torch.no_grad():
+            val_tot = 0.0; val_cnt = 0
+            for batch in val_loader:
+                if _PYG_OK:
+                    x = batch.x.to(device)
+                    ei = batch.edge_index.to(device)
+                    y = {
+                        "e":   batch.y_e.to(device),
+                        "pos": batch.y_pos.to(device),
+                        "sz":  batch.y_sz.to(device),
+                        "phi": batch.y_phi.to(device),
+                        "s":   batch.y_s.to(device).long().view(-1),
+                        "a":   batch.y_a.to(device),
+                        "hf":  batch.y_hf.to(device),
+                        "fl":  batch.y_fl.to(device).long().view(-1),
+                        "il":  batch.y_il.to(device),
+                        "la":  batch.y_la.to(device),
+                        "sv1": batch.y_sv1.to(device),
+                        "svc": batch.y_svc.to(device),
+                    }
+                else:
+                    x = batch["x"].to(device)
+                    ei = batch["edge_index"].to(device)
+                    y = {k: v.to(device) for k,v in batch["y"].items()}
+                    if y["pos"].ndim == 2 and y["pos"].shape[0] == 2 and y["pos"].shape[1] != 2:
+                        y["pos"] = y["pos"].T
+                    if y["sz"].ndim == 2 and y["sz"].shape[0] == 2 and y["sz"].shape[1] != 2:
+                        y["sz"] = y["sz"].T
+
+                pred = model(x, ei)
+                l, _ = loss_comp(pred, y)
+                val_tot += float(l.item()); val_cnt += 1
+            val_loss = val_tot / max(1, val_cnt)
+        writer.add_scalar("val/total", float(val_loss), epoch)
+        log.info(f"[Epoch {epoch}] train_loss={epoch_loss:.4f}  val_loss={val_loss:.4f}")
+
+        # чекпойнт по лучшей валидации
+        if val_loss < best_val:
+            best_val = val_loss
+            _ensure_dir(save_ckpt_path)
+            torch.save({
+                "model_state": model.state_dict(),
+                "cfg": cfg,
+                "val_loss": best_val,
+                "timestamp": time.time()
+            }, save_ckpt_path)
+            log.info(f"Сохранён лучший чекпойнт → {save_ckpt_path}")
+
+    return best_val
+
+# ----------------------
+# HF upload
+# ----------------------
+
+def push_to_hf(repo_id: str, token: str, folder: str, private: bool = True):
+    if not _HF_OK:
+        log.warning("huggingface_hub не установлен — пропускаю загрузку на HF")
+        return
+    if not repo_id:
+        log.warning("Не указан --hf-repo-id — пропускаю загрузку на HF")
+        return
+    HfFolder.save_token(token or os.environ.get("HF_TOKEN", ""))
+    try:
+        create_repo(repo_id, token=token, exist_ok=True, private=private)
+    except Exception:
+        pass
+    log.info(f"Загружаю артефакты в HF: repo_id={repo_id}, path={folder}")
+    upload_folder(
+        repo_id=repo_id,
+        repo_type="model",
+        folder_path=folder,
+        path_in_repo="",
+        token=token,
+        ignore_patterns=["*.png", "*.jpg", "*.jpeg", "*.zip"]
+    )
+    log.info("Готово: артефакты загружены на HF")
+
+# ----------------------
+# main
+# ----------------------
+
+def main():
+    cfg = _CFG
+    # пути
+    data_dir = args.data_dir
+    ckpt_path = args.model_ckpt
+    zones_json = args.zones_json
+    services_json = args.services_json
+
+    device = args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
+    if args.device == "cuda" and device != "cuda":
+        log.warning("CUDA недоступна — использую CPU")
+
+    # датасеты
+    log.info("Готовлю датасеты…")
+    ds_train = HCanonGraphDataset(data_dir, zones_json, services_json, split="train", split_ratio=0.9)
+    ds_val   = HCanonGraphDataset(data_dir, zones_json, services_json, split="val",   split_ratio=0.9)
+
+    if _PYG_OK:
+        train_loader = GeomLoader(ds_train, batch_size=args.batch_size, shuffle=True)
+        val_loader   = GeomLoader(ds_val,   batch_size=args.batch_size, shuffle=False)
+        in_dim = ds_train[0].x.shape[1]
+    else:
+        def _collate(batch_list):
+            # Собираем батч по узлам (конкат) без графовой агрегации
+            xs = []; eis = []; ys = {}
+            for b in batch_list:
+                xs.append(b["x"])  # (N_i, F)
+                if b["edge_index"].numel() > 0:
+                    eis.append(b["edge_index"])  # игнорируем для MLP
+                for k,v in b["y"].items():
+                    ys.setdefault(k, []).append(v)
+            x = torch.cat(xs, dim=0)
+            for k in ys: ys[k] = torch.cat(ys[k], dim=0)
+            # пустой edge_index
+            ei = torch.zeros((2,0), dtype=torch.long)
+            return {"x": x, "edge_index": ei, "y": ys}
+        train_loader = DataLoader(ds_train, batch_size=1, shuffle=True, collate_fn=_collate)
+        val_loader   = DataLoader(ds_val,   batch_size=1, shuffle=False, collate_fn=_collate)
+        in_dim = ds_train[0]["x"].shape[1]
+
+    # модель
+    log.info("Создаю модель…")
+    model = GraphModel(in_dim=in_dim, hidden=int(cfg["model"]["hidden"]), num_services=ds_train.num_services)
+
+    # TensorBoard
+    run_name = f"{cfg.get('experiment','exp')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    runs_dir = os.path.join(os.path.dirname(ckpt_path) or data_dir, "runs", run_name)
+    os.makedirs(runs_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir=runs_dir)
+    log.info(f"TensorBoard лог-директория: {runs_dir}")
+
+    # обучение
+    best_val = train_loop(model, train_loader, val_loader, device, cfg, ckpt_path, writer)
+    writer.close()
+
+    # сохраняем вспомог. файлы рядом с чекпойнтом
+    aux_dir = os.path.join(os.path.dirname(ckpt_path) or data_dir, "artifacts")
+    os.makedirs(aux_dir, exist_ok=True)
+    with open(os.path.join(aux_dir, "zones.json"), "w", encoding="utf-8") as f:
+        json.dump(ds_train.zone2id, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(aux_dir, "services.json"), "w", encoding="utf-8") as f:
+        json.dump(ds_train.service2id, f, ensure_ascii=False, indent=2)
+    with open(os.path.join(aux_dir, "train_config.json"), "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    log.info(f"Вспомогательные файлы сохранены → {aux_dir}")
+
+    # Загрузка на HF (директория с чекпойнтом и артефактами)
+    if args.hf_push:
+        repo_id = args.hf_repo_id
+        token = args.hf_token or os.environ.get("HF_TOKEN")
+        if not token:
+            log.warning("HF token не найден ни в --hf-token, ни в $HF_TOKEN — пропускаю загрузку")
+        else:
+            to_push_dir = os.path.commonpath([os.path.abspath(aux_dir), os.path.abspath(ckpt_path)])
+            # если чекпойнт вне aux_dir — положим его в artifacts и пушнем целиком
+            if not os.path.dirname(ckpt_path).startswith(aux_dir):
+                try:
+                    import shutil
+                    shutil.copy2(ckpt_path, os.path.join(aux_dir, os.path.basename(ckpt_path)))
+                except Exception:
+                    pass
+            push_to_hf(repo_id=repo_id, token=token, folder=aux_dir, private=bool(args.hf_private))
+
+    log.info("Обучение завершено.")
 
 
 if __name__ == "__main__":
-    # Seed Python's RNG so dataset shuffling is repeatable.  When new features
-    # are added to the dataset (e.g. zone labels) this ensures consistent train
-    # / validation splits.
-    random.seed(42) # make sure every time has the same training and validation sets
-
-
-    root = os.getcwd()
-
-    # Location of the processed graphs.  Replace with your own dataset path if
-    # necessary.
-    dataset_path = os.path.join(root, 'dataset')  ### you may set up your own dataset
-
-    # Load training options from YAML configuration.  Editing ``train_gnn.yaml``
-    # allows users to introduce new hyper-parameters or feature dimensions.
-    train_opt = read_train_yaml(root, filename = "train_gnn.yaml")
-    print(train_opt)
-    is_resmue = train_opt['resume']
-    gpu_ids = train_opt['gpu_ids']
-
-    if is_resmue:
-        # When resuming training, restore saved hyper-parameters and weights.
-        resume_epoch = train_opt['resume_epoch']
-        resume_dir = train_opt['resume_dir']
-        import_name = train_opt['import_name']
-        opt = read_train_yaml(os.path.join(root,'epoch', resume_dir), filename = "train_save.yaml")
-    else:
-        opt = train_opt
-
-    notes = 'GlobalMapper'
-        
-    # Total number of possible nodes in the grid-shaped template.  When
-    # including new node attributes (functional zones or building features) the
-    # template size typically stays the same, but the feature dimensionality
-    # per node will grow.
-    maxlen = opt['template_width']
-    N = maxlen * opt['template_height']
-    min_bldg = 0   # >
-    max_bldg = N   # <=
-    opt['N'] = int(N)
-
-    fname = opt['convlayer'] + '_' + opt['aggr'] + '_dim' + str(opt['n_ft_dim'])
-    data_name = 'osm_cities' #Structure + '_Bldg'+str(min_bldg)+'-'+str(max_bldg)+'_ML'+str(maxlen) +'_N' + str(N)
-
-    opt['data_name'] = data_name
-    print(data_name)
-    device = torch.device('cuda:{}'.format(gpu_ids[0]))
-    print(device)
-    opt['device'] = str(device)
-    start_epoch = opt['start_epoch']
-
-
-    # Register all loss functions.  When you introduce new labels, such as
-    # functional zone categories, define and insert the corresponding loss
-    # modules here (e.g. another CrossEntropyLoss).
-    loss_dict = {}
-    loss_dict['Posloss'] = nn.MSELoss(reduction='sum')
-    loss_dict['ShapeCEloss'] = nn.CrossEntropyLoss(reduction='sum')
-    loss_dict['Iouloss'] = nn.MSELoss(reduction='sum')
-    loss_dict['ExistBCEloss'] = nn.BCEWithLogitsLoss(reduction='sum')
-    loss_dict['CELoss'] = nn.CrossEntropyLoss(reduction='none')
-    loss_dict['Sizeloss'] = nn.MSELoss(reduction='sum')  # nn.SmoothL1Loss
-    loss_dict['ExtSumloss'] = nn.MSELoss(reduction='sum')  # nn.SmoothL1Loss
-
-
-    # Prepare directories for checkpoints, TensorBoard logs and text logs.
-    save_pth = os.path.join(root,'epoch')
-    if not os.path.exists(save_pth):
-        os.mkdir(save_pth)
-
-    log_pth = os.path.join(root,'tensorboard')
-    if not os.path.exists(log_pth):
-        os.mkdir(log_pth)
-
-    logs_pth = os.path.join(root,'logs')
-    if not os.path.exists(logs_pth):
-        os.mkdir(logs_pth)
-
-    time = strftime("%Y-%m-%d %H:%M:%S", gmtime())
-
-    if is_resmue:
-        save_name = notes + fname + '_lr{}_epochs{}_batch{}'.format(opt['lr'], opt['total_epochs'], opt['batch_size'])
-        save_pth = os.path.join(root,'epoch', resume_dir)
-        log_file = os.path.join(root,'logs', resume_dir + '.log')
-        tb_path = os.path.join(root,'tensorboard', resume_dir)
-    else:
-        save_name = notes + fname + '_lr{}_epochs{}_batch{}_'.format(opt['lr'], opt['total_epochs'], opt['batch_size'])
-        save_pth = os.path.join(root,'epoch', save_name + time)
-        log_file = os.path.join(root,'logs', save_name + time + '.log')
-        tb_path = os.path.join(root,'tensorboard', save_name + time)
-
-
-    if opt['save_record']:
-        if not os.path.exists(save_pth):
-            os.mkdir(save_pth)
-
-        # Reconfigure root logger for a clean log file.
-        for handler in logging.root.handlers[:]:
-            logging.root.removeHandler(handler)
-
-        logging.basicConfig(
-            level=logging.INFO,
-            format="[%(levelname)s] %(message)s - %(filename)s %(funcName)s %(asctime)s ",
-            filename = log_file)
-        opt['save_path'] = save_pth
-        opt['log_path'] = log_file
-        opt['tensorboard_path'] = tb_path
-        if is_resmue:
-            yaml_fn = 'resume_train_save.yaml'
-            opt['save_notes'] = save_name
-        else:
-            yaml_fn = 'train_save.yaml'
-        with open(os.path.join(save_pth, yaml_fn), 'w') as outfile:
-            yaml.dump(opt, outfile, default_flow_style=False)
-
-        # TensorBoard setup so losses/metrics are logged during training.
-        configure(tb_path, flush_secs=5)
-
-
-
-    torch.autograd.set_detect_anomaly(True)
-
-    # Image augmentation for the CNN branch (road conditions).  Users adding
-    # new raster attributes can extend ``get_transform`` in ``urban_dataset``.
-    cnn_transform = get_transform(noise_range = 10.0, noise_type = 'gaussian', isaug = False, rescale_size = 64)
-    dataset = UrbanGraphDataset(dataset_path,transform = graph_transform, cnn_transform = cnn_transform)
-    num_data = len(dataset)
-
-    opt['num_data'] = int(num_data)
-    print(num_data)
-
-    ### get the validation data number
-    val_num = int(num_data * opt['val_ratio'])
-    ### sample the validation data index
-    val_idx = np.array(random.sample(range(num_data), val_num))
-    ### remove the validation data index for training
-    train_idx = np.delete(np.arange(num_data), val_idx)
-
-
-    print('Get {} graph for training'.format(train_idx.shape[0]))
-    print('Get {} graph for validation'.format(val_idx.shape[0]))
-
-
-    val_dataset = dataset[val_idx]
-    train_dataset = dataset[train_idx]
-    val_loader = DataLoader(val_dataset, batch_size=opt['batch_size'], shuffle=False, num_workers=8)
-    train_loader = DataLoader(train_dataset, batch_size=opt['batch_size'], shuffle=True, num_workers=8)
-
-    # Instantiate the model variant depending on configuration flags.  Adding
-    # new input attributes may require adapting the constructors in ``model.py``
-    # (e.g., increasing input channel dimensions).
-    if opt['is_blockplanner']:
-        model = NaiveBlockGenerator(opt, N = N)
-
-    elif opt['is_conditional_block']:
-        if opt['convlayer'] in opt['attten_net']:
-            model = AttentionBlockGenerator(opt, N = N)
-        else:
-            model = BlockGenerator(opt, N = N)
-    else:
-        if opt['convlayer'] in opt['attten_net']:
-            if opt['encode_cnn']:
-                print('attention net')
-                model = AttentionBlockGenerator_independent_cnn(opt, N = N) #, T = 1
-            else:
-                model = AttentionBlockGenerator_independent(opt, N = N)
-
-    if is_resmue:
-        start_epoch = resume_epoch
-        print('import from {}'.format(os.path.join(root,'epoch',resume_dir, import_name+'.pth')))
-        model.load_state_dict(torch.load(os.path.join(root,'epoch',resume_dir, import_name+'.pth'), map_location=device))
-
-
-    model.to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr= float(opt['lr']), weight_decay=1e-6)
-    scheduler = MultiStepLR(optimizer, milestones=[(opt['total_epochs'] - start_epoch) * 0.6, (opt['total_epochs']-start_epoch) * 0.8], gamma=0.3)
-
-
-    # Track the best metrics for checkpointing.
-    best_val_acc = None
-    best_train_acc = None
-    best_train_loss = None
-    best_val_loss = None
-    best_val_geo_loss = None
-
-    print('Start Training...')
-    logging.info('Start Training...' )
-
-    for epoch in range(start_epoch, opt['total_epochs']):
-
-        t_acc, t_loss = train(model, epoch, train_loader, device, opt, loss_dict, optimizer, scheduler)
-        v_acc, v_loss, v_loss_geo = validation(model, epoch, val_loader, device, opt, loss_dict, scheduler)
-
-        if opt['save_record']:
-            # Update running best statistics and store checkpoints.
-            if best_train_acc is None or t_acc >= best_train_acc:
-                best_train_acc = t_acc
-
-            if best_train_loss is None or t_loss <= best_train_loss:
-                best_train_loss = t_loss
-
-            if best_val_acc is None or v_acc >= best_val_acc:
-                best_val_acc = v_acc
-                filn = os.path.join(save_pth, "val_best_extacc.pth")
-                torch.save(model.state_dict(), filn)
-
-            if best_val_loss is None or v_loss <= best_val_loss:
-                best_val_loss = v_loss
-                filn = os.path.join(save_pth, "val_least_loss_all.pth")
-                torch.save(model.state_dict(), filn)
-
-            if best_val_geo_loss is None or v_loss_geo <= best_val_geo_loss:
-                best_val_geo_loss = v_loss_geo
-                filn = os.path.join(save_pth, "val_least_loss_geo.pth")
-                torch.save(model.state_dict(), filn)
-
-            if epoch % opt['save_epoch'] == 0:
-                filn = os.path.join(save_pth, str(epoch) + "_save.pth")
-                torch.save(model.state_dict(), filn)
-            logging.info('Epoch: {:03d}, Train Loss: {:.7f}, Train exist accuracy: {:.7f}, Valid Loss: {:.7f}, Valid exist accuracy: {:.7f}, valid geo loss {:.7f}'.format(epoch, t_loss, t_acc, v_loss, v_acc, v_loss_geo) )
-            print('Epoch: {:03d}, Train Loss: {:.7f}, Train exist accuracy: {:.7f}, Valid Loss: {:.7f}, Valid exist accuracy: {:.7f}, valid geo loss {:.7f}'.format(epoch, t_loss, t_acc, v_loss, v_acc, v_loss_geo) )
-
-            # Always keep a copy of the latest model in case training is
-            # interrupted.
-            filn = os.path.join(save_pth, "latest.pth")
-            torch.save(model.state_dict(), filn)
-
-    if opt['save_record']:
-        # Final summary of the best metrics encountered during training.
-        logging.info('Least Train Loss: {:.7f}, Best Train exist accuracy: {:.7f}, Least Valid Loss: {:.7f}, Best Valid exist accuracy: {:.7f}, best valid geo loss {:.7f}'.format(best_train_loss, best_train_acc, best_val_loss, best_val_acc, best_val_geo_loss))
-        print('Least Train Loss: {:.7f}, Best Train exist accuracy: {:.7f}, Least Valid Loss: {:.7f}, Best Valid exist accuracy: {:.7f}, best valid geo loss {:.7f}'.format(best_train_loss, best_train_acc, best_val_loss, best_val_acc, best_val_geo_loss))
+    sys.exit(main())
