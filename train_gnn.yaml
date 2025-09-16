@@ -14,12 +14,12 @@ experiment: graphgen_hcanon_v1
 seed: 42
 
 paths:
-  data_dir: ./dataset                           # директория с blocks.parquet, branches.parquet, nodes_fixed.parquet, edges.parquet, masks/
-  by_block_dir: ./dataset/by_block              # если нужен инкрементальный режим
-  model_ckpt: ./dataset/checkpoints/graphgen_hcanon_v1.pt
-  artifacts_dir: ./dataset/artifacts            # куда складывать вспомогательные файлы (zones.json, services.json, config снапшот)
-  zones_json: ./dataset/zones.json              # автогенерация при первом запуске
-  services_json: ./dataset/services.json        # автогенерация при первом запуске
+  data_dir: ./out                           # директория с blocks.parquet, branches.parquet, nodes_fixed.parquet, edges.parquet, masks/
+  by_block_dir: ./out/by_block              # если нужен инкрементальный режим
+  model_ckpt: ./out/checkpoints/graphgen_hcanon_v1.pt
+  artifacts_dir: ./out/artifacts            # куда складывать вспомогательные файлы (zones.json, services.json, config снапшот)
+  zones_json: ./out/zones.json              # автогенерация при первом запуске
+  services_json: ./out/services.json        # автогенерация при первом запуске
   tb_log_dir: ./runs                            # TensorBoard логи
 
 # Описание данных и препроцессинг
