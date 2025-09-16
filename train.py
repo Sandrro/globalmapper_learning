@@ -50,6 +50,25 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 try:
+    from sklearn.cluster import KMeans  # опционально
+    _SK_OK = True
+except Exception:
+    _SK_OK = False
+
+from torch.utils.data import Sampler
+
+def _quantile_bins(x: np.ndarray, nbins: int) -> np.ndarray:
+    x = np.asarray(x, dtype=float)
+    x = np.where(np.isfinite(x), x, np.nan)
+    qs = np.nanquantile(x, np.linspace(0, 1, nbins + 1))
+    # сделаем края уникальными
+    qs = np.unique(qs)
+    if len(qs) <= 2:
+        return np.zeros_like(x, dtype=int)
+    bins = np.digitize(x, qs[1:-1], right=True)
+    return np.clip(bins, 0, len(qs) - 2).astype(int)
+
+try:
     import yaml  # pyyaml
 except Exception as e:
     yaml = None
@@ -94,6 +113,15 @@ _DEF_CFG: Dict[str, Any] = {
             "il": 0.2, "la": 1.0, "sv1": 0.5, "svc": 1.0, "coll": 0.5
         }
     },
+    "sampler": {
+        "mode": "two_stream",
+        "batch_size": 8,
+        "majority_frac": 0.5,
+        "tau_majority": 0.8,
+        "use_residential_stratify": True,
+        "use_residential_clusters": True,
+        "epoch_len_batches": None
+    },
     "model": {
         "emb_dim": 128,
         "hidden": 256,
@@ -137,6 +165,12 @@ parser.add_argument("--device", default=_CFG["training"]["device"])
 parser.add_argument("--mode", choices=["train", "infer"], default="train")
 parser.add_argument("--infer-geojson-in")
 parser.add_argument("--infer-out")
+#sampler
+parser.add_argument("--sampler-mode", choices=["two_stream","vanilla"], default=_CFG["sampler"]["mode"])
+parser.add_argument("--majority-frac", type=float, default=_CFG["sampler"]["majority_frac"])
+parser.add_argument("--tau-majority", type=float, default=_CFG["sampler"]["tau_majority"])
+parser.add_argument("--no-res-stratify", action="store_true", help="Отключить стратификацию внутри residential")
+parser.add_argument("--no-res-clusters", action="store_true", help="Отключить k-means кластеры внутри residential")
 # hf
 parser.add_argument("--hf-push", action="store_true", default=_CFG.get("hf",{}).get("push", False))
 parser.add_argument("--hf-repo-id", default=_CFG.get("hf",{}).get("repo_id"))
@@ -147,11 +181,50 @@ parser.add_argument("--log-level", default="INFO")
 args = parser.parse_args()
 
 setup_logger(args.log_level)
+log.info(f"Sampler: mode={args.sampler_mode}, batch_size={args.batch_size}, "
+         f"majority_frac={args.majority_frac}, tau={args.tau_majority}, "
+         f"res_stratify={not args.no_res_stratify}, res_clusters={not args.no_res_clusters}")
 log.info("Запуск train.py (YAML+CLI) …")
 
 # ----------------------
 # Утилиты
 # ----------------------
+# --- Target Normalizer (reversible) ---
+class TargetNormalizer:
+    """
+    Обратимая нормализация таргетов:
+      - la: log1p(living_area / (scale_l**2 + eps))
+      - svc: log1p(capacity)
+    Сохраняется в JSON для последующего инференса.
+    """
+    def __init__(self, eps: float = 1e-6):
+        self.eps = float(eps)
+
+    # ---------- living area ----------
+    def encode_la(self, living_area: torch.Tensor, scale_l: torch.Tensor) -> torch.Tensor:
+        # living_area, scale_l: (N,1) или broadcastable
+        return torch.log1p(living_area / (scale_l**2 + self.eps))
+
+    def decode_la(self, la_norm: torch.Tensor, scale_l: torch.Tensor) -> torch.Tensor:
+        return torch.expm1(la_norm) * (scale_l**2 + self.eps)
+
+    # ---------- services capacity ----------
+    def encode_svc(self, capacity: torch.Tensor) -> torch.Tensor:
+        return torch.log1p(torch.clamp_min(capacity, 0.0))
+
+    def decode_svc(self, svc_norm: torch.Tensor) -> torch.Tensor:
+        return torch.expm1(svc_norm)
+
+    # ---------- persistence ----------
+    def to_dict(self) -> dict:
+        return {"version": 1, "eps": self.eps,
+                "la": {"type": "log1p_div_scale2"}, "svc": {"type": "log1p"}}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TargetNormalizer":
+        return cls(eps=float(d.get("eps", 1e-6)))
+
+
 SEED = 42
 random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
 
@@ -234,7 +307,119 @@ class HCanonGraphDataset(Dataset):
         # кэш блок→зона
         self.block_zone = {r.block_id: r.zone for r in self.blocks.itertuples(index=False)}
 
+        # индексации
+        self.idx2block = {i: b for i, b in enumerate(self.block_ids)}
+        self.block2idx = {b: i for i, b in enumerate(self.block_ids)}
+
+        # кэш: блок -> список узлов (ускорение группировок)
+        self._nodes_by_block = self.nodes.groupby("block_id")
+
+        # предрасчёт блочных метрик и стратификаций
+        self._compute_block_stats_and_strata(nbins=4, k_clusters=8)
+
+        self._block_scale = {r.block_id: float(r.scale_l) if pd.notna(r.scale_l) else 0.0
+                     for r in self.blocks.itertuples(index=False)}
+        self._normalizer = TargetNormalizer(eps=1e-6)  # можно вынести в конфиг
+
         log.info(f"Dataset[{split}] blocks={len(self.block_ids)} nodes={len(self.nodes)} edges={len(self.edges)} services={self.num_services}")
+
+    def _compute_block_stats_and_strata(self, nbins: int = 4, k_clusters: int = 8):
+        """Считает метрики на уровне квартала и подготавливает страты/кластеры для семплинга."""
+        # агрегаты по узлам
+        rows = []
+        cols_exist = set(self.nodes.columns)
+
+        has_il  = "is_living" in cols_exist
+        has_fl  = "floors_num" in cols_exist
+        has_hf  = "has_floors" in cols_exist
+        needed  = {"posx","posy","size_x","size_y","phi_resid"}
+        has_geom = needed.issubset(cols_exist)
+
+        for blk_id in self.block_ids:
+            g = self._nodes_by_block.get_group(blk_id) if blk_id in self._nodes_by_block.groups else None
+            if g is None or len(g) == 0:
+                rows.append({"block_id": blk_id, "occupancy": 0.0, "living_share_active": 0.0,
+                             "floors_mean": np.nan, "posx_m":0,"posx_s":0,"posy_m":0,"posy_s":0,
+                             "sx_m":0,"sy_m":0,"phi_m":0,"phi_s":0})
+                continue
+            e = (g["e_i"].values > 0.5).astype(np.float32)
+            n_tot = float(len(g))
+            n_act = float(e.sum())
+            occ = (n_act / n_tot) if n_tot > 0 else 0.0
+
+            if has_il and n_act > 0:
+                il = g["is_living"].astype(bool).values.astype(np.float32)
+                living_share = float((il * e).sum() / (n_act + 1e-6))
+            else:
+                living_share = 0.0
+
+            if has_fl and has_hf and n_act > 0:
+                hf = g["has_floors"].astype(bool).values.astype(np.float32)
+                fln = pd.to_numeric(g["floors_num"], errors="coerce").fillna(np.nan).values
+                msk = (e > 0) & (hf > 0) & np.isfinite(fln)
+                fl_mean = float(np.mean(fln[msk])) if np.any(msk) else np.nan
+            else:
+                fl_mean = np.nan
+
+            # гео-статы
+            if has_geom and n_act > 0:
+                px, py = g["posx"].values, g["posy"].values
+                sx, sy = g["size_x"].values, g["size_y"].values
+                ph     = g["phi_resid"].values
+                rows.append({
+                    "block_id": blk_id,
+                    "occupancy": occ,
+                    "living_share_active": living_share,
+                    "floors_mean": fl_mean,
+                    "posx_m": float(np.mean(px[e>0])), "posx_s": float(np.std(px[e>0])),
+                    "posy_m": float(np.mean(py[e>0])), "posy_s": float(np.std(py[e>0])),
+                    "sx_m": float(np.mean(sx[e>0])), "sy_m": float(np.mean(sy[e>0])),
+                    "phi_m": float(np.mean(ph[e>0])), "phi_s": float(np.std(ph[e>0])),
+                })
+            else:
+                rows.append({
+                    "block_id": blk_id, "occupancy": occ, "living_share_active": living_share,
+                    "floors_mean": fl_mean, "posx_m":0,"posx_s":0,"posy_m":0,"posy_s":0,
+                    "sx_m":0,"sy_m":0,"phi_m":0,"phi_s":0
+                })
+
+        meta = pd.DataFrame(rows).set_index("block_id")
+        # присоединяем scale_l и zone
+        meta["scale_l"] = self.blocks.set_index("block_id").reindex(self.block_ids)["scale_l"].values
+        meta["zone"]    = self.blocks.set_index("block_id").reindex(self.block_ids)["zone"].astype(str).values
+
+        # страты (квантили)
+        meta["bin_occ"]   = _quantile_bins(meta["occupancy"].values, nbins)
+        meta["bin_lshare"]= _quantile_bins(meta["living_share_active"].values, nbins)
+        meta["bin_floor"] = _quantile_bins(pd.to_numeric(meta["floors_mean"], errors="coerce").fillna(-1).values, nbins)
+        meta["bin_scale"] = _quantile_bins(pd.to_numeric(meta["scale_l"],  errors="coerce").fillna(-1).values, nbins)
+
+        # k-means внутри residential (опц.)
+        if _SK_OK:
+            res_mask = (meta["zone"].values == "residential")
+            X = meta.loc[res_mask, ["posx_m","posx_s","posy_m","posy_s","sx_m","sy_m","phi_m","phi_s"]].values
+            if X.shape[0] >= k_clusters and np.isfinite(X).all():
+                km = KMeans(n_clusters=k_clusters, n_init=10, random_state=42)
+                cl = km.fit_predict(X)
+                meta.loc[res_mask, "res_cluster"] = cl.astype(int)
+            else:
+                meta["res_cluster"] = -1
+        else:
+            meta["res_cluster"] = -1
+
+        self.block_meta = meta  # DataFrame
+        # списки индексов по зонам
+        self.zone2indices = {}
+        for z, grp in meta.groupby("zone"):
+            self.zone2indices[str(z)] = [self.block2idx[b] for b in grp.index.tolist() if b in self.block2idx]
+
+    def get_zone_indices(self, zone_label: str) -> List[int]:
+        return self.zone2indices.get(str(zone_label), [])
+
+    def get_block_meta(self, idx: int) -> Dict[str, Any]:
+        blk = self.idx2block[idx]
+        r = self.block_meta.loc[blk]
+        return r.to_dict()
 
     def __len__(self):
         return len(self.block_ids)
@@ -274,35 +459,92 @@ class HCanonGraphDataset(Dataset):
         return mhot, cap_vec
 
     def _node_targets(self, df_nodes_block: pd.DataFrame) -> Dict[str, torch.Tensor]:
-        # Цели (y):
-        #   e_i (mask), pos(x,y), size(x,y), phi, s_i (class), a_i,
-        #   has_floors, floors_num, is_living, living_area,
-        #   services_present(one-hot), services_capacity(aligned)
-        e = torch.as_tensor(df_nodes_block["e_i"].values, dtype=torch.float32)
-        pos = torch.as_tensor(df_nodes_block[["posx","posy"]].values, dtype=torch.float32)
-        sz  = torch.as_tensor(df_nodes_block[["size_x","size_y"]].values, dtype=torch.float32)
-        phi = torch.as_tensor(df_nodes_block[["phi_resid"]].values, dtype=torch.float32)
-        s   = torch.as_tensor(df_nodes_block[["s_i"]].fillna(0).values, dtype=torch.long).view(-1)
-        a   = torch.as_tensor(df_nodes_block[["a_i"]].fillna(0.0).values, dtype=torch.float32)
-        hf  = torch.as_tensor(df_nodes_block[["has_floors"]].astype(bool).values, dtype=torch.float32)
-        # floors_num может быть отсутствующим (Int64), используем -1 и маску
-        fl_raw = df_nodes_block["floors_num"].astype("Int64").fillna(-1).astype(int).values
-        fl = torch.as_tensor(fl_raw, dtype=torch.long)
-        il  = torch.as_tensor(df_nodes_block[["is_living"]].astype(bool).values, dtype=torch.float32)
-        # living_area: если is_living==False → treat как 0 и mark как missing в лоссе (маска il)
-        la_vals = pd.to_numeric(df_nodes_block["living_area"], errors="coerce").fillna(0.0).values
-        la  = torch.as_tensor(la_vals, dtype=torch.float32).view(-1,1)
+        """
+        Готовит таргеты для одного блока с обратимой нормализацией:
+        - la_norm = log1p(living_area / (scale_l**2 + eps))
+        - svc_norm = log1p(capacity), считать лосс только там, где sv1==1.
+        Возвращаемые тензоры:
+        e:(N,1), pos:(N,2), sz:(N,2), phi:(N,1), s:(N,), a:(N,1),
+        hf:(N,1), fl:(N,), il:(N,1), la:(N,1),
+        sv1:(N,S), svc:(N,S), svc_mask:(N,S),
+        scale_l:(N,1).
+        """
+        N = len(df_nodes_block)
 
-        # services
-        mhot_list = []
-        cap_list  = []
+        # --- бинарные/скалярные узловые ---
+        e = torch.as_tensor(pd.to_numeric(df_nodes_block["e_i"], errors="coerce")
+                            .fillna(0.0).values, dtype=torch.float32).view(-1, 1)
+
+        pos = torch.as_tensor(df_nodes_block[["posx", "posy"]]
+                            .apply(pd.to_numeric, errors="coerce").fillna(0.0).values,
+                            dtype=torch.float32)  # (N,2)
+
+        sz = torch.as_tensor(df_nodes_block[["size_x", "size_y"]]
+                            .apply(pd.to_numeric, errors="coerce").fillna(0.0).values,
+                            dtype=torch.float32)   # (N,2)
+
+        phi = torch.as_tensor(pd.to_numeric(df_nodes_block["phi_resid"], errors="coerce")
+                            .fillna(0.0).values, dtype=torch.float32).view(-1, 1)  # (N,1)
+
+        # классы формы (int) и непрерывный атрибут a_i
+        s = torch.as_tensor(pd.to_numeric(df_nodes_block["s_i"], errors="coerce")
+                            .fillna(0).astype(int).values, dtype=torch.long).view(-1)  # (N,)
+
+        a = torch.as_tensor(pd.to_numeric(df_nodes_block["a_i"], errors="coerce")
+                            .fillna(0.0).values, dtype=torch.float32).view(-1, 1)     # (N,1)
+
+        # этажность
+        hf = torch.as_tensor(df_nodes_block["has_floors"].astype(bool).values,
+                            dtype=torch.float32).view(-1, 1)  # (N,1)
+        fl = torch.as_tensor(pd.to_numeric(df_nodes_block["floors_num"], errors="coerce")
+                            .fillna(-1).astype(int).values, dtype=torch.long).view(-1)  # (N,)
+
+        # жилое/площадь
+        il = torch.as_tensor(df_nodes_block["is_living"].astype(bool).values,
+                            dtype=torch.float32).view(-1, 1)  # (N,1)
+
+        la_raw = torch.as_tensor(pd.to_numeric(df_nodes_block["living_area"], errors="coerce")
+                                .fillna(0.0).values, dtype=torch.float32).view(-1, 1)   # (N,1)
+
+        # --- масштаб блока (одинаков для всех узлов блока) ---
+        try:
+            blk_id_val = df_nodes_block["block_id"].iloc[0]
+            sc = float(self._block_scale.get(blk_id_val, 0.0))
+        except Exception:
+            sc = 0.0
+        scale_col = torch.full((N, 1), sc, dtype=torch.float32)  # (N,1)
+
+        # --- НОРМАЛИЗАЦИЯ living_area (обратима) ---
+        # требуется self._normalizer: TargetNormalizer(eps=...)
+        la = self._normalizer.encode_la(la_raw, scale_col)  # (N,1)
+
+        # --- сервисы ---
+        mhot_list, cap_list = [], []
         for r in df_nodes_block.itertuples(index=False):
-            m, c = self._services_vecs(getattr(r, "services_present", None), getattr(r, "services_capacity", None))
-            mhot_list.append(m); cap_list.append(c)
-        sv1 = torch.as_tensor(np.vstack(mhot_list) if mhot_list else np.zeros((len(df_nodes_block), self.num_services), np.float32))
-        svc = torch.as_tensor(np.vstack(cap_list)  if cap_list  else np.zeros((len(df_nodes_block), self.num_services), np.float32))
+            m, c = self._services_vecs(getattr(r, "services_present", None),
+                                    getattr(r, "services_capacity", None))
+            mhot_list.append(m)
+            cap_list.append(c)
 
-        return {"e": e, "pos": pos, "sz": sz, "phi": phi, "s": s, "a": a, "hf": hf, "fl": fl, "il": il, "la": la, "sv1": sv1, "svc": svc}
+        if self.num_services > 0:
+            sv1 = torch.as_tensor(np.vstack(mhot_list), dtype=torch.float32)                 # (N,S)
+            svc_raw = torch.as_tensor(np.vstack(cap_list), dtype=torch.float32)              # (N,S)
+            svc = self._normalizer.encode_svc(svc_raw)                                       # (N,S)
+            svc_mask = (sv1 > 0).float()                                                     # (N,S)
+        else:
+            sv1 = torch.zeros((N, 0), dtype=torch.float32)
+            svc = torch.zeros((N, 0), dtype=torch.float32)
+            svc_mask = torch.zeros((N, 0), dtype=torch.float32)
+
+        return {
+            "e": e, "pos": pos, "sz": sz, "phi": phi, "s": s, "a": a,
+            "hf": hf, "fl": fl, "il": il,
+            "la": la,                      # нормированная living_area
+            "sv1": sv1,                    # multi-hot присутствия сервисов
+            "svc": svc,                    # нормированные capacity
+            "svc_mask": svc_mask,          # маска для лосса по capacity (sv1==1)
+            "scale_l": scale_col,          # для денормализации на инференсе
+        }
 
     def __getitem__(self, idx: int):
         blk_id = self.block_ids[idx]
@@ -348,8 +590,10 @@ class HCanonGraphDataset(Dataset):
             data.y_fl  = targets["fl"].view(-1)       # целевая этажность как int, N
             data.y_il  = targets["il"].view(-1,1)
             data.y_la  = targets["la"].view(-1,1)
-            data.y_sv1 = targets["sv1"].view(-1, self.num_services) if self.num_services > 0 else torch.zeros((len(nodes_b),0))
-            data.y_svc = targets["svc"].view(-1, self.num_services) if self.num_services > 0 else torch.zeros((len(nodes_b),0))
+            data.y_sv1 = targets["sv1"].view(-1, self.num_services) if self.num_services>0 else torch.zeros((len(nodes_b),0))
+            data.y_svc = targets["svc"].view(-1, self.num_services) if self.num_services>0 else torch.zeros((len(nodes_b),0))
+            data.y_svc_mask = targets["svc_mask"].view(-1, self.num_services) if self.num_services>0 else torch.zeros((len(nodes_b),0))
+            data.scale_l = targets["scale_l"].view(-1,1)
             return data
         else:
             # Fallback без PyG — как было, но в y словарь уже корректных форм
@@ -357,6 +601,127 @@ class HCanonGraphDataset(Dataset):
                 "x": x_in, "edge_index": edge_index, "y": targets,
                 "num_nodes": x_in.shape[0], "block_id": blk_id, "zone_id": zone_id
             }
+
+def make_zone_temperature_weights(ds: "HCanonGraphDataset", tau: float = 1.0) -> np.ndarray:
+    """
+    Возвращает веса длины len(ds) пропорционально f_z**tau,
+    где f_z — частоты блоков в зонах. При tau=0 получаем рав.-по-зонам.
+    """
+    counts = {z: len(ixs) for z, ixs in ds.zone2indices.items()}
+    # вероятности зон
+    total = sum(counts.values()) + 1e-9
+    pz = {z: (c / total) for z, c in counts.items()}
+
+    # p(z|tau)
+    for z in pz:
+        pz[z] = max(pz[z], 1e-12) ** float(tau)
+
+    # нормировка
+    s = sum(pz.values())
+    pz = {z: pz[z] / s for z in pz}
+
+    w = np.zeros((len(ds),), dtype=np.float64)
+    for z, ixs in ds.zone2indices.items():
+        for i in ixs:
+            w[i] = pz[z]
+    # безопасная нормировка
+    w = np.where(np.isfinite(w) & (w > 0), w, 1e-12)
+    w = w / w.sum()
+    return w
+
+class MajoritySampler:
+    """Семплирование по весам f_z**tau; внутри residential — равномерно по стратам/кластерам."""
+    def __init__(self, ds: HCanonGraphDataset, tau: float = 0.8,
+                 residential_stratify: bool = True,
+                 use_clusters: bool = True):
+        self.ds = ds
+        self.base_w = make_zone_temperature_weights(ds, tau=tau)
+        self.residential_stratify = residential_stratify
+        self.use_clusters = use_clusters
+
+        # подготовим страты в residential
+        self.res_indices = ds.get_zone_indices("residential")
+        self._res_strata = None
+        if self.residential_stratify and len(self.res_indices) > 0:
+            meta = ds.block_meta
+            sub = meta.iloc[[ds.idx2block[i] in meta.index for i in self.res_indices]]  # осторожно: прямой индекс
+            # лучшая совместимость — соберём руками
+            rows = []
+            for i in self.res_indices:
+                m = ds.get_block_meta(i)
+                rows.append((i, m["bin_occ"], m["bin_lshare"], m["bin_floor"], m["bin_scale"], int(m.get("res_cluster", -1))))
+            # группировка по бинам (кластеры учитываем, если есть)
+            strata = {}
+            for i, b1, b2, b3, b4, cl in rows:
+                key = (b1, b2, b3, b4, cl if (self.use_clusters and cl >= 0) else -1)
+                strata.setdefault(key, []).append(i)
+            # уберём пустые/микроскопические
+            self._res_strata = {k: v for k, v in strata.items() if len(v) > 0}
+
+    def sample(self, k: int) -> List[int]:
+        out: List[int] = []
+        # сколько отдать на «особое» стратифицированное резид.семплирование?
+        # возьмём половину от k, если strata доступны
+        k_res = min(k // 2, len(self.res_indices)) if self._res_strata else 0
+        k_gen = k - k_res
+
+        # 1) общая часть — по весам (разрешим повторы)
+        if k_gen > 0:
+            choices = np.random.choice(np.arange(len(self.ds)), size=k_gen, replace=True, p=self.base_w)
+            out.extend(choices.tolist())
+
+        # 2) «residential страты» — равномерно по стратам
+        if k_res > 0:
+            keys = list(self._res_strata.keys())
+            for _ in range(k_res):
+                key = random.choice(keys)
+                out.append(random.choice(self._res_strata[key]))
+
+        return out
+    
+class MinoritySampler:
+    """Равномерно по зонам (τ=0). В каждом выборе: случайная зона, случайный блок внутри неё."""
+    def __init__(self, ds: HCanonGraphDataset):
+        self.ds = ds
+        self.zones = [z for z, lst in ds.zone2indices.items() if len(lst) > 0]
+
+    def sample(self, k: int) -> List[int]:
+        out: List[int] = []
+        for _ in range(k):
+            z = random.choice(self.zones)
+            i = random.choice(self.ds.zone2indices[z])
+            out.append(i)
+        return out
+    
+class TwoStreamBatchSampler(Sampler[List[int]]):
+    """
+    Собирает батчи длины batch_size = k_maj + k_min:
+      - k_maj = round(batch_size * majority_frac)
+      - k_min = batch_size - k_maj
+    """
+    def __init__(self, ds: HCanonGraphDataset,
+                 batch_size: int = 8,
+                 majority_frac: float = 0.5,
+                 maj_sampler: MajoritySampler | None = None,
+                 min_sampler: MinoritySampler | None = None,
+                 epoch_len_batches: int | None = None):
+        self.ds = ds
+        self.batch_size = int(batch_size)
+        self.k_maj = int(round(self.batch_size * float(majority_frac)))
+        self.k_min = self.batch_size - self.k_maj
+        self.maj = maj_sampler or MajoritySampler(ds)
+        self.min = min_sampler or MinoritySampler(ds)
+        # длина эпохи: по умолчанию ≈ покрытие датасета 1 раз
+        self._n_batches = int(math.ceil(len(ds) / max(1, self.batch_size))) if epoch_len_batches is None else int(epoch_len_batches)
+
+    def __iter__(self):
+        for _ in range(self._n_batches):
+            idxs = self.maj.sample(self.k_maj) + self.min.sample(self.k_min)
+            random.shuffle(idxs)
+            yield idxs
+
+    def __len__(self) -> int:
+        return self._n_batches
 
 # ----------------------
 # Модель
@@ -445,9 +810,9 @@ class LossComputer:
         a_loss_t   = (self.l1(pred["a"],   y["a"])   * e_mask).sum() / denom_nodes   # (1,)
 
         # Жилая площадь считаем только для жилых (il==1)
-        il_mask = y["il"]                        # (N,1)
+        il_mask = y["il"]                          # (N,1)
         denom_living = il_mask.sum() + 1e-6
-        la_loss_t = (self.l1(pred["la"], y["la"]) * il_mask).sum() / denom_living
+        la_loss_t = (self.l1(pred["la"], y["la"]) * il_mask).sum() / denom_living   
 
         # Этажность: считаем, если есть сведения о этажности (has_floors == 1)
         fl_mask = y["hf"].view(-1,1)             # (N,1)
@@ -463,13 +828,15 @@ class LossComputer:
 
         # Сервисы: могут отсутствовать → (N,0), даём нулевой вклад
         if y["sv1"].numel() > 0:
+            svc_mask = y.get("svc_mask", torch.zeros_like(y["sv1"]))  # (N,S)
+            denom_svc = svc_mask.sum() + 1e-6
+            if denom_svc.item() > 0:
+                svc_loss_t = (self.l1(pred["svc"], y["svc"]) * svc_mask).sum() / denom_svc
+            else:
+                svc_loss_t = torch.zeros((), device=pred["e"].device)
             sv1_loss_t = (self.bce(pred["sv1"], y["sv1"]) * e_mask).sum() / denom_nodes
         else:
             sv1_loss_t = torch.zeros((), device=pred["e"].device)
-
-        if y["svc"].numel() > 0:
-            svc_loss_t = (self.l1(pred["svc"], y["svc"]) * e_mask).sum() / denom_nodes
-        else:
             svc_loss_t = torch.zeros((), device=pred["e"].device)
 
         # Собираем тензорные лоссы в словарь
@@ -494,7 +861,9 @@ class LossComputer:
 # Тренировка
 # ----------------------
 
-def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dict[str,Any], save_ckpt_path: str, writer: SummaryWriter):
+def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dict[str,Any],
+               save_ckpt_path: str, writer: SummaryWriter,
+               normalizer: "TargetNormalizer | None" = None):
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["lr"]))
     loss_comp = LossComputer(cfg["training"]["loss_weights"])
@@ -587,6 +956,35 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
 
                 pred = model(x, ei)
                 l, _ = loss_comp(pred, y)
+                if (epoch % 5 == 0) and (normalizer is not None):
+                    # Чтобы не логировать на каждом батче, делаем флаг
+                    if not locals().get("_dbg_la_logged", False):
+                        # scale_l и маска жилых
+                        if _PYG_OK:
+                            scale = batch.scale_l.to(device)                 # (N,1)
+                            il_mask = y["il"].to(device)                     # (N,1)
+                        else:
+                            scale = batch["y"]["scale_l"].to(device)         # (N,1)
+                            il_mask = y["il"].to(device)                     # (N,1)
+
+                        # денормализация
+                        la_real = normalizer.decode_la(pred["la"], scale)    # (N,1)
+                        mask = (il_mask > 0.5).view(-1)
+
+                        if mask.any():
+                            vals = la_real.view(-1)[mask]
+                            # квантильки
+                            p10 = torch.quantile(vals, 0.10).item()
+                            p50 = torch.quantile(vals, 0.50).item()
+                            p90 = torch.quantile(vals, 0.90).item()
+                            writer.add_scalar("debug/la_real_p10", p10, epoch)
+                            writer.add_scalar("debug/la_real_p50", p50, epoch)
+                            writer.add_scalar("debug/la_real_p90", p90, epoch)
+                        else:
+                            # на случай, если в батче нет жилых узлов
+                            writer.add_scalar("debug/la_real_p50", 0.0, epoch)
+
+                        _dbg_la_logged = True  # не логируем повторно в этой эпохе
                 val_tot += float(l.item()); val_cnt += 1
             val_loss = val_tot / max(1, val_cnt)
         writer.add_scalar("val/total", float(val_loss), epoch)
@@ -655,25 +1053,59 @@ def main():
     ds_val   = HCanonGraphDataset(data_dir, zones_json, services_json, split="val",   split_ratio=0.9)
 
     if _PYG_OK:
-        train_loader = GeomLoader(ds_train, batch_size=args.batch_size, shuffle=True)
+        if args.sampler_mode == "two_stream":
+            maj = MajoritySampler(
+                ds_train,
+                tau=float(args.tau_majority),
+                residential_stratify=not args.no_res_stratify,
+                use_clusters=not args.no_res_clusters,
+            )
+            mino = MinoritySampler(ds_train)
+            batch_sampler = TwoStreamBatchSampler(
+                ds_train,
+                batch_size=int(args.batch_size),
+                majority_frac=float(args.majority_frac),
+                maj_sampler=maj, min_sampler=mino,
+                epoch_len_batches=_CFG["sampler"].get("epoch_len_batches"),
+            )
+            # ВАЖНО: при использовании batch_sampler не задаём batch_size/shuffle
+            train_loader = GeomLoader(ds_train, batch_sampler=batch_sampler)
+        else:
+            train_loader = GeomLoader(ds_train, batch_size=args.batch_size, shuffle=True)
+
         val_loader   = GeomLoader(ds_val,   batch_size=args.batch_size, shuffle=False)
         in_dim = ds_train[0].x.shape[1]
     else:
         def _collate(batch_list):
-            # Собираем батч по узлам (конкат) без графовой агрегации
-            xs = []; eis = []; ys = {}
+            xs = []; ys = {}
             for b in batch_list:
-                xs.append(b["x"])  # (N_i, F)
-                if b["edge_index"].numel() > 0:
-                    eis.append(b["edge_index"])  # игнорируем для MLP
-                for k,v in b["y"].items():
+                xs.append(b["x"])
+                for k, v in b["y"].items():
                     ys.setdefault(k, []).append(v)
             x = torch.cat(xs, dim=0)
             for k in ys: ys[k] = torch.cat(ys[k], dim=0)
-            # пустой edge_index
             ei = torch.zeros((2,0), dtype=torch.long)
             return {"x": x, "edge_index": ei, "y": ys}
-        train_loader = DataLoader(ds_train, batch_size=1, shuffle=True, collate_fn=_collate)
+
+        if args.sampler_mode == "two_stream":
+            maj = MajoritySampler(
+                ds_train,
+                tau=float(args.tau_majority),
+                residential_stratify=not args.no_res_stratify,
+                use_clusters=not args.no_res_clusters,
+            )
+            mino = MinoritySampler(ds_train)
+            batch_sampler = TwoStreamBatchSampler(
+                ds_train,
+                batch_size=int(args.batch_size),
+                majority_frac=float(args.majority_frac),
+                maj_sampler=maj, min_sampler=mino,
+                epoch_len_batches=_CFG["sampler"].get("epoch_len_batches"),
+            )
+            train_loader = DataLoader(ds_train, batch_sampler=batch_sampler, collate_fn=_collate)
+        else:
+            train_loader = DataLoader(ds_train, batch_size=1, shuffle=True, collate_fn=_collate)
+
         val_loader   = DataLoader(ds_val,   batch_size=1, shuffle=False, collate_fn=_collate)
         in_dim = ds_train[0]["x"].shape[1]
 
@@ -689,7 +1121,8 @@ def main():
     log.info(f"TensorBoard лог-директория: {runs_dir}")
 
     # обучение
-    best_val = train_loop(model, train_loader, val_loader, device, cfg, ckpt_path, writer)
+    best_val = train_loop(model, train_loader, val_loader, device, cfg, ckpt_path, writer,
+                      normalizer=getattr(ds_train, "_normalizer", None))
     writer.close()
 
     # сохраняем вспомог. файлы рядом с чекпойнтом
@@ -702,6 +1135,11 @@ def main():
     with open(os.path.join(aux_dir, "train_config.json"), "w", encoding="utf-8") as f:
         json.dump(cfg, f, ensure_ascii=False, indent=2)
     log.info(f"Вспомогательные файлы сохранены → {aux_dir}")
+
+    norm_path = os.path.join(aux_dir, "target_normalizer.json")
+    with open(norm_path, "w", encoding="utf-8") as f:
+        json.dump(ds_train._normalizer.to_dict(), f, ensure_ascii=False, indent=2)
+    log.info(f"Нормировщик таргетов сохранён → {norm_path}")
 
     # Загрузка на HF (директория с чекпойнтом и артефактами)
     if args.hf_push:
@@ -721,6 +1159,38 @@ def main():
             push_to_hf(repo_id=repo_id, token=token, folder=aux_dir, private=bool(args.hf_private))
 
     log.info("Обучение завершено.")
+
+def load_target_normalizer(path: str) -> TargetNormalizer:
+    with open(path, "r", encoding="utf-8") as f:
+        return TargetNormalizer.from_dict(json.load(f))
+
+@torch.no_grad()
+def denorm_predictions(batch, pred: Dict[str, torch.Tensor], normalizer: TargetNormalizer) -> Dict[str, torch.Tensor]:
+    """
+    Принимает батч и предсказания в НОРМ-формате, возвращает дикт с 'la_real', 'svc_real'.
+    Требует наличие batch.scale_l (PyG) или batch["y"]["scale_l"] (fallback).
+    """
+    if hasattr(batch, "scale_l"):
+        scale = batch.scale_l.to(pred["la"].device)  # (N,1)
+    else:
+        scale = batch["y"]["scale_l"].to(pred["la"].device)
+
+    out = {}
+    if "la" in pred:
+        la_real = normalizer.decode_la(pred["la"], scale)  # (N,1)
+        out["la_real"] = la_real
+
+    if "svc" in pred:
+        svc_real = normalizer.decode_svc(pred["svc"])      # (N,S)
+        out["svc_real"] = svc_real
+
+    # По желанию: бинаризуем sv1 и зануляем capacities, где presence==0
+    if "sv1" in pred and "svc_real" in out:
+        sv1_prob = torch.sigmoid(pred["sv1"])
+        sv1_bin = (sv1_prob > 0.5).float()
+        out["svc_real"] = out["svc_real"] * sv1_bin
+
+    return out
 
 
 if __name__ == "__main__":

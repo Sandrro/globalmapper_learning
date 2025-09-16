@@ -52,6 +52,14 @@ data:
     val_ratio: 0.1
     shuffle: true
 
+sampler:
+  mode: two_stream
+  batch_size: 8
+  majority_frac: 0.5
+  tau_majority: 0.8
+  use_residential_stratify: true
+  use_residential_clusters: true
+
 training:
   batch_size: 8
   epochs: 5
