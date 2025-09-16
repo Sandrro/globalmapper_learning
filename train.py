@@ -29,6 +29,9 @@ import os, sys, json, math, time, argparse, logging, random
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+
+
 # --- логгер ---
 log = logging.getLogger("train")
 
@@ -316,12 +319,71 @@ class HCanonGraphDataset(Dataset):
 
         # предрасчёт блочных метрик и стратификаций
         self._compute_block_stats_and_strata(nbins=4, k_clusters=8)
+        self._compute_label_stats()
 
         self._block_scale = {r.block_id: float(r.scale_l) if pd.notna(r.scale_l) else 0.0
                      for r in self.blocks.itertuples(index=False)}
         self._normalizer = TargetNormalizer(eps=1e-6)  # можно вынести в конфиг
 
         log.info(f"Dataset[{split}] blocks={len(self.block_ids)} nodes={len(self.nodes)} edges={len(self.edges)} services={self.num_services}")
+
+    def _compute_label_stats(self):
+        """Подсчёт частот на текущем split для pos_weight (e/il/hf) и class_weight (s)."""
+        nodes = self.nodes
+        mask_split = nodes["block_id"].astype(str).isin(self.block_ids)
+        df = nodes[mask_split].copy()
+
+        # e
+        e = pd.to_numeric(df["e_i"], errors="coerce").fillna(0.0) > 0.5
+        p_e = float(e.mean()) if len(df) else 0.0
+
+        # активные узлы
+        df_act = df[e]
+
+        # il, hf на активных
+        if len(df_act):
+            il = df_act["is_living"].astype(bool)
+            hf = df_act["has_floors"].astype(bool)
+            p_il = float(il.mean())
+            p_hf = float(hf.mean())
+        else:
+            p_il, p_hf = 0.0, 0.0
+
+        # классы формы (на активных)
+        if "s_i" in df_act.columns and len(df_act):
+            s_vals = pd.to_numeric(df_act["s_i"], errors="coerce").fillna(0).astype(int)
+            counts = s_vals.value_counts().reindex([0,1,2,3], fill_value=0).astype(int)
+        else:
+            counts = pd.Series([0,0,0,0], index=[0,1,2,3])
+
+        self.label_stats = {
+            "p_e": max(min(p_e, 0.999999), 1e-6),
+            "p_il": max(min(p_il, 0.999999), 1e-6),
+            "p_hf": max(min(p_hf, 0.999999), 1e-6),
+            "s_counts": counts.to_dict(),  # {0:c0,1:c1,2:c2,3:c3}
+        }
+
+    def get_pos_weights(self) -> Dict[str, float]:
+        """pos_weight = neg/pos для BCE."""
+        ls = getattr(self, "label_stats", None) or {}
+        def _pw(p):  # p = P(y=1)
+            p = max(min(float(p), 0.999999), 1e-6)
+            return (1.0 - p) / p
+        return {
+            "e": _pw(ls.get("p_e", 0.01)),
+            "il": _pw(ls.get("p_il", 0.1)),
+            "hf": _pw(ls.get("p_hf", 0.5)),
+        }
+
+    def get_s_class_weights(self) -> torch.Tensor:
+        """Обратные частоты классов для CE (Rect/X/U/L -> 0/1/2/3)."""
+        ls = getattr(self, "label_stats", None) or {}
+        counts = ls.get("s_counts", {0:1,1:1,2:1,3:1})
+        arr = np.array([counts.get(k, 1) for k in [0,1,2,3]], dtype=np.float64)
+        arr = np.where(arr > 0, arr, 1.0)
+        inv = 1.0 / arr
+        inv = inv / inv.mean()  # нормируем, чтобы средний вес ~1
+        return torch.tensor(inv, dtype=torch.float32)
 
     def _compute_block_stats_and_strata(self, nbins: int = 4, k_clusters: int = 8):
         """Считает метрики на уровне квартала и подготавливает страты/кластеры для семплинга."""
@@ -643,34 +705,36 @@ class MajoritySampler:
         self.res_indices = ds.get_zone_indices("residential")
         self._res_strata = None
         if self.residential_stratify and len(self.res_indices) > 0:
-            meta = ds.block_meta
-            sub = meta.iloc[[ds.idx2block[i] in meta.index for i in self.res_indices]]  # осторожно: прямой индекс
-            # лучшая совместимость — соберём руками
-            rows = []
-            for i in self.res_indices:
-                m = ds.get_block_meta(i)
-                rows.append((i, m["bin_occ"], m["bin_lshare"], m["bin_floor"], m["bin_scale"], int(m.get("res_cluster", -1))))
-            # группировка по бинам (кластеры учитываем, если есть)
             strata = {}
-            for i, b1, b2, b3, b4, cl in rows:
+            for i in self.res_indices:
+                blk_id = ds.idx2block[i]
+                m = ds.block_meta.loc[blk_id]
+                b1 = int(m["bin_occ"]); b2 = int(m["bin_lshare"]); b3 = int(m["bin_floor"]); b4 = int(m["bin_scale"])
+                cl = int(m.get("res_cluster", -1))
                 key = (b1, b2, b3, b4, cl if (self.use_clusters and cl >= 0) else -1)
                 strata.setdefault(key, []).append(i)
-            # уберём пустые/микроскопические
             self._res_strata = {k: v for k, v in strata.items() if len(v) > 0}
 
     def sample(self, k: int) -> List[int]:
+        """
+        Возвращает список индексов блоков длиной k.
+        Половину (если доступны) берём равномерно по стратам внутри residential,
+        остальное — по глобальным весам p ~ f_z**tau. Разрешаем повторы (replace=True).
+        """
+        if k <= 0:
+            return []
         out: List[int] = []
-        # сколько отдать на «особое» стратифицированное резид.семплирование?
-        # возьмём половину от k, если strata доступны
+
+        # сколько отдаём на страты residential?
         k_res = min(k // 2, len(self.res_indices)) if self._res_strata else 0
         k_gen = k - k_res
 
-        # 1) общая часть — по весам (разрешим повторы)
+        # 1) общая часть: выборка по распределению self.base_w (замена разрешена)
         if k_gen > 0:
             choices = np.random.choice(np.arange(len(self.ds)), size=k_gen, replace=True, p=self.base_w)
             out.extend(choices.tolist())
 
-        # 2) «residential страты» — равномерно по стратам
+        # 2) равномерно по стратам внутри residential
         if k_res > 0:
             keys = list(self._res_strata.keys())
             for _ in range(k_res):
@@ -781,80 +845,83 @@ class GraphModel(nn.Module):
 # Лоссы
 # ----------------------
 class LossComputer:
-    def __init__(self, w: Dict[str, float]):
+    def __init__(self, w: Dict[str, float],
+                 posw: Dict[str, float] | None = None,
+                 ce_weight: torch.Tensor | None = None,
+                 label_smoothing: float = 0.05):
         self.w = w
-        self.ce = nn.CrossEntropyLoss(reduction='none')
-        self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        self.posw = posw or {"e": 1.0, "il": 1.0, "hf": 1.0}
+        self.ce_weight = ce_weight
+        self.label_smoothing = float(label_smoothing)
         self.l1 = nn.L1Loss(reduction='none')
-        self.mse = nn.MSELoss(reduction='none')
 
     def __call__(self, pred: Dict[str, torch.Tensor], y: Dict[str, torch.Tensor]) -> Tuple[torch.Tensor, Dict[str,float]]:
-        """
-        Возвращает:
-          total_loss  — СКАЛЯРНЫЙ ТЕНЗОР (requires_grad=True)
-          parts(float) — словарь для логов
-        """
+        device = pred["e"].device
+
         # Маски
-        e_mask = (y["e"] > 0.5).float()           # (N,1) — активные узлы
-        denom_nodes = e_mask.sum() + 1e-6         # скаляр
+        e_mask = (y["e"] > 0.5).float()                 # (N,1) — активные узлы
+        denom_nodes = e_mask.sum() + 1e-6               # скаляр
 
-        # Бинарные
-        e_loss_t  = self.bce(pred["e"], y["e"]).mean()                               # (1,)
-        hf_loss_t = (self.bce(pred["hf"], y["hf"]) * e_mask).sum() / denom_nodes     # (1,)
-        il_loss_t = (self.bce(pred["il"], y["il"]) * e_mask).sum() / denom_nodes     # (1,)
+        # ----- BCE с pos_weight -----
+        pw_e  = torch.tensor(self.posw.get("e", 1.0),  device=device)
+        pw_il = torch.tensor(self.posw.get("il", 1.0), device=device)
+        pw_hf = torch.tensor(self.posw.get("hf", 1.0), device=device)
 
-        # Регрессии
-        pos_loss_t = (self.l1(pred["pos"], y["pos"]) * e_mask).sum() / denom_nodes   # (1,)
-        sz_loss_t  = (self.l1(pred["sz"],  y["sz"])  * e_mask).sum() / denom_nodes   # (1,)
-        phi_loss_t = (self.l1(pred["phi"], y["phi"]) * e_mask).sum() / denom_nodes   # (1,)
-        a_loss_t   = (self.l1(pred["a"],   y["a"])   * e_mask).sum() / denom_nodes   # (1,)
+        e_loss_t  = F.binary_cross_entropy_with_logits(pred["e"],  y["e"],  pos_weight=pw_e,  reduction='mean')
+        il_loss_t = (F.binary_cross_entropy_with_logits(pred["il"], y["il"], pos_weight=pw_il, reduction='none') * e_mask).sum() / denom_nodes
+        hf_loss_t = (F.binary_cross_entropy_with_logits(pred["hf"], y["hf"], pos_weight=pw_hf, reduction='none') * e_mask).sum() / denom_nodes
 
-        # Жилая площадь считаем только для жилых (il==1)
-        il_mask = y["il"]                          # (N,1)
+        # ----- Регрессии (по активным) -----
+        pos_loss_t = (self.l1(pred["pos"], y["pos"]) * e_mask).sum() / denom_nodes
+        sz_loss_t  = (self.l1(pred["sz"],  y["sz"])  * e_mask).sum() / denom_nodes
+        phi_loss_t = (self.l1(pred["phi"], y["phi"]) * e_mask).sum() / denom_nodes
+        a_loss_t   = (self.l1(pred["a"],   y["a"])   * e_mask).sum() / denom_nodes
+
+        # ----- Жилая площадь (по жилым), уже нормирована -----
+        il_mask = y["il"]
         denom_living = il_mask.sum() + 1e-6
-        la_loss_t = (self.l1(pred["la"], y["la"]) * il_mask).sum() / denom_living   
+        la_loss_t = (self.l1(pred["la"], y["la"]) * il_mask).sum() / denom_living
 
-        # Этажность: считаем, если есть сведения о этажности (has_floors == 1)
-        fl_mask = y["hf"].view(-1,1)             # (N,1)
+        # ----- Этажность: корректная маска has_floors==1 & fl>=0 -----
+        fl_valid = (y["fl"].view(-1,1) >= 0).float()
+        fl_mask  = (y["hf"] > 0.5).float() * fl_valid
         denom_fl = fl_mask.sum() + 1e-6
-        fl_tgt  = y["fl"].clamp(min=0).float().view(-1,1)  # (N,1)
-        fl_pred = pred["fl"].view(-1,1)                      # (N,1)
+        fl_tgt   = y["fl"].clamp(min=0).float().view(-1,1)
+        fl_pred  = pred["fl"].view(-1,1)
         fl_loss_t = (self.l1(fl_pred, fl_tgt) * fl_mask).sum() / denom_fl
 
-        # Классы форм
-        # pred["s"]:(N,4), y["s"]:(N,)
-        s_loss_vec = self.ce(pred["s"], y["s"].long()).view(-1)   # (N,)
-        s_loss_t   = (s_loss_vec * e_mask.view(-1)).sum() / denom_nodes
+        # ----- Классы формы (CE с весами, по активным) -----
+        ce_w = self.ce_weight.to(device) if self.ce_weight is not None else None
+        s_loss_vec = F.cross_entropy(pred["s"], y["s"].long(),
+                                     weight=ce_w, reduction='none',
+                                     label_smoothing=self.label_smoothing)
+        s_loss_t = (s_loss_vec * e_mask.view(-1)).sum() / denom_nodes
 
-        # Сервисы: могут отсутствовать → (N,0), даём нулевой вклад
+        # ----- Сервисы: как прежде (но учёт маски для capacity) -----
         if y["sv1"].numel() > 0:
-            svc_mask = y.get("svc_mask", torch.zeros_like(y["sv1"]))  # (N,S)
+            svc_mask = y.get("svc_mask", torch.zeros_like(y["sv1"]))
             denom_svc = svc_mask.sum() + 1e-6
             if denom_svc.item() > 0:
                 svc_loss_t = (self.l1(pred["svc"], y["svc"]) * svc_mask).sum() / denom_svc
             else:
-                svc_loss_t = torch.zeros((), device=pred["e"].device)
-            sv1_loss_t = (self.bce(pred["sv1"], y["sv1"]) * e_mask).sum() / denom_nodes
+                svc_loss_t = torch.zeros((), device=device)
+            sv1_loss_t = (F.binary_cross_entropy_with_logits(pred["sv1"], y["sv1"], reduction='none') * e_mask).sum() / denom_nodes
         else:
-            sv1_loss_t = torch.zeros((), device=pred["e"].device)
-            svc_loss_t = torch.zeros((), device=pred["e"].device)
+            sv1_loss_t = torch.zeros((), device=device)
+            svc_loss_t = torch.zeros((), device=device)
 
-        # Собираем тензорные лоссы в словарь
+        # Сборка и взвешивание
         t_losses = {
             "e": e_loss_t, "pos": pos_loss_t, "sz": sz_loss_t, "phi": phi_loss_t,
             "s": s_loss_t, "a": a_loss_t, "fl": fl_loss_t, "hf": hf_loss_t,
             "il": il_loss_t, "la": la_loss_t, "sv1": sv1_loss_t, "svc": svc_loss_t
         }
-
-        # Итог как сумма ТЕНЗОРОВ (а не float'ов)
-        total_t = torch.zeros((), device=pred["e"].device)
+        total_t = torch.zeros((), device=device)
         for k, t in t_losses.items():
             if k in self.w:
                 total_t = total_t + float(self.w[k]) * t
 
-        # parts — только для логирования (float)
         parts = {k: float(v.detach().item()) for k, v in t_losses.items()}
-
         return total_t, parts
 
 # ----------------------
@@ -863,10 +930,10 @@ class LossComputer:
 
 def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dict[str,Any],
                save_ckpt_path: str, writer: SummaryWriter,
+               loss_comp: LossComputer,
                normalizer: "TargetNormalizer | None" = None):
     model.to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=float(cfg["training"]["lr"]))
-    loss_comp = LossComputer(cfg["training"]["loss_weights"])
 
     global_step = 0
     best_val = float('inf')
@@ -908,6 +975,16 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
                 if y["sz"].ndim == 2 and y["sz"].shape[0] == 2 and y["sz"].shape[1] != 2:
                     y["sz"] = y["sz"].T
 
+            with torch.no_grad():
+                e_mean  = float((y["e"] > 0.5).float().mean().item())
+                e_mask  = (y["e"] > 0.5).float()
+                denom   = e_mask.sum() + 1e-6
+                il_mean = float(((y["il"] > 0.5).float() * e_mask).sum().item() / denom.item())
+                hf_mean = float(((y["hf"] > 0.5).float() * e_mask).sum().item() / denom.item())
+                writer.add_scalar("batch_pos/e",  e_mean,  global_step)
+                writer.add_scalar("batch_pos/il", il_mean, global_step)
+                writer.add_scalar("batch_pos/hf", hf_mean, global_step)
+
             pred = model(x, ei)
             loss, parts = loss_comp(pred, y)
             loss.backward()
@@ -927,6 +1004,7 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
         model.eval()
         with torch.no_grad():
             val_tot = 0.0; val_cnt = 0
+            _dbg_la_logged = False  # <- добавь эту строку
             for batch in val_loader:
                 if _PYG_OK:
                     x = batch.x.to(device)
@@ -956,35 +1034,26 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
 
                 pred = model(x, ei)
                 l, _ = loss_comp(pred, y)
-                if (epoch % 5 == 0) and (normalizer is not None):
-                    # Чтобы не логировать на каждом батче, делаем флаг
-                    if not locals().get("_dbg_la_logged", False):
-                        # scale_l и маска жилых
-                        if _PYG_OK:
-                            scale = batch.scale_l.to(device)                 # (N,1)
-                            il_mask = y["il"].to(device)                     # (N,1)
-                        else:
-                            scale = batch["y"]["scale_l"].to(device)         # (N,1)
-                            il_mask = y["il"].to(device)                     # (N,1)
+                if (epoch % 5 == 0) and (normalizer is not None) and (not _dbg_la_logged):
+                    # scale_l и маска жилых
+                    if _PYG_OK:
+                        scale = batch.scale_l.to(device)                 # (N,1)
+                        il_mask = y["il"].to(device)                     # (N,1)
+                    else:
+                        scale = batch["y"]["scale_l"].to(device)         # (N,1)
+                        il_mask = y["il"].to(device)                     # (N,1)
 
-                        # денормализация
-                        la_real = normalizer.decode_la(pred["la"], scale)    # (N,1)
-                        mask = (il_mask > 0.5).view(-1)
+                    la_real = normalizer.decode_la(pred["la"], scale)    # (N,1)
+                    mask = (il_mask > 0.5).view(-1)
+                    if mask.any():
+                        vals = la_real.view(-1)[mask]
+                        writer.add_scalar("debug/la_real_p10", torch.quantile(vals, 0.10).item(), epoch)
+                        writer.add_scalar("debug/la_real_p50", torch.quantile(vals, 0.50).item(), epoch)
+                        writer.add_scalar("debug/la_real_p90", torch.quantile(vals, 0.90).item(), epoch)
+                    else:
+                        writer.add_scalar("debug/la_real_p50", 0.0, epoch)
 
-                        if mask.any():
-                            vals = la_real.view(-1)[mask]
-                            # квантильки
-                            p10 = torch.quantile(vals, 0.10).item()
-                            p50 = torch.quantile(vals, 0.50).item()
-                            p90 = torch.quantile(vals, 0.90).item()
-                            writer.add_scalar("debug/la_real_p10", p10, epoch)
-                            writer.add_scalar("debug/la_real_p50", p50, epoch)
-                            writer.add_scalar("debug/la_real_p90", p90, epoch)
-                        else:
-                            # на случай, если в батче нет жилых узлов
-                            writer.add_scalar("debug/la_real_p50", 0.0, epoch)
-
-                        _dbg_la_logged = True  # не логируем повторно в этой эпохе
+                    _dbg_la_logged = True  # <- и вот это оставь
                 val_tot += float(l.item()); val_cnt += 1
             val_loss = val_tot / max(1, val_cnt)
         writer.add_scalar("val/total", float(val_loss), epoch)
@@ -1051,6 +1120,16 @@ def main():
     log.info("Готовлю датасеты…")
     ds_train = HCanonGraphDataset(data_dir, zones_json, services_json, split="train", split_ratio=0.9)
     ds_val   = HCanonGraphDataset(data_dir, zones_json, services_json, split="val",   split_ratio=0.9)
+
+    # Балансировки лоссов из train-сплита
+    posw = ds_train.get_pos_weights()
+    ce_w = ds_train.get_s_class_weights()
+    loss_comp = LossComputer(
+        cfg["training"]["loss_weights"],
+        posw=posw,
+        ce_weight=ce_w,
+        label_smoothing=0.05,  # можно 0.0, если не хочешь сглаживание
+    )
 
     if _PYG_OK:
         if args.sampler_mode == "two_stream":
@@ -1121,8 +1200,11 @@ def main():
     log.info(f"TensorBoard лог-директория: {runs_dir}")
 
     # обучение
-    best_val = train_loop(model, train_loader, val_loader, device, cfg, ckpt_path, writer,
-                      normalizer=getattr(ds_train, "_normalizer", None))
+    best_val = train_loop(
+        model, train_loader, val_loader, device, cfg, ckpt_path, writer,
+        loss_comp=loss_comp,
+        normalizer=getattr(ds_train, "_normalizer", None)
+    )
     writer.close()
 
     # сохраняем вспомог. файлы рядом с чекпойнтом
