@@ -21,6 +21,7 @@ paths:
   zones_json: ./out/zones.json              # автогенерация при первом запуске
   services_json: ./out/services.json        # автогенерация при первом запуске
   tb_log_dir: ./runs                            # TensorBoard логи
+  mask_dir: ./out/masks
 
 # Описание данных и препроцессинг
 data:
