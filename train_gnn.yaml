@@ -1,167 +1,56 @@
-# train_gnn.yaml — конфигурация обучения GNN под иерархическую канонизацию
-#
-# Ключевые моменты:
-# - Вход: квартал (маска 64×64, label функциональной зоны, scale_l),
-#         иерархические узлы (ветка → узлы) с признаками из transform.py:
-#         e_i, branch_local_id, posx/posy, size_x/size_y, phi_resid, s_i, a_i,
-#         has_floors, floors_num, is_living, living_area,
-#         services_present(one-hot), services_capacity (маскированная регрессия), aspect_ratio.
-# - Выход: предсказания по узлам и рёбрам (для генерации полигонов),
-#          учитывается зона и требования по сервисам/жилплощади на квартал.
-# - Лоссы и весовые коэффициенты настраиваются ниже.
+# train_gnn.min.yaml — используется train.py из твоего сообщения
 
 experiment: graphgen_hcanon_v1
 seed: 42
 
 paths:
-  data_dir: ./out                           # директория с blocks.parquet, branches.parquet, nodes_fixed.parquet, edges.parquet, masks/
-  by_block_dir: ./out/by_block              # если нужен инкрементальный режим
+  data_dir: ./out
   model_ckpt: ./out/checkpoints/graphgen_hcanon_v1.pt
-  artifacts_dir: ./out/artifacts            # куда складывать вспомогательные файлы (zones.json, services.json, config снапшот)
-  zones_json: ./out/zones.json              # автогенерация при первом запуске
-  services_json: ./out/services.json        # автогенерация при первом запуске
-  tb_log_dir: ./runs                            # TensorBoard логи
+  zones_json: ./out/zones.json
+  services_json: ./out/services.json
   mask_dir: ./out/masks
 
-# Описание данных и препроцессинг
-data:
-  n_slots: 120                  # максимальное число узлов на квартал (из transform.py)
-  mask_size: 64                 # размер маски квартала (из transform.py)
-  use_masks: true               # подавать ли маску квартала в модель
-  zone_as_categorical: true     # кодировать zone в embedding
-
-  # Нормализация/маскирование скалярных признаков
-  normalization:
-    pos: [-1.0, 1.0]           # posx/posy уже в этом диапазоне
-    size_clip: [0.0, 2.0]       # клип размеров к разумным пределам (по отношению к scale_l/mean_width)
-    phi_clip_rad: 1.57079632679 # ±π/2 для остаточного угла
-    living_area_scale: 0.001    # масштаб для целей регрессии (кв. м → тысячи кв. м)
-    capacity_scale: 1.0         # масштаб для вместимости (оставьте 1.0, если не нужно)
-
-  # Отсутствующие значения
-  missing:
-    floors_strategy: two_head   # has_floors (BCE) + floors_num (MAE) под маской has_floors==True
-    living_if_absent_area_zero: true  # если is_living=False → living_area=0 и исключаем из регрессии
-
-  # Раширение сервисов (вытягивается из services.json). Если список пуст, будет определён автоматически.
-  services:
-    vocab: []                   # опционально: зафиксируйте список сервисов ["school","kindergarten",...]
-    min_count: 5                # игнорировать редкие сервисы при построении one-hot (если vocab пуст)
-
-  # Валидация/сплит
-  split:
-    val_ratio: 0.1
-    shuffle: true
-
-sampler:
-  mode: two_stream
-  batch_size: 8
-  majority_frac: 0.5
-  tau_majority: 0.8
-  use_residential_stratify: true
-  use_residential_clusters: true
+model:
+  hidden: 256           # -> GraphModel(hidden)
+  use_mask_cnn: true    # -> GraphModel(use_mask=True)
+  mask_dim: 64          # -> MaskEncoderCNN(..., mask_dim)
+  mask_size: 128        # -> polygon_to_mask(..., size=(128,128))
 
 training:
   batch_size: 8
-  epochs: 3
-  device: cuda                  # cuda|cpu|cuda:0
+  epochs: 50
   lr: 2.0e-4
-  optimizer: adamw
-  betas: [0.9, 0.999]
-  weight_decay: 1.0e-4
-  scheduler:
-    name: cosine                 # none|cosine|plateau
-    warmup_steps: 500
-    min_lr_mult: 0.1             # итоговый LR = lr * min_lr_mult
-  grad_clip: 1.0
-  mixed_precision: true          # torch.cuda.amp
-  num_workers: 8                 # DataLoader workers
-  pin_memory: true
-  persistent_workers: true
-  accumulate_steps: 1            # градиентная аккумуляция
-
-losses:
-  # Типы лоссов (модель подбирает по ключу)
-  types:
-    e: bce                       # e_i (узел существует)
-    pos: smooth_l1               # (posx,posy)
-    sz: smooth_l1                # (size_x,size_y)
-    phi: smooth_l1               # phi_resid
-    s: ce                        # shape class (0/1/2/3)
-    a: smooth_l1                 # occupancy ratio (0..1)
-    hf: bce                      # has_floors
-    fl: l1_masked                # floors_num (под маской has_floors)
-    il: bce                      # is_living
-    la: l1_masked                # living_area_scaled (под маской is_living)
-    sv: bce_multilabel           # services one-hot
-    svc: l1_masked_multi         # services capacity (под маской присутствующих сервисов)
-    ar: smooth_l1                # aspect_ratio
-    coll: soft_collision         # штраф за пересечения/слишком малые интервалы
-
-  # Веса лоссов (тонкая настройка важности задач)
-  weights:
+  device: cuda
+  loss_weights:         # -> LossComputer(w=...)
     e: 1.0
     pos: 2.0
     sz: 2.0
     phi: 0.5
     s: 0.5
     a: 0.2
-    hf: 0.2
     fl: 0.5
+    hf: 0.2
     il: 0.2
     la: 1.0
-    sv: 0.5
+    sv1: 0.5
     svc: 1.0
-    ar: 0.2
     coll: 0.5
+    la_block: 0.5       # БЛОЧНЫЕ ЛОССЫ реально считаются в LossComputer
+    svc_block: 0.5
 
-  # Настройки коллизий/геометрических ограничений
-  collision:
-    min_spacing_m: 3.0           # минимальный «зазор» между центрами проекций на ветку (в метрах)
-    penalty_margin: 0.5          # ширина мягкой зоны перед штрафом
-
-model:
-  arch: gatv2                    # gcn|gat|gatv2|graphunet (выбирает класс из train.py)
-  emb_dim: 128
-  hidden_dim: 256
-  gnn_layers: 6
-  attn_heads: 4
-  dropout: 0.1
-  # Декодеры по головам
-  heads:
-    e: 2                         # логиты существования
-    pos: 2
-    sz: 2
-    phi: 1
-    s: 4                         # классов (Rect/L/X/U)
-    a: 1
-    hf: 1
-    fl: 1
-    il: 1
-    la: 1
-    sv: auto                     # будет равен |services_vocab|
-    svc: auto                    # будет равен |services_vocab|
-    ar: 1
-
-inference:
-  temperature: 0.7
-  n_candidates: 1
-  snap_to_skeleton: true
-  nms_min_dist_m: 2.0            # подавление близких объектов
-  keep_inside_block: true
-  non_overlap: true
-
-checkpointing:
-  save_every_n_epochs: 1
-  keep_last_n: 3
-  resume_from: null              # путь к .pt для продолжения
-
-logging:
-  log_level: INFO
-  tqdm: true
+sampler:
+  mode: two_stream          # -> --sampler-mode
+  majority_frac: 0.5        # -> --majority-frac
+  tau_majority: 0.8         # -> --tau-majority
+  use_residential_stratify: true
+  use_residential_clusters: true
+  epoch_len_batches: null
 
 hf:
   push: false
   repo_id: your-username/graphgen-hcanon-v1
   private: true
-  token_env: HF_TOKEN            # переменная окружения с токеном
+  token: null
+
+logging:
+  log_level: INFO

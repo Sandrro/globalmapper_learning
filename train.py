@@ -29,6 +29,8 @@ import os, sys, json, math, time, argparse, logging, random
 from datetime import datetime
 from typing import Dict, Any, List, Tuple
 
+from pyproj import Transformer
+
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 
@@ -165,8 +167,10 @@ if _cfg_args.config and yaml is not None:
                 a[k] = v
     _merge(_CFG, user_cfg)
 
-# основной парсер
+# --- основной парсер
 parser = argparse.ArgumentParser(parents=[_p0])
+
+# paths & training basics
 parser.add_argument("--data-dir", default=_CFG["paths"]["data_dir"])
 parser.add_argument("--mask-root", default=_CFG["paths"].get("mask_dir", "./out/masks"),
                     help="Каталог с масками кварталов (mask_root/block_id.png)")
@@ -180,31 +184,37 @@ parser.add_argument("--device", default=_CFG["training"]["device"])
 parser.add_argument("--mode", choices=["train", "infer"], default="train")
 parser.add_argument("--infer-geojson-in")
 parser.add_argument("--infer-out")
-#sampler
+
+# sampler
 parser.add_argument("--sampler-mode", choices=["two_stream","vanilla"], default=_CFG["sampler"]["mode"])
 parser.add_argument("--majority-frac", type=float, default=_CFG["sampler"]["majority_frac"])
 parser.add_argument("--tau-majority", type=float, default=_CFG["sampler"]["tau_majority"])
 parser.add_argument("--no-res-stratify", action="store_true", help="Отключить стратификацию внутри residential")
 parser.add_argument("--no-res-clusters", action="store_true", help="Отключить k-means кластеры внутри residential")
-# hf
-parser.add_argument("--hf-push", action="store_true", default=_CFG.get("hf",{}).get("push", False))
-parser.add_argument("--hf-repo-id", default=_CFG.get("hf",{}).get("repo_id"))
-parser.add_argument("--hf-token", default=_CFG.get("hf",{}).get("token"))
-parser.add_argument("--hf-private", action="store_true", default=_CFG.get("hf",{}).get("private", True))
-# misc
-parser.add_argument("--log-level", default="INFO")
-args = parser.parse_args()
-# infer
+
+# --- ВАЖНО: инференс-параметры ДОЛЖНЫ быть ДО parse_args() ---
 parser.add_argument("--zone", type=str, help="Функциональная зона квартала (label из zones.json)")
-parser.add_argument("--la-target", type=float, default=None, help="Целевая суммарная жилая площадь в 'метрах' исходной системы координат")
+parser.add_argument("--la-target", type=float, default=None,
+                    help="Целевая суммарная жилая площадь в м² (в мировых координатах)")
 parser.add_argument("--services-target", type=str, default=None,
-                    help="JSON-строка или путь к JSON с целями по сервисам: "
-                         "dict {name: capacity} или list [{name, value}]")
+                    help="JSON-строка или путь к JSON: dict {name: capacity} или list[{name,value}]")
 parser.add_argument("--infer-slots", type=int, default=256, help="Число слотов для сэмплинга в квартале")
 parser.add_argument("--infer-knn", type=int, default=8, help="k для kNN-графа")
 parser.add_argument("--infer-e-thr", type=float, default=0.5, help="Порог для e")
 parser.add_argument("--infer-il-thr", type=float, default=0.5, help="Порог для is_living")
 parser.add_argument("--infer-sv1-thr", type=float, default=0.5, help="Порог для наличия сервиса на узле")
+
+# hf
+parser.add_argument("--hf-push", action="store_true", default=_CFG.get("hf", {}).get("push", False))
+parser.add_argument("--hf-repo-id", default=_CFG.get("hf", {}).get("repo_id"))
+parser.add_argument("--hf-token", default=_CFG.get("hf", {}).get("token"))
+parser.add_argument("--hf-private", action="store_true", default=_CFG.get("hf", {}).get("private", True))
+
+# misc
+parser.add_argument("--log-level", default="INFO")
+
+# >>> парсим здесь <<<
+args = parser.parse_args()
 
 setup_logger(args.log_level)
 log.info(f"Sampler: mode={args.sampler_mode}, batch_size={args.batch_size}, "
@@ -319,52 +329,57 @@ def _principal_angle(poly: ShpPolygon) -> float:
 
 def canonicalize_polygon(poly: ShpPolygon):
     """
-    Возвращает (poly_can, fwd, inv, scale_l), где:
-      - poly_can — полигон, ориентированный по PCA и отмасштабированный в (примерно) [0,1] по большой стороне;
-      - fwd(pt), inv(pt) — прямое/обратное Аффин-преобразование (np.array([x,y]) <-> np.array([x,y]));
-      - scale_l — линейный масштаб (sqrt(area_world)), как в train.
-    """
-    # линейный масштаб квартала (совместим с нормировкой living_area)
-    scale_l = _math.sqrt(max(1e-9, poly.area))
+    Канонизация полигона квартала к [0,1]^2 с PCA-ориентацией.
+    Возвращает poly_can, fwd(world->can), inv(can->world), scale_l=sqrt(area_world).
 
-    # выравнивание по PCA
+    Порядок однородных преобразований строго соответствует train.py:
+      world -> canonical:  T(-minx2,-miny2) @ S(s) @ R(-angle) @ T(-cx,-cy)
+      canonical -> world:  T(cx,cy) @ R(angle) @ S(1/s) @ T(minx2,miny2)
+    """
+    scale_l = _math.sqrt(max(1e-9, float(poly.area)))
     angle = _principal_angle(poly)
     c = poly.centroid
+
     poly0 = shp_translate(poly, xoff=-c.x, yoff=-c.y)
     poly1 = shp_rotate(poly0, -angle, origin=(0, 0), use_radians=False)
 
     minx, miny, maxx, maxy = poly1.bounds
     w, h = maxx - minx, maxy - miny
     if max(w, h) < 1e-9:
-        raise ValueError("Degenerate polygon")
+        raise ValueError("Degenerate polygon: near-zero extent after PCA alignment")
+
     s = 1.0 / max(w, h)
     poly2 = shp_scale(poly1, xfact=s, yfact=s, origin=(0, 0))
-    # в положительную четверть и к [0,1]
-    minx2, miny2, *_ = poly2.bounds
+    minx2, miny2, _, _ = poly2.bounds
     poly_can = shp_translate(poly2, xoff=-minx2, yoff=-miny2)
 
-    # соберём аффин-цепочку как матрицы 2x3
-    def _mat_translate(dx, dy):
-        return np.array([[1,0,dx],[0,1,dy]], dtype=np.float64)
-    def _mat_rotate(deg):
-        th = _math.radians(deg)
-        c, s_ = _math.cos(th), _math.sin(th)
-        return np.array([[c,-s_,0],[s_,c,0]], dtype=np.float64)
-    def _mat_scale(sx, sy):
-        return np.array([[sx,0,0],[0,sy,0]], dtype=np.float64)
+    def _mat_translate(dx: float, dy: float) -> np.ndarray:
+        return np.array([[1.0, 0.0, float(dx)],
+                         [0.0, 1.0, float(dy)],
+                         [0.0, 0.0, 1.0]], dtype=np.float64)
 
-    # fwd: world -> can
-    M = _mat_translate(-c.x, -c.y) @ _mat_rotate(-angle) @ _mat_scale(s, s) @ _mat_translate(-minx2, -miny2)
+    def _mat_rotate(deg: float) -> np.ndarray:
+        th = _math.radians(float(deg))
+        c_, s_ = _math.cos(th), _math.sin(th)
+        return np.array([[ c_, -s_, 0.0],
+                         [ s_,  c_, 0.0],
+                         [ 0.0, 0.0, 1.0]], dtype=np.float64)
 
-    # inv: can -> world
-    Minv = _mat_translate(minx2, miny2) @ _mat_scale(1/s, 1/s) @ _mat_rotate(angle) @ _mat_translate(c.x, c.y)
+    def _mat_scale(sx: float, sy: float) -> np.ndarray:
+        return np.array([[float(sx), 0.0, 0.0],
+                         [0.0, float(sy), 0.0],
+                         [0.0, 0.0, 1.0]], dtype=np.float64)
 
-    def _apply(M_, xy):
-        x, y = float(xy[0]), float(xy[1])
-        return np.array([M_[0,0]*x + M_[0,1]*y + M_[0,2],
-                         M_[1,0]*x + M_[1,1]*y + M_[1,2]], dtype=np.float64)
+    M    = _mat_translate(-minx2, -miny2) @ _mat_scale(s, s) @ _mat_rotate(-angle) @ _mat_translate(-c.x, -c.y)
+    Minv = _mat_translate( c.x,   c.y  ) @ _mat_rotate( angle) @ _mat_scale(1.0/s, 1.0/s) @ _mat_translate(minx2, miny2)
+
+    def _apply(M_: np.ndarray, xy) -> np.ndarray:
+        v = np.array([float(xy[0]), float(xy[1]), 1.0], dtype=np.float64)
+        r = M_ @ v
+        return np.array([r[0], r[1]], dtype=np.float64)
 
     return poly_can, (lambda p: _apply(M, p)), (lambda p: _apply(Minv, p)), float(scale_l)
+
 
 def polygon_to_mask(poly_can: ShpPolygon, size=(128,128)) -> torch.Tensor:
     """(1,H,W) mask в [0,1]"""
@@ -428,41 +443,48 @@ def post_fit_to_targets(
     device = next(iter(pred.values())).device
     out = pred.copy()
 
-    # денорм предсказаний (если ещё не сделан выше)
+    # Денорм (если ещё не сделан)
     if "la_real" not in out and "la" in pred and "scale_l" in pred:
-        out["la_real"] = normalizer.decode_la(pred["la"], pred["scale_l"].to(device))
+        la_norm = torch.clamp_min(pred["la"], 0.0)
+        out["la_real"] = torch.clamp_min(
+            normalizer.decode_la(la_norm, pred["scale_l"].to(device)),
+            0.0
+        )
     if "svc_real" not in out and "svc" in pred:
         out["svc_real"] = normalizer.decode_svc(pred["svc"])
 
-    # === FIX: корректный decode цели с реальным scale_l ===
-    if la_target_norm is not None and "scale_l" in pred:
-        # возьмём блоковый scale_l (он одинаков для всех узлов; берём первый)
+    # Маска «жилых»
+    il_prob = torch.sigmoid(pred["il"]).view(-1)
+    live_mask = (il_prob >= il_prob_thr).float().view(-1,1)
+
+    # Подгонка блочной жилплощади
+    if la_target_norm is not None and "scale_l" in pred and "la_real" in out:
         if pred["scale_l"].ndim == 2:
-            scale_blk = pred["scale_l"][0:1, :]           # (1,1)
+            scale_blk = pred["scale_l"][0:1, :]
         else:
-            scale_blk = pred["scale_l"].view(1,1)         # (1,1)
+            scale_blk = pred["scale_l"].view(1,1)
 
         la_target_real = normalizer.decode_la(
             torch.tensor([[float(la_target_norm)]], device=device),
             scale_blk.to(device)
         ).item()
 
-        il_prob = torch.sigmoid(pred["il"]).view(-1)
-        live_mask = (il_prob >= il_prob_thr).float().view(-1,1)
-        la_real = out.get("la_real", None)
-        if la_real is not None:
-            sum_cur = (la_real * live_mask).sum().item()
-            if sum_cur > 1e-6:
-                factor = la_target_real / sum_cur
-                out["la_real"] = la_real * live_mask * factor + la_real * (1.0 - live_mask)
+        la_pos = torch.clamp_min(out["la_real"], 0.0)
+        sum_cur = (la_pos * live_mask).sum().item()
+        if sum_cur > 1e-6:
+            factor = la_target_real / sum_cur
+            la_adj = la_pos * live_mask * factor + la_pos * (1.0 - live_mask)  # не трогаем не-жилые
+            out["la_real"] = torch.clamp_min(la_adj, 0.0)
+        else:
+            out["la_real"] = torch.clamp_min(la_pos, 0.0)
 
-    # сервисы — как было (log1p без scale)
-    if svc_target_norm_vec is not None and out.get("svc_real", None) is not None:
+    # Подгонка сервисов (как было, с ReLU-логикой по сути через decode_svc)
+    if (svc_target_norm_vec is not None) and out.get("svc_real", None) is not None:
         S = out["svc_real"].shape[1]
         sv1_prob = torch.sigmoid(pred["sv1"]) if "sv1" in pred else torch.sigmoid(pred["svc"])
         sv1_bin = (sv1_prob >= sv1_thr).float()
-        tgt_real = normalizer.decode_svc(svc_target_norm_vec.to(device).view(1, -1)).view(-1)  # (S,)
-        cur_sum = (out["svc_real"] * sv1_bin).sum(dim=0)  # (S,)
+        tgt_real = normalizer.decode_svc(svc_target_norm_vec.to(device).view(1, -1)).view(-1)
+        cur_sum = (out["svc_real"] * sv1_bin).sum(dim=0)
         for s in range(S):
             t = float(tgt_real[s].item()); cs = float(cur_sum[s].item())
             if t <= 0:
@@ -476,6 +498,10 @@ def post_fit_to_targets(
             else:
                 out["svc_real"][:, s] = out["svc_real"][:, s] * sv1_bin[:, s] * (t / cs)
         out["sv1_bin"] = sv1_bin
+
+    # На выходе гарантируем неотрицательность
+    if "la_real" in out:
+        out["la_real"] = torch.clamp_min(out["la_real"], 0.0)
 
     return out
 
@@ -493,10 +519,8 @@ def run_infer(
     device = args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     model.eval().to(device)
 
-    # загрузка входного полигона (один квартал) из GeoJSON-файла
     with open(args.infer_geojson_in, "r", encoding="utf-8") as f:
         gj = json.load(f)
-    # допускаем Feature или FeatureCollection
     if gj.get("type") == "FeatureCollection":
         feats = gj.get("features", [])
         if not feats:
@@ -508,26 +532,22 @@ def run_infer(
         feat = {"type":"Feature","geometry":gj}
     poly_world = _polygon_from_geojson(feat)
 
-    # канонизация полигона, маска и масштаб
     poly_can, fwd, inv, scale_l = canonicalize_polygon(poly_world)
     mask_size = tuple([int(_CFG["model"].get("mask_size", 128))]*2)
     mask_img = polygon_to_mask(poly_can, size=mask_size).to(device)  # (1,H,W)
 
-    # сэмплинг слотов
     n_slots = int(getattr(args, "infer_slots", 256))
-    pts = sample_slots_grid(poly_can, n_slots=n_slots, jitter=0.35, seed=42)  # (M,2)
+    pts = sample_slots_grid(poly_can, n_slots=n_slots, jitter=0.35, seed=42)
     if len(pts) == 0:
         raise ValueError("No slots sampled inside polygon")
     edge_index = build_knn_edges(pts, k=int(getattr(args, "infer_knn", 8))).to(device)
 
-    # глобальные условия
     zone_label = args.zone
     if zone_label not in zone2id:
         raise ValueError(f"Unknown zone '{zone_label}'. Известные: {list(zone2id.keys())[:8]}…")
     zone_id = zone2id[zone_label]
     zone_onehot = torch.as_tensor(np.eye(len(zone2id), dtype=np.float32)[zone_id])  # (Z,)
 
-    # tar: la + services
     la_target = float(args.la_target) if args.la_target is not None else 0.0
     la_target_norm = normalizer.encode_la(
         torch.tensor([[la_target]], dtype=torch.float32),
@@ -538,14 +558,12 @@ def run_infer(
     sv1_block = torch.zeros((S,), dtype=torch.float32)
     svc_block_norm = torch.zeros((S,), dtype=torch.float32)
     if args.services_target is not None:
-        # поддержка строки JSON или пути к JSON
         st_raw = args.services_target
         if isinstance(st_raw, str) and os.path.exists(st_raw):
             with open(st_raw, "r", encoding="utf-8") as f:
                 st = json.load(f)
         else:
             st = json.loads(st_raw)
-        # форматы: {"school": 600, "kindergarten": 120, ...} или [{"name":"school","value":600}, ...]
         if isinstance(st, dict):
             iters = st.items()
         elif isinstance(st, list):
@@ -560,9 +578,8 @@ def run_infer(
                     sv1_block[sid] = 1.0
                     svc_block_norm[sid] = normalizer.encode_svc(torch.tensor([val], dtype=torch.float32)).item()
 
-    # сбор x_in (для каждого узла одни и те же глобальные условия)
     N = pts.shape[0]
-    e_stub = torch.ones((N,1), dtype=torch.float32)  # на инференсе e_i в x_in ставим 1.0
+    e_stub = torch.ones((N,1), dtype=torch.float32)
     scale_feat = torch.full((N,1), float(scale_l), dtype=torch.float32)
     la_blk_feat = torch.full((N,1), float(la_target_norm), dtype=torch.float32)
     sv1_blk_feat = sv1_block.view(1,-1).repeat(N,1)
@@ -570,70 +587,83 @@ def run_infer(
     zone_feat = torch.from_numpy(np.tile(zone_onehot.numpy(), (N,1))).float()
 
     x_in = torch.cat([e_stub, zone_feat, scale_feat, la_blk_feat, sv1_blk_feat, svc_blk_feat], dim=1).to(device)
-
-    # batch_index: один блок
     batch_index = torch.zeros((N,), dtype=torch.long, device=device)
 
-    # прогон модели
     with torch.no_grad():
         pred = model(
             x=x_in, edge_index=edge_index,
             batch_index=batch_index, mask_img=mask_img
         )
-        # добавим scale_l для денорма
         pred["scale_l"] = torch.full((N,1), float(scale_l), device=device)
+
         den = denorm_predictions({"y":{"scale_l": pred["scale_l"]}}, pred, normalizer)
         pred.update(den)
 
-        # пост-подгонка к целям
+        svc_vec = svc_block_norm.clone() if S > 0 else None
         pred_pf = post_fit_to_targets(
             {**pred, **{"scale_l": pred["scale_l"]}},
             zone_feat[0], la_target_norm,
-            torch.from_numpy(svc_block_norm.numpy()) if svc_block_norm.numel()>0 else None,
+            (svc_vec if svc_vec is None else svc_vec),
             normalizer=normalizer,
             il_prob_thr=float(getattr(args, "infer_il_thr", 0.5)),
             sv1_thr=float(getattr(args, "infer_sv1_thr", 0.5))
         )
         pred.update(pred_pf)
 
-    # пороги
     e_mask = (torch.sigmoid(pred["e"].view(-1)) > float(getattr(args,"infer_e_thr",0.5))).cpu().numpy()
 
-    # сбор геометрии зданий (прямоугольники) в каноническом и обратная проекция
+    # размер в канонике — аккуратный клип
+    sz = pred["sz"].detach().cpu().numpy()
+    sz[:, 0] = np.clip(sz[:, 0], 0.01, 0.35)
+    sz[:, 1] = np.clip(sz[:, 1], 0.01, 0.35)
+
     out_features = []
     for i, keep in enumerate(e_mask):
         if not keep:
             continue
         center = pts[i]
-        size = pred["sz"][i].detach().cpu().numpy()
-        phi  = float(pred["phi"][i].detach().cpu().numpy())
+        size = sz[i]
+        phi = float(pred["phi"][i].detach().cpu().item())
         poly_can = rect_polygon(center, size, phi)
-        # обратная аффин-преобразование
+
         xs, ys = poly_can.exterior.xy
-        world = [inv((float(x), float(y))) for x,y in zip(xs, ys)]
-        poly_world_i = {"type":"Polygon","coordinates":[world]}
+        world_np = [inv((float(x), float(y))) for x, y in zip(xs, ys)]
+        world = [(float(p[0]), float(p[1])) for p in world_np]
+        if world and world[0] != world[-1]:
+            world.append(world[0])
+
+        il_prob_i = float(torch.sigmoid(pred["il"][i]).item())
+        la_i = float(torch.clamp_min(pred.get("la_real", torch.zeros_like(pred["e"]))[i], 0.0).item())
+        # Пишем жилую площадь только для «жилых», иначе 0
+        living_area_out = la_i if il_prob_i >= float(getattr(args,"infer_il_thr",0.5)) else 0.0
+
         props = {
             "zone": zone_label,
             "e": float(torch.sigmoid(pred["e"][i]).item()),
-            "is_living": float(torch.sigmoid(pred["il"][i]).item()),
-            "living_area": float(pred.get("la_real", torch.zeros_like(pred["e"]))[i].item()),
+            "is_living": il_prob_i,
+            "living_area": living_area_out,
         }
-        # сервисы (реальные вместимости после подгонки)
         if "svc_real" in pred and pred["svc_real"].numel() > 0:
             caps = pred["svc_real"][i].detach().cpu().numpy().tolist()
             if any(c > 0 for c in caps):
                 props["services_capacity"] = [
-                    {"name": name, "value": float(c)}
+                    {"name": name, "value": float(caps[sid])}
                     for name, sid in service2id.items()
-                    for j,c in enumerate(caps) if sid == j and c > 0
+                    if 0 <= sid < len(caps) and caps[sid] > 0
                 ]
-        out_features.append({"type":"Feature","geometry":poly_world_i,"properties":props})
+
+        out_features.append({
+            "type":"Feature",
+            "geometry": {"type":"Polygon","coordinates":[world]},
+            "properties": props
+        })
 
     out_fc = {"type":"FeatureCollection","features":out_features}
     os.makedirs(os.path.dirname(args.infer_out) or ".", exist_ok=True)
     with open(args.infer_out, "w", encoding="utf-8") as f:
         json.dump(out_fc, f, ensure_ascii=False, indent=2)
     log.info(f"[infer] Saved → {args.infer_out}")
+
 
 # ----------------------
 # Датасет
@@ -1894,6 +1924,7 @@ def denorm_predictions(batch, pred: Dict[str, torch.Tensor], normalizer: TargetN
     """
     Принимает батч и предсказания в НОРМ-формате, возвращает дикт с 'la_real', 'svc_real'.
     Требует наличие batch.scale_l (PyG) или batch["y"]["scale_l"] (fallback).
+    ВАЖНО: обеспечивает неотрицательность жилой площади.
     """
     if hasattr(batch, "scale_l"):
         scale = batch.scale_l.to(pred["la"].device)  # (N,1)
@@ -1901,15 +1932,19 @@ def denorm_predictions(batch, pred: Dict[str, torch.Tensor], normalizer: TargetN
         scale = batch["y"]["scale_l"].to(pred["la"].device)
 
     out = {}
+
+    # ---- living area: clamp в норм-пространстве и ReLU в реальном ----
     if "la" in pred:
-        la_real = normalizer.decode_la(pred["la"], scale)  # (N,1)
+        la_norm = torch.clamp_min(pred["la"], 0.0)              # НЕ допускаем отрицательную la_norm
+        la_real = normalizer.decode_la(la_norm, scale)          # ≥ 0 в реальных единицах
+        la_real = torch.clamp_min(la_real, 0.0)                 # страховка
         out["la_real"] = la_real
 
+    # ---- services: как раньше, но с маской присутствия ----
     if "svc" in pred:
-        svc_real = normalizer.decode_svc(pred["svc"])      # (N,S)
+        svc_real = normalizer.decode_svc(pred["svc"])           # может быть >0
         out["svc_real"] = svc_real
 
-    # По желанию: бинаризуем sv1 и зануляем capacities, где presence==0
     if "sv1" in pred and "svc_real" in out:
         sv1_prob = torch.sigmoid(pred["sv1"])
         sv1_bin = (sv1_prob > 0.5).float()
