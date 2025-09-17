@@ -63,7 +63,7 @@ sampler:
 
 training:
   batch_size: 8
-  epochs: 5
+  epochs: 3
   device: cuda                  # cuda|cpu|cuda:0
   lr: 2.0e-4
   optimizer: adamw
@@ -152,7 +152,7 @@ inference:
   non_overlap: true
 
 checkpointing:
-  save_every_n_epochs: 5
+  save_every_n_epochs: 1
   keep_last_n: 3
   resume_from: null              # путь к .pt для продолжения
 
