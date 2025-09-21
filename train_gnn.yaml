@@ -18,7 +18,7 @@ model:
 
 training:
   batch_size: 8
-  epochs: 3
+  epochs: 1
   lr: 2.0e-4
   device: cuda
   loss_weights:         # -> LossComputer(w=...)
