@@ -83,6 +83,35 @@ def time_limit(seconds: int):
 
 # ----------------- helpers -----------------
 
+import json
+import numpy as np
+import pandas as pd
+
+def _as_list(val):
+    """Аккуратно привести значение к python-списку."""
+    if val is None:
+        return []
+    if isinstance(val, list):
+        return val
+    if isinstance(val, tuple):
+        return list(val)
+    if isinstance(val, np.ndarray):
+        return val.tolist()
+    if isinstance(val, (str, bytes)):
+        s = val.decode("utf-8") if isinstance(val, bytes) else val
+        s = s.strip()
+        if s in ("", "[]", "{}"):
+            return []
+        try:
+            parsed = json.loads(s)
+            return _as_list(parsed)
+        except Exception:
+            return []
+    # dict → возьмём значения >0 по возрастанию ключа
+    if isinstance(val, dict):
+        return [v for k, v in sorted(val.items())]
+    return []
+
 def _largest_polygon(geom) -> Optional[Polygon]:
     if geom is None or getattr(geom, "is_empty", True):
         return None
@@ -343,10 +372,15 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             for slot_id, j, k in slot_meta:
                 feat = per_branch[j]
                 r = feat["rows"].iloc[k]
+
                 s_vec = feat.get("s", [])
                 a_vec = feat.get("a", [])
                 s_i = int(s_vec[k]) if isinstance(s_vec, (list, tuple, np.ndarray)) and _safe_len(s_vec) > k else 0
                 a_i = float(a_vec[k]) if isinstance(a_vec, (list, tuple, np.ndarray)) and _safe_len(a_vec) > k else 0.0
+
+                pres = _as_list(r.get("services_present", []))
+                caps = _as_list(r.get("services_capacity", []))
+
                 nodes.append(
                     {
                         "block_id": blk_id,
@@ -364,8 +398,8 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                         "living_area": float(r.get("living_area", 0.0)),
                         "is_living": bool(r.get("is_living", False)),
                         "has_floors": bool(r.get("has_floors", False)),
-                        "services_present": list(r.get("services_present", [])),
-                        "services_capacity": list(r.get("services_capacity", [])),
+                        "services_present": pres,
+                        "services_capacity": caps,
                         "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", [])) > k else 0.0,
                     }
                 )

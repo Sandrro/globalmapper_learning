@@ -4,11 +4,11 @@ experiment: graphgen_hcanon_v1
 seed: 42
 
 paths:
-  data_dir: ./out
-  model_ckpt: ./out/checkpoints/graphgen_hcanon_v1.pt
-  zones_json: ./out/zones.json
-  services_json: ./out/services.json
-  mask_dir: ./out/masks
+  data_dir: ./out_2
+  model_ckpt: ./out_2/checkpoints/graphgen_hcanon_v1.pt
+  zones_json: ./out_2/zones.json
+  services_json: ./out_2/services.json
+  mask_dir: ./out_2/masks
 
 model:
   hidden: 256           # -> GraphModel(hidden)
@@ -18,7 +18,7 @@ model:
 
 training:
   batch_size: 8
-  epochs: 50
+  epochs: 3
   lr: 2.0e-4
   device: cuda
   loss_weights:         # -> LossComputer(w=...)

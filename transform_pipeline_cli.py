@@ -66,6 +66,145 @@ def setup_logger(level: str = "INFO") -> None:
         datefmt="%H:%M:%S",
     )
 
+import json
+import numpy as np
+import pandas as pd
+
+def _coerce_services_present(val, service_map=None):
+    """
+    Привести произвольное значение к списку индексов сервисов (List[int]).
+    Поддерживает: None/NaN/"" → []; JSON-строку; list/tuple; np.ndarray; dict; 
+    бинарный/емкостной вектор длиной == |service_map|.
+    """
+    if val is None:
+        return []
+    # NaN
+    try:
+        if isinstance(val, (float, np.floating)) and np.isnan(val):
+            return []
+    except Exception:
+        pass
+
+    # JSON-строка
+    if isinstance(val, (str, bytes)):
+        s = val.decode("utf-8") if isinstance(val, bytes) else val
+        s = s.strip()
+        if s in ("", "[]", "{}"):
+            return []
+        try:
+            parsed = json.loads(s)
+            return _coerce_services_present(parsed, service_map)
+        except Exception:
+            # строка без JSON — считаем пустой
+            return []
+
+    # numpy массив
+    if isinstance(val, np.ndarray):
+        if val.size == 0:
+            return []
+        # если это вероятно бинарный/емкостной вектор по всей карте
+        if service_map and val.ndim == 1 and val.shape[0] == len(service_map):
+            idx = np.where(np.asarray(val) > 0)[0].tolist()
+            return [int(i) for i in idx]
+        # иначе предполагаем, что это уже список индексов
+        return [int(x) for x in val.tolist() if x is not None and not (isinstance(x, float) and np.isnan(x))]
+
+    # dict: {service_name or idx: capacity/value}
+    if isinstance(val, dict):
+        out = []
+        for k, v in val.items():
+            present = False
+            try:
+                present = (float(v) > 0)
+            except Exception:
+                present = bool(v)
+            if not present:
+                continue
+            # ключ может быть именем сервиса или индексом
+            if isinstance(k, (int, np.integer)):
+                out.append(int(k))
+            else:
+                if service_map and k in service_map:
+                    out.append(int(service_map[k]))
+        return sorted(set(out))
+
+    # list/tuple уже из индексов или имён
+    if isinstance(val, (list, tuple)):
+        out = []
+        for x in val:
+            if x is None or (isinstance(x, float) and np.isnan(x)):
+                continue
+            if isinstance(x, (int, np.integer)):
+                out.append(int(x))
+            elif isinstance(x, str) and service_map and x in service_map:
+                out.append(int(service_map[x]))
+            # прочее игнорируем
+        return sorted(set(out))
+
+    return []
+
+
+def _coerce_services_capacity(val, present_idx=None, service_map=None):
+    """
+    Привести емкости к списку float. Если передан полный вектор по всей карте,
+    он будет спроецирован на present_idx.
+    """
+    if val is None:
+        return []
+    # JSON-строка
+    if isinstance(val, (str, bytes)):
+        s = val.decode("utf-8") if isinstance(val, bytes) else val
+        s = s.strip()
+        if s in ("", "[]", "{}"):
+            return []
+        try:
+            parsed = json.loads(s)
+            return _coerce_services_capacity(parsed, present_idx, service_map)
+        except Exception:
+            return []
+
+    # numpy массив
+    if isinstance(val, np.ndarray):
+        if val.size == 0:
+            return []
+        arr = np.asarray(val).astype(float)
+        # полный вектор по всей карте
+        if service_map and arr.ndim == 1 and arr.shape[0] == len(service_map):
+            if not present_idx:
+                idx = np.where(arr > 0)[0].tolist()
+                return [float(arr[i]) for i in idx]
+            return [float(arr[i]) for i in present_idx]
+        # уже список емкостей под те же индексы
+        return [float(x) for x in arr.tolist()]
+
+    # dict: {service_name or idx: capacity}
+    if isinstance(val, dict):
+        out_map = {}
+        for k, v in val.items():
+            cap = None
+            try:
+                cap = float(v)
+            except Exception:
+                continue
+            if isinstance(k, (int, np.integer)):
+                out_map[int(k)] = cap
+            elif isinstance(k, str) and service_map and k in service_map:
+                out_map[int(service_map[k])] = cap
+        if present_idx:
+            return [float(out_map.get(i, 0.0)) for i in present_idx]
+        # иначе отдаём положительные
+        return [float(c) for i, c in sorted(out_map.items()) if c > 0]
+
+    # list/tuple — уже емкости (предполагаем ту же длину, что и present_idx)
+    if isinstance(val, (list, tuple)):
+        try:
+            caps = [float(x) for x in val]
+        except Exception:
+            return []
+        return caps
+
+    return []
+
 
 # ----------------- ORPHANS / TIMEOUT DUMPS -----------------
 
@@ -344,12 +483,21 @@ def main() -> int:
 
     groups = bldgs.groupby("block_id")
     tasks: List[Dict[str, Any]] = []
+    n_bldgs_with_services = 0
+
     for _, row in block_records.iterrows():
-        blk_id = str(row["block_id"])  # noqa: F841
+        blk_id = str(row["block_id"])
         sub = groups.get_group(blk_id) if blk_id in groups.groups else pd.DataFrame(columns=bldgs.columns)
+
         rows_bldgs: List[Dict[str, Any]] = []
         if not sub.empty:
+            # itertuples максимально быстрый, но значения сервисов приводим акуратно
             for r in sub.itertuples(index=False):
+                pres_idx = _coerce_services_present(getattr(r, "services_present", None), service_map)
+                caps = _coerce_services_capacity(getattr(r, "services_capacity", None), pres_idx, service_map)
+                if pres_idx:
+                    n_bldgs_with_services += 1
+
                 rows_bldgs.append(
                     {
                         "building_id": r.building_id,
@@ -358,8 +506,8 @@ def main() -> int:
                         "living_area": getattr(r, "living_area", 0.0),
                         "is_living": bool(getattr(r, "is_living", False)),
                         "has_floors": bool(getattr(r, "has_floors", False)),
-                        "services_present": list(getattr(r, "services_present", [])),
-                        "services_capacity": list(getattr(r, "services_capacity", [])),
+                        "services_present": pres_idx,           # уже List[int]
+                        "services_capacity": caps,               # List[float] той же длины либо свернутый
                     }
                 )
         tasks.append(
@@ -379,6 +527,8 @@ def main() -> int:
                 "knn_k": int(args.knn_k),
             }
         )
+
+    log.info(f"[services] зданий с непустыми сервисами: {n_bldgs_with_services:,}")
 
     # 7) Параллельная обработка блоков
     log.info(f"Параллельная обработка блоков: workers={int(args.num_workers)}, blocks={len(tasks)}")

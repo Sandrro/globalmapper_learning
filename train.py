@@ -232,6 +232,34 @@ def log_service_presence_stats(ds: "HCanonGraphDataset"):
     p_blocks_with_cap = n_with / n_blocks
     log.info(f"[services] blocks_with_any_service: {p_blocks_with_cap:.4f}  (S={ds.num_services})")
 
+import ast
+
+def _parse_list_any(x):
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return []
+    if isinstance(x, (list, tuple)):
+        return list(x)
+    if isinstance(x, str):
+        s = x.strip()
+        # Быстрые фиксы кавычек: '...' -> "..."
+        if s.startswith("[") and s.endswith("]") and ("'" in s) and ('"' not in s):
+            s_try = s.replace("'", '"')
+        else:
+            s_try = s
+        # 1) json
+        try:
+            v = json.loads(s_try)
+            return v if isinstance(v, list) else []
+        except Exception:
+            pass
+        # 2) literal_eval
+        try:
+            v = ast.literal_eval(s)
+            return v if isinstance(v, (list, tuple)) else []
+        except Exception:
+            return []
+    return []
+
 # --- Target Normalizer (reversible) ---
 class TargetNormalizer:
     """
@@ -669,6 +697,16 @@ def run_infer(
 # Датасет
 # ----------------------
 class HCanonGraphDataset(Dataset):
+    """
+    Датасет для иерархической канонизации (обновлён для устранения утечки таргета).
+
+    ВАЖНО: канал активности узла в признаках ("e-канал") больше НЕ берётся из таргета e_i.
+           Вместо него подаётся безопасный канал:
+             - "ones"  — константа 1.0 (по умолчанию; совпадает с инференсом)
+             - "noise" — слабый гауссов шум N(0, e_noise_std)
+             - "zeros" — константа 0.0 (если нужно)
+    """
+
     def __init__(
         self,
         data_dir: str,
@@ -678,6 +716,9 @@ class HCanonGraphDataset(Dataset):
         split_ratio: float = 0.9,
         mask_size: tuple[int,int] = (128,128),
         mask_root: str | None = None,
+        # --- Новые параметры управления e-каналом ---
+        e_channel_mode: str = "ones",   # "ones" | "noise" | "zeros"
+        e_noise_std: float = 0.05,      # std для "noise"
     ):
         super().__init__()
         # загрузка таблиц
@@ -704,7 +745,7 @@ class HCanonGraphDataset(Dataset):
         else:
             vocab = set()
             for x in self.nodes["services_present"].fillna("").values.tolist():
-                lst = _maybe_json_to_list(x)
+                lst = _parse_list_any(x)
                 for s in lst:
                     vocab.add(str(s))
             self.service2id = {s:i for i,s in enumerate(sorted(vocab))}
@@ -775,9 +816,16 @@ class HCanonGraphDataset(Dataset):
                 if has:
                     self.blocks_with_services.add(blk)
 
+        # --- настройки e-канала ---
+        self.e_channel_mode = str(e_channel_mode).lower().strip()
+        if self.e_channel_mode not in {"ones","noise","zeros"}:
+            self.e_channel_mode = "ones"
+        self.e_noise_std = float(e_noise_std)
+
         log.info(
             f"Dataset[{split}] blocks={len(self.block_ids)} "
-            f"nodes={len(self.nodes)} edges={len(self.edges)} services={self.num_services}"
+            f"nodes={len(self.nodes)} edges={len(self.edges)} services={self.num_services} | "
+            f"e_channel={self.e_channel_mode} (std={self.e_noise_std if self.e_channel_mode=='noise' else 0.0})"
         )
 
     def __len__(self) -> int:
@@ -786,6 +834,7 @@ class HCanonGraphDataset(Dataset):
     def _node_targets(self, df_nodes_block: pd.DataFrame) -> Dict[str, torch.Tensor]:
         N = len(df_nodes_block)
 
+        # ТАРГЕТЫ (как были — e_i остаётся только как цель!)
         e = torch.as_tensor(pd.to_numeric(df_nodes_block["e_i"], errors="coerce")
                             .fillna(0.0).values, dtype=torch.float32).view(-1, 1)
         pos = torch.as_tensor(df_nodes_block[["posx","posy"]]
@@ -874,20 +923,29 @@ class HCanonGraphDataset(Dataset):
             svc_block_norm = torch.zeros((0,), dtype=torch.float32)
             sv1_block = torch.zeros((0,), dtype=torch.float32)
 
-        # --- глобальное кондиционирование c добавляем в признаки каждого узла ---
+        # --- глобальное кондиционирование по блоку (повторяем на каждый узел) ---
         N = len(nodes_b)
         scale_feat = scale_scalar.view(1,1).repeat(N, 1)          # (N,1)
         la_blk_feat = la_block_norm.view(1,1).repeat(N, 1)        # (N,1)
         sv1_blk_feat = sv1_block.view(1, -1).repeat(N, 1)         # (N,S)
         svc_blk_feat = svc_block_norm.view(1, -1).repeat(N, 1)    # (N,S)
 
+        # --- БЕЗОПАСНЫЙ e-канал (УСТРАНЕНА УТЕЧКА ТАРГЕТА) ---
+        if self.e_channel_mode == "ones":
+            e_chan = torch.ones((N,1), dtype=torch.float32)
+        elif self.e_channel_mode == "noise":
+            e_chan = torch.randn((N,1), dtype=torch.float32) * self.e_noise_std
+        else:  # "zeros"
+            e_chan = torch.zeros((N,1), dtype=torch.float32)
+
+        # x_in БЕЗ e_i — вместо него e_chan
         x_in = torch.cat([
-            torch.as_tensor(nodes_b[["e_i"]].values, dtype=torch.float32),    # (N,1)
-            torch.tile(zone_onehot.view(1,-1), (N, 1)),                       # (N,|zones|)
-            scale_feat,                                                       # (N,1) — ДОБАВЛЕНО
-            la_blk_feat,                                                      # (N,1) — ДОБАВЛЕНО
-            sv1_blk_feat,                                                     # (N,S) — ДОБАВЛЕНО
-            svc_blk_feat,                                                     # (N,S) — ДОБАВЛЕНО
+            e_chan,                                                   # (N,1) — безопасный канал
+            torch.tile(zone_onehot.view(1,-1), (N, 1)),               # (N,|zones|)
+            scale_feat,                                               # (N,1)
+            la_blk_feat,                                              # (N,1)
+            sv1_blk_feat,                                             # (N,S)
+            svc_blk_feat,                                             # (N,S)
         ], dim=1)
 
         # путь к маске
@@ -916,8 +974,8 @@ class HCanonGraphDataset(Dataset):
             data.scale_l = targets["scale_l"].view(-1,1)
 
             # блочные таргеты (по одному на граф)
-            data.y_la_block  = la_block_norm.view(1,1)                 # (1,1)
-            data.y_svc_block = svc_block_norm.view(1, -1)              # (1,S)
+            data.y_la_block  = la_block_norm.view(1,1)                 # (B=1, 1)
+            data.y_svc_block = svc_block_norm.view(1, -1)              # (B=1, S)
 
             data.mask_img = mask_img  # (1,H,W)
             return data
@@ -944,8 +1002,8 @@ class HCanonGraphDataset(Dataset):
         return v
     
     def _services_vecs(self, present_raw, cap_raw) -> Tuple[np.ndarray, np.ndarray]: 
-        present = _maybe_json_to_list(present_raw) 
-        cap = _maybe_json_to_list(cap_raw) 
+        present = _parse_list_any(present_raw) 
+        cap = _parse_list_any(cap_raw) 
         mhot = np.zeros((self.num_services,), dtype=np.float32) 
         for s in present: 
             sid = self.service2id.get(str(s)) 
@@ -1079,12 +1137,7 @@ class HCanonGraphDataset(Dataset):
     
     def _compute_label_stats(self, thr: float = 0.5) -> None:
         """
-        Считает частоты меток для балансировок лоссов:
-            - p_e  : доля активных узлов (e_i > thr)
-            - p_il : доля жилых среди активных
-            - p_hf : доля "есть этажность" среди активных
-            - s_counts: частоты классов формы s_i среди активных (ключи 0..3)
-        Записывает в self.label_stats (dict).
+        Частоты меток (для балансировок лоссов).
         """
         df = self.nodes.copy()
         cols = set(df.columns)
@@ -1113,13 +1166,11 @@ class HCanonGraphDataset(Dataset):
             p_hf = 0.0
 
         # частоты классов формы среди активных
-        s_counts = {0: 1, 1: 1, 2: 1, 3: 1}  # псевдосчётчики по умолчанию (чтобы не было деления на ноль)
+        s_counts = {0: 1, 1: 1, 2: 1, 3: 1}  # псевдосчётчики по умолчанию
         if "s_i" in cols and m_act.any():
             s_raw = pd.to_numeric(df["s_i"], errors="coerce").fillna(-1).astype(int).values
             s_active = s_raw[m_act]
-            # считаем только допустимые классы 0..3
             uniq, cnt = np.unique(s_active[(s_active >= 0) & (s_active <= 3)], return_counts=True)
-            # перезапишем поверх дефолта, оставив 1 для отсутствующих
             for k in range(4):
                 val = int(cnt[uniq.tolist().index(k)]) if (k in uniq.tolist()) else 0
                 s_counts[k] = max(1, val)
@@ -1130,6 +1181,7 @@ class HCanonGraphDataset(Dataset):
             "p_hf": p_hf,
             "s_counts": s_counts
         }
+
 
 def make_zone_temperature_weights(ds: "HCanonGraphDataset", tau: float = 1.0) -> np.ndarray:
     """
@@ -1587,14 +1639,15 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
                     "la":  batch.y_la.to(device),
                     "sv1": batch.y_sv1.to(device),
                     "svc": batch.y_svc.to(device),
-                    "la_block":  batch.y_la_block.to(device),   # (B=1, 1)
-                    "svc_block": batch.y_svc_block.to(device),  # (B=1, S)
+                    "la_block":  batch.y_la_block.to(device),   # (B,1)
+                    "svc_block": batch.y_svc_block.to(device),  # (B,S)
                 }
             else:
                 x  = batch["x"].to(device)
                 ei = batch["edge_index"].to(device)
-                bi = None
+                bi = batch.get("batch_index", None)
                 mi = batch.get("mask_img", None)
+                if bi is not None: bi = bi.to(device)
                 if mi is not None: mi = mi.to(device)
 
                 y = {k: v.to(device) for k,v in batch["y"].items()}
@@ -1614,7 +1667,8 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
                 writer.add_scalar("batch_pos/hf", hf_mean, global_step)
 
             pred = model(x, ei, bi, mi)
-            loss, parts = loss_comp(pred, y)
+            # ВАЖНО: передаём batch_index, чтобы считались блочные и collision-лоссы
+            loss, parts = loss_comp(pred, y, batch_index=bi)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
@@ -1660,8 +1714,9 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
                 else:
                     x  = batch["x"].to(device)
                     ei = batch["edge_index"].to(device)
-                    bi = None
+                    bi = batch.get("batch_index", None)
                     mi = batch.get("mask_img", None)
+                    if bi is not None: bi = bi.to(device)
                     if mi is not None: mi = mi.to(device)
 
                     y = {k: v.to(device) for k,v in batch["y"].items()}
@@ -1671,7 +1726,8 @@ def train_loop(model: nn.Module, train_loader, val_loader, device: str, cfg: Dic
                         y["sz"] = y["sz"].T
 
                 pred = model(x, ei, bi, mi)
-                l, _ = loss_comp(pred, y)
+                # ВАЖНО: тоже передаём batch_index в валидации
+                l, _ = loss_comp(pred, y, batch_index=bi)
 
                 if (epoch % 5 == 0) and (normalizer is not None) and (not _dbg_la_logged):
                     if _PYG_OK:
@@ -1837,15 +1893,55 @@ def main():
         in_dim = ds_train[0].x.shape[1]
     else:
         def _collate(batch_list):
-            xs = []; ys = {}
-            for b in batch_list:
-                xs.append(b["x"])
+            """
+            Collate для fallback (без PyG):
+            - конкатенирует узлы,
+            - создаёт batch_index (по графам внутри батча),
+            - собирает блочные таргеты,
+            - стакает маски кварталов в (B,1,H,W) для Mask-CNN.
+            """
+            xs = []
+            ys = {}
+            mis = []
+            bis_parts = []
+
+            for i, b in enumerate(batch_list):
+                x_i = b["x"]
+                xs.append(x_i)
+
+                # таргеты
                 for k, v in b["y"].items():
                     ys.setdefault(k, []).append(v)
+
+                # batch_index для узлов этого графа
+                n_i = x_i.shape[0]
+                bis_parts.append(torch.full((n_i,), i, dtype=torch.long))
+
+                # маска квартала (1,H,W) -> собираем в батч (B,1,H,W), если есть
+                mi = b.get("mask_img", None)
+                if mi is not None:
+                    mis.append(mi)  # (1,H,W)
+
+            # X и batch_index
             x = torch.cat(xs, dim=0)
-            for k in ys: ys[k] = torch.cat(ys[k], dim=0)
+            bi = torch.cat(bis_parts, dim=0)  # (N_total,)
+
+            # таргеты
+            for k in ys:
+                ys[k] = torch.cat(ys[k], dim=0)
+
+            # в fallback нет межграфовых рёбер
             ei = torch.zeros((2,0), dtype=torch.long)
-            return {"x": x, "edge_index": ei, "y": ys}
+
+            out = {"x": x, "edge_index": ei, "y": ys, "batch_index": bi}
+            if len(mis) > 0:
+                try:
+                    out["mask_img"] = torch.stack(mis, dim=0)  # (B,1,H,W)
+                except Exception:
+                    # если разные размеры — игнорируем маски в этом батче
+                    pass
+            return out
+        
         if args.sampler_mode == "two_stream":
             maj = MajoritySampler(
                 ds_train, tau=float(args.tau_majority),
