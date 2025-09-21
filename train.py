@@ -544,6 +544,7 @@ def run_infer(
     zone2id: Dict[str,int],
     service2id: Dict[str,int]
 ):
+    import re  # для санитизации имён сервисов в ключи GeoJSON
     device = args.device if (args.device == "cuda" and torch.cuda.is_available()) else "cpu"
     model.eval().to(device)
 
@@ -576,22 +577,23 @@ def run_infer(
     zone_id = zone2id[zone_label]
     zone_onehot = torch.as_tensor(np.eye(len(zone2id), dtype=np.float32)[zone_id])  # (Z,)
 
+    # Цель по жилплощади (квартальная) — только она, без целей по этажности
     la_target = float(args.la_target) if args.la_target is not None else 0.0
     la_target_norm = normalizer.encode_la(
         torch.tensor([[la_target]], dtype=torch.float32),
         torch.tensor([[scale_l]], dtype=torch.float32)
     ).item()
 
+    # Сервисы: грузим цели (если есть), но в выход теперь пишем только вероятности наличия по зданиям
     S = len(service2id)
     sv1_block = torch.zeros((S,), dtype=torch.float32)
     svc_block_norm = torch.zeros((S,), dtype=torch.float32)
     if args.services_target is not None:
-        st_raw = args.services_target
-        if isinstance(st_raw, str) and os.path.exists(st_raw):
-            with open(st_raw, "r", encoding="utf-8") as f:
+        if isinstance(args.services_target, str) and os.path.exists(args.services_target):
+            with open(args.services_target, "r", encoding="utf-8") as f:
                 st = json.load(f)
         else:
-            st = json.loads(st_raw)
+            st = json.loads(args.services_target)
         if isinstance(st, dict):
             iters = st.items()
         elif isinstance(st, list):
@@ -624,9 +626,11 @@ def run_infer(
         )
         pred["scale_l"] = torch.full((N,1), float(scale_l), device=device)
 
+        # денормируем полезное
         den = denorm_predictions({"y":{"scale_l": pred["scale_l"]}}, pred, normalizer)
         pred.update(den)
 
+        # подгонка по LA и сервисам (оставим стандартную)
         svc_vec = svc_block_norm.clone() if S > 0 else None
         pred_pf = post_fit_to_targets(
             {**pred, **{"scale_l": pred["scale_l"]}},
@@ -638,47 +642,62 @@ def run_infer(
         )
         pred.update(pred_pf)
 
+    # пороги для отбора зданий
     e_mask = (torch.sigmoid(pred["e"].view(-1)) > float(getattr(args,"infer_e_thr",0.5))).cpu().numpy()
 
-    # размер в канонике — аккуратный клип
+    # клипы размеров (каноника)
     sz = pred["sz"].detach().cpu().numpy()
     sz[:, 0] = np.clip(sz[:, 0], 0.01, 0.35)
     sz[:, 1] = np.clip(sz[:, 1], 0.01, 0.35)
+
+    # вероятности наличия сервисов на узле
+    sv1_prob_all = torch.sigmoid(pred["sv1"]).detach().cpu().numpy() if ("sv1" in pred and S > 0) else None
+
+    # санитизация ключей свойств из имён сервисов
+    def _sanitize_key(s: str, fallback: str) -> str:
+        k = re.sub(r"[^\w]+", "_", str(s)).strip("_")
+        return k if k else fallback
 
     out_features = []
     for i, keep in enumerate(e_mask):
         if not keep:
             continue
+
+        # геометрия здания в исходной СК
         center = pts[i]
         size = sz[i]
         phi = float(pred["phi"][i].detach().cpu().item())
-        poly_can = rect_polygon(center, size, phi)
+        poly_can_i = rect_polygon(center, size, phi)
 
-        xs, ys = poly_can.exterior.xy
+        xs, ys = poly_can_i.exterior.xy
         world_np = [inv((float(x), float(y))) for x, y in zip(xs, ys)]
         world = [(float(p[0]), float(p[1])) for p in world_np]
         if world and world[0] != world[-1]:
             world.append(world[0])
 
+        # этажность (как есть, неотрицательная)
+        floors_val = max(0.0, float(pred["fl"][i].detach().cpu().item()))
+
+        # жилая площадь — только если узел «жилой» по порогу
         il_prob_i = float(torch.sigmoid(pred["il"][i]).item())
         la_i = float(torch.clamp_min(pred.get("la_real", torch.zeros_like(pred["e"]))[i], 0.0).item())
-        # Пишем жилую площадь только для «жилых», иначе 0
         living_area_out = la_i if il_prob_i >= float(getattr(args,"infer_il_thr",0.5)) else 0.0
 
         props = {
             "zone": zone_label,
             "e": float(torch.sigmoid(pred["e"][i]).item()),
+            "floors": floors_val,
             "is_living": il_prob_i,
             "living_area": living_area_out,
         }
-        if "svc_real" in pred and pred["svc_real"].numel() > 0:
-            caps = pred["svc_real"][i].detach().cpu().numpy().tolist()
-            if any(c > 0 for c in caps):
-                props["services_capacity"] = [
-                    {"name": name, "value": float(caps[sid])}
-                    for name, sid in service2id.items()
-                    if 0 <= sid < len(caps) and caps[sid] > 0
-                ]
+
+        # вероятности наличия сервисов — отдельные float-атрибуты
+        if sv1_prob_all is not None:
+            for name, sid in service2id.items():
+                if 0 <= sid < sv1_prob_all.shape[1]:
+                    p = float(sv1_prob_all[i, sid])
+                    key = _sanitize_key(name, fallback=f"service_{sid}")
+                    props[key] = p
 
         out_features.append({
             "type":"Feature",

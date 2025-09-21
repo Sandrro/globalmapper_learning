@@ -135,11 +135,29 @@ def main():
     ap.add_argument("--infer-il-thr", type=float, default=0.5)
     ap.add_argument("--infer-sv1-thr", type=float, default=0.5)
 
+    # НОВОЕ: словарь целевой LA по зонам
+    ap.add_argument("--la-by-zone", default=None,
+                    help="Путь к JSON или JSON-строка вида {\"residential\": 12000, \"business\": 8000}")
+
     args = ap.parse_args()
 
-    # подхватим services_vocab из artifacts, чтобы выбрать корректные имена
+    # подхватим services_vocab из artifacts, чтобы выбрать корректные имена (для мин. сервисов)
     vocab = load_services_vocab_from_artifacts(args.model_ckpt)
     svc_keys = pick_service_keys(vocab)
+
+    # загрузим словарь LA по зонам
+    la_by_zone = {}
+    if args.la_by_zone:
+        src = args.la_by_zone
+        try:
+            if os.path.exists(src):
+                with open(src, "r", encoding="utf-8") as f:
+                    la_by_zone = json.load(f)
+            else:
+                la_by_zone = json.loads(src)
+        except Exception as e:
+            print(f"[WARN] failed to read --la-by-zone: {e}", file=sys.stderr)
+            la_by_zone = {}
 
     fc = read_geojson(args.blocks)
     out_feats: List[Dict[str,Any]] = []
@@ -152,25 +170,34 @@ def main():
                 print(f"[WARN] feature #{i}: не найдена зона в properties['{args.zone_attr}'] — пропуск", file=sys.stderr)
                 continue
 
-            # сформируем цели
+            # цели
             la_target = None
             services_target: Dict[str, float] = {}
 
-            if str(z).casefold() == "residential":
+            # приоритет: из словаря --la-by-zone
+            if z in la_by_zone and la_by_zone[z] is not None:
+                try:
+                    la_target = float(la_by_zone[z])
+                except Exception:
+                    print(f"[WARN] feature #{i}: некорректное значение LA для зоны '{z}' в --la-by-zone", file=sys.stderr)
+
+            # fallback: старая логика для residential по числу жителей
+            if (la_target is None) and (str(z).casefold() == "residential"):
                 people = get_people(feat.get("properties") or {}, args.people)
-                la_target = float(15.0 * people)  # м²
+                la_target = float(15.0 * people)
+
+                # минимальные сервисы для residential (если включено)
                 if args.min_services:
-                    # выставляем «минимальную» вместимость = 1, чтобы гарантировать присутствие
                     services_target[svc_keys["school"]]       = 1.0
                     services_target[svc_keys["polyclinic"]]   = 1.0
                     services_target[svc_keys["kindergarten"]] = 1.0
 
-            # запишем единичный квартал во временный файл
+            # временные файлы для данного квартала
             in_path  = os.path.join(tmpdir, f"blk_{i:06d}.geojson")
             out_path = os.path.join(tmpdir, f"blk_{i:06d}_out.geojson")
             write_geojson(in_path, {"type":"FeatureCollection","features":[feat]})
 
-            # соберём команду
+            # команда вызова train.py --mode infer
             cmd = [
                 sys.executable, args.train_script,
                 "--mode", "infer",
@@ -197,18 +224,17 @@ def main():
             if args.services_json:
                 cmd += ["--services-json", args.services_json]
 
-            # вызов инференса
+            # инференс одного квартала
             try:
                 subprocess.run(cmd, check=True, stdout=sys.stdout, stderr=sys.stderr)
             except subprocess.CalledProcessError as e:
                 print(f"[ERROR] infer failed for block #{i} (zone={z}): {e}", file=sys.stderr)
                 continue
 
-            # дочитаем результат
+            # читаем результат и добавляем трассировку источника
             try:
                 blk_out = read_geojson(out_path)
                 for b in blk_out.get("features", []):
-                    # добавим исходные атрибуты квартала для трассировки
                     props = dict(b.get("properties") or {})
                     props.setdefault("_source_zone", z)
                     props.setdefault("_source_block_index", i)
@@ -218,12 +244,11 @@ def main():
                 print(f"[WARN] failed to read output for block #{i}: {e}", file=sys.stderr)
                 continue
 
-        # запись общего выхода
+        # общий выход
         write_geojson(args.out, {"type":"FeatureCollection","features": out_feats})
         print(f"[OK] saved {len(out_feats)} buildings → {args.out}")
 
     finally:
-        # можно оставить tmpdir для отладки — тогда закомментируйте следующую строку
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
