@@ -230,6 +230,103 @@ log.info("Запуск train.py (YAML+CLI) …")
 # ----------------------
 # Утилиты
 # ----------------------
+def _wrap_angle_deg(a: float) -> float:
+    """[-180,180) — удобно для разницы углов."""
+    a = float(a)
+    a = (a + 180.0) % 360.0 - 180.0
+    return a
+
+def _dominant_edge_angle(poly: ShpPolygon, bins: int = 72) -> float:
+    """
+    Доминирующее направление границ полигона (в градусах, модуль 180°).
+    Берём внешний контур, считаем углы сегментов, взвешиваем длиной.
+    """
+    ext = poly.exterior
+    xs, ys = list(ext.coords.xy[0]), list(ext.coords.xy[1])
+    angs = []
+    ws = []
+    for i in range(len(xs) - 1):
+        dx = xs[i+1] - xs[i]
+        dy = ys[i+1] - ys[i]
+        w = (dx*dx + dy*dy) ** 0.5
+        if w <= 1e-9:
+            continue
+        a = math.degrees(math.atan2(dy, dx))  # (-180,180]
+        # модуль 180°: осевое направление, а не векторное
+        a = _wrap_angle_deg(a)
+        if a < -90.0: a += 180.0
+        if a >= 90.0: a -= 180.0
+        angs.append(a); ws.append(w)
+    if not angs:
+        return 0.0
+    angs = np.asarray(angs, dtype=np.float64)
+    ws   = np.asarray(ws,   dtype=np.float64)
+
+    # гистограмма на [-90,90)
+    hist, edges = np.histogram(angs, bins=bins, range=(-90.0, 90.0), weights=ws)
+    k = int(hist.argmax())
+    a0 = 0.5 * (edges[k] + edges[k+1])
+    return float(a0)
+
+def _poly_iou(pa: ShpPolygon, pb: ShpPolygon) -> float:
+    try:
+        inter = pa.intersection(pb).area
+        if inter <= 0.0:
+            return 0.0
+        uni = pa.union(pb).area
+        return float(inter / max(uni, 1e-9))
+    except Exception:
+        return 0.0
+
+def _nms_pack_by_la(
+    polys: list[ShpPolygon],
+    centers: list[tuple[float,float]],
+    scores: list[float],
+    la_each: list[float],
+    la_target: float | None,
+    iou_thr: float = 0.10,
+    min_dist_k: float = 0.35
+) -> list[int]:
+    """
+    Грязная, но быстрая жадная выборка:
+      1) сортируем по score убыв.
+      2) выкидываем кандидатов с IoU>τ или центры ближе, чем min_dist_k*sqrt(area(poly)).
+      3) опционально набираем до суммарной LA (если задана), допускаем +5%.
+    Возвращает индексы оставленных объектов.
+    """
+    order = np.argsort(-np.asarray(scores, dtype=np.float64)).tolist()
+    keep: list[int] = []
+    cur_la = 0.0
+    la_cap = float(la_target) if (la_target is not None and la_target > 0) else None
+
+    for i in order:
+        pi = polys[i]
+        ci = centers[i]
+        # проверки на пересечения с уже выбранными
+        ok = True
+        ai = max(pi.area, 1e-9)
+        min_d = (ai ** 0.5) * min_dist_k
+        for j in keep:
+            if _poly_iou(pi, polys[j]) > iou_thr:
+                ok = False; break
+            # расстояние между центрами
+            cj = centers[j]
+            dx = ci[0] - cj[0]; dy = ci[1] - cj[1]
+            if (dx*dx + dy*dy) ** 0.5 < min_d:
+                ok = False; break
+        if not ok:
+            continue
+
+        # ограничение по жилплощади (если есть цель)
+        if la_cap is not None:
+            nxt = cur_la + max(0.0, float(la_each[i]))
+            if nxt > la_cap * 1.05:   # +5% допуска
+                continue
+            cur_la = nxt
+
+        keep.append(i)
+    return keep
+
 def _sample_slots_from_mask_img(mask_img: torch.Tensor, n_slots: int, jitter: float = 0.35, seed: int = 42) -> np.ndarray:
     """
     mask_img: (1,H,W) тензор в [0,1] (y-вниз). Возвращает (N,2) в канонике [0,1]^2 (y-вверх).
@@ -602,7 +699,142 @@ def post_fit_to_targets(
 # -------------------------------
 # INFERENCE
 # --------------------------------
-# === NEW: inference runner ===
+# ---- helpers for inference orientation & spacing ----
+def _wrap_pi(x: float) -> float:
+    # сводим угол к (-pi, pi]
+    return (x + math.pi) % (2.0 * math.pi) - math.pi
+
+def _circ_mean_pi(angles: np.ndarray) -> float:
+    """
+    Круглое среднее по углам с периодом pi (ориентации прямоугольников),
+    реализуем через удвоение угла.
+    """
+    if angles.size == 0:
+        return 0.0
+    c = np.cos(2.0 * angles).mean()
+    s = np.sin(2.0 * angles).mean()
+    return 0.5 * math.atan2(s, c)
+
+def _dominant_edge_orientation(poly_world: ShpPolygon) -> float:
+    """
+    Доминирующее направление ребер контура полигона в мировых координатах (рад, mod π).
+    Берём углы отрезков границы, усредняем с весами по длине (через удвоение угла).
+    """
+    xs, ys = poly_world.exterior.xy
+    if len(xs) < 2:
+        return 0.0
+    angs = []
+    wts  = []
+    for i in range(len(xs) - 1):
+        dx = float(xs[i+1] - xs[i]); dy = float(ys[i+1] - ys[i])
+        L = math.hypot(dx, dy)
+        if L <= 1e-6:
+            continue
+        a = math.atan2(dy, dx)
+        # ориентация прямоугольников периодична по π
+        a = (a + math.pi) % math.pi
+        angs.append(a); wts.append(L)
+    if not wts:
+        return 0.0
+    angs = np.asarray(angs, dtype=np.float64)
+    wts  = np.asarray(wts,  dtype=np.float64)
+    C = (wts * np.cos(2.0 * angs)).sum()
+    S = (wts * np.sin(2.0 * angs)).sum()
+    return 0.5 * math.atan2(S, C)
+
+def _push_inside_poly(pt: np.ndarray, poly_can: ShpPolygon, alpha: float = 0.25) -> np.ndarray:
+    """
+    Если точка вышла за пределы poly_can, мягко тянем к центроиду до возврата внутрь.
+    alpha — шаг притяжения к центроиду (0..1).
+    """
+    if poly_can.contains(ShpPoint(pt[0], pt[1])):
+        return pt
+    c = np.asarray(poly_can.centroid.coords[0], dtype=np.float64)
+    q = pt.copy()
+    for _ in range(6):
+        q = (1.0 - alpha) * q + alpha * c
+        if poly_can.contains(ShpPoint(q[0], q[1])):
+            break
+    # на всякий случай подрежем в [0,1]
+    q = np.clip(q, 0.0, 1.0)
+    return q
+
+def _repel_points_in_poly(P: np.ndarray,
+                          SZ: np.ndarray,
+                          poly_can: ShpPolygon,
+                          steps: int = 12,
+                          step_scale: float = 0.25,
+                          edge_clear_k: float = 0.35,
+                          rng: np.random.Generator | None = None) -> np.ndarray:
+    """
+    Простейший «репульсор» центров в каноническом пространстве:
+    - отталкиваем пары, у которых центры ближе суммарного радиуса (по max-полуоси),
+      небольшими шагами (step_scale).
+    - «отбой» от границы: если точка вышла наружу, возвращаем её внутрь к центроиду.
+    - edge_clear_k: целевой запас до границы в долях длинной полуоси прямоугольника.
+    """
+    if rng is None:
+        rng = np.random.default_rng(123)
+    P = P.copy()
+    N = P.shape[0]
+    # радиусы как половина длинной стороны с небольшим коэффициентом
+    R = 0.5 * np.maximum(SZ[:, 0], SZ[:, 1])  # (N,)
+    R = np.asarray(R, dtype=np.float64)
+
+    for _ in range(steps):
+        moved = False
+        # попарное разведение
+        for i in range(N):
+            for j in range(i + 1, N):
+                v = P[i] - P[j]
+                d = float(np.linalg.norm(v))
+                target = 0.9 * (R[i] + R[j])  # желаемая дистанция
+                if d < 1e-6:
+                    # случайное маленькое смещение для разлипания
+                    dir_ = rng.normal(size=(2,))
+                    nrm = np.linalg.norm(dir_)
+                    dir_ = dir_ / (nrm + 1e-6)
+                    delta = 0.15 * target * dir_
+                    P[i] = P[i] + delta
+                    P[j] = P[j] - delta
+                    moved = True
+                elif d < target:
+                    dir_ = v / d
+                    # симметрично раздвигаем, маленький шаг
+                    shift = 0.5 * (target - d) * step_scale
+                    P[i] = P[i] + shift * dir_
+                    P[j] = P[j] - shift * dir_
+                    moved = True
+
+        # лёгкий отбой от границы + запас до границы
+        if moved:
+            for k in range(N):
+                # вернуть внутрь при выходе
+                if not poly_can.contains(ShpPoint(P[k, 0], P[k, 1])):
+                    P[k] = _push_inside_poly(P[k], poly_can, alpha=0.35)
+                else:
+                    # запас до границы: если слишком близко — немного в сторону центроида
+                    nearest = poly_can.exterior.project(ShpPoint(P[k, 0], P[k, 1]), normalized=False)
+                    # грубая оценка дистанции до контура
+                    # shapely.distance(Point, LineString) дороже; проект простым способом:
+                    d_clear = poly_can.exterior.distance(ShpPoint(P[k, 0], P[k, 1]))
+                    need = edge_clear_k * R[k]
+                    if d_clear < need:
+                        c = np.asarray(poly_can.centroid.coords[0], dtype=np.float64)
+                        dir_in = c - P[k]
+                        nrm = np.linalg.norm(dir_in)
+                        if nrm > 1e-6:
+                            P[k] = P[k] + (need - d_clear) * 0.5 * (dir_in / nrm)
+
+            # безопасная обрезка
+            P = np.clip(P, 0.0, 1.0)
+
+    return P
+
+
+# ------------------------------- 
+# INFERENCE (заменить полностью) 
+# --------------------------------
 def run_infer(
     args,
     model: "GraphModel",
@@ -619,10 +851,12 @@ def run_infer(
     feat = gj["features"][0] if gj.get("type") == "FeatureCollection" else (gj if gj.get("type")=="Feature" else {"type":"Feature","geometry":gj})
     poly_world = _polygon_from_geojson(feat)
 
+    # каноника блока (как раньше)
     poly_can, fwd, inv, scale_l = canonicalize_polygon(poly_world)
     mask_size = tuple([int(_CFG["model"].get("mask_size", 128))]*2)
     mask_img = polygon_to_mask(poly_can, size=mask_size).to(device)  # (1,H,W)
 
+    # точки-слоты (как было)
     n_slots = int(getattr(args, "infer_slots", 256))
     pts = sample_slots_grid(poly_can, n_slots=n_slots, jitter=0.35, seed=42)  # (N,2) в канонике
     if len(pts) == 0:
@@ -635,7 +869,7 @@ def run_infer(
     zone_id = zone2id[zone_label]
     zone_onehot = torch.as_tensor(np.eye(len(zone2id), dtype=np.float32)[zone_id])  # (Z,)
 
-    # целевая квартальная LA и сервисы (в норм-пространстве)
+    # блочные цели (норм-пространство)
     la_target = float(args.la_target) if args.la_target is not None else 0.0
     la_target_norm = normalizer.encode_la(
         torch.tensor([[la_target]], dtype=torch.float32),
@@ -664,9 +898,7 @@ def run_infer(
     fl_blk_feat = torch.full((N,1), floors_avg, dtype=torch.float32)
     zone_feat = torch.from_numpy(np.tile(zone_onehot.numpy(), (N,1))).float()
 
-    # БАЗОВЫЕ узловые признаки (без pos-encoding и без mask-local — они добавятся внутри модели)
-    x_in = torch.cat([
-    e_stub, zone_feat, scale_feat, la_blk_feat, sv1_blk_feat, svc_blk_feat, fl_blk_feat], dim=1).to(device)
+    x_in = torch.cat([e_stub, zone_feat, scale_feat, la_blk_feat, sv1_blk_feat, svc_blk_feat, fl_blk_feat], dim=1).to(device)
     batch_index = torch.zeros((N,), dtype=torch.long, device=device)
     pos_in = torch.from_numpy(pts).float().to(device)  # канонические координаты узлов
 
@@ -687,30 +919,58 @@ def run_infer(
         )
         pred.update(pred_pf)
 
-    # пороги и клипы
-    e_mask = (torch.sigmoid(pred["e"].view(-1)) > float(getattr(args,"infer_e_thr",0.5))).cpu().numpy()
-
-    # ГЕОМЕТРИЯ: берём именно стабильные головы
+    # исходные пороги/клипы
+    e_prob = torch.sigmoid(pred["e"].view(-1)).detach().cpu().numpy()
+    e_mask = (e_prob > float(getattr(args,"infer_e_thr",0.5)))
     pos_pred = pred["pos_abs"].detach().cpu().numpy()
     sz = pred["sz_abs"].detach().cpu().numpy()
     sz[:, 0] = np.clip(sz[:, 0], 0.01, 0.35)
     sz[:, 1] = np.clip(sz[:, 1], 0.01, 0.35)
+    phi_pred = pred["phi"].detach().cpu().numpy().reshape(-1)
 
+    # === 1) Глобальная поправка угла (устраняем систематический наклон) ===
+    # доминирующее направление рёбер в МИРОВЫХ координатах:
+    theta_ref_world = _dominant_edge_orientation(poly_world)  # mod π
+    # средний предсказанный угол (mod π) ПО АКТИВНЫМ узлам в КАНОНИКЕ:
+    mean_phi_can = _circ_mean_pi(phi_pred[e_mask]) if e_mask.any() else 0.0
+    # PCA-угол был «снят» в canonicalize_polygon и вернётся на обратном преобразовании.
+    # Мировой угол зданий без поправки ≈ angle_pca + mean_phi_can,
+    # значит δ надо взять так, чтобы (angle_pca + mean_phi_can + δ) ≈ theta_ref_world.
+    # angle_pca учтён внутри inv(), так что корректируем сами φ:
+    delta = _wrap_pi(theta_ref_world - mean_phi_can - 0.0)   # 0.0 — т.к. inv уже вернёт +angle_pca
+    phi_adj = phi_pred + delta
+
+    # === 2) Рассредоточение центров внутри полигона (в канонике) ===
+    # берём только активные, разводим, затем склеим обратно
+    pos_can = pos_pred.copy()
+    if e_mask.sum() >= 2:
+        pos_can_active = _repel_points_in_poly(
+            P=pos_pred[e_mask],
+            SZ=sz[e_mask],
+            poly_can=poly_can,
+            steps=12,
+            step_scale=0.25,
+            edge_clear_k=0.35
+        )
+        pos_can[e_mask] = pos_can_active
+
+    # финальные многоугольники
+    out_features = []
+    S = len(service2id)
     sv1_prob_all = torch.sigmoid(pred["sv1"]).detach().cpu().numpy() if ("sv1" in pred and S > 0) else None
 
     def _sanitize_key(s: str, fallback: str) -> str:
         k = re.sub(r"[^\w]+", "_", str(s)).strip("_")
         return k if k else fallback
 
-    out_features = []
     for i, keep in enumerate(e_mask):
         if not keep:
             continue
-
-        center = pos_pred[i]                       # предсказанный центр
+        center = pos_can[i]                 # уже «разведённый» центр
         size = sz[i]
-        phi = float(pred["phi"][i].detach().cpu().item())
-        poly_can_i = rect_polygon(center, size, phi)
+        phi_i = float(phi_adj[i])           # с глобальной поправкой δ
+
+        poly_can_i = rect_polygon(center, size, phi_i)
 
         xs, ys = poly_can_i.exterior.xy
         world_np = [inv((float(x), float(y))) for x, y in zip(xs, ys)]
@@ -725,7 +985,7 @@ def run_infer(
 
         props = {
             "zone": zone_label,
-            "e": float(torch.sigmoid(pred["e"][i]).item()),
+            "e": float(e_prob[i]),
             "floors": floors_val,
             "is_living": il_prob_i,
             "living_area": living_area_out,
@@ -741,7 +1001,7 @@ def run_infer(
     os.makedirs(os.path.dirname(args.infer_out) or ".", exist_ok=True)
     with open(args.infer_out, "w", encoding="utf-8") as f:
         json.dump(out_fc, f, ensure_ascii=False, indent=2)
-    log.info(f"[infer] Saved → {args.infer_out}")
+    log.info(f"[infer] Saved → {args.infer_out}  (δ={delta:.3f} rad ≈ {math.degrees(delta):.1f}°)")
 
 # ----------------------
 # Датасет
