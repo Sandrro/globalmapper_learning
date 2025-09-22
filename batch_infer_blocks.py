@@ -3,20 +3,23 @@
 """
 batch_infer_blocks.py — пакетная генерация застройки по набору кварталов через train.py --mode infer
 
-Примеры:
+Что делает:
+- Читает FeatureCollection с полигонами кварталов; метка зоны в properties[--zone-attr] (по умолчанию "zone").
+- Для каждой зоны берёт цели из --targets-by-zone: { "zone": {"la": <м2>, "floors_avg": <этажи>} }.
+  Синонимы ключей внутри зоны: la|living_area|la_target и floors_avg|floors.
+- Если для residential не задана la, можно fallback: la = 15 м² * people (из properties или --people).
+- НЕ передаёт --zones-json/--services-json, если вы их явно не указали,
+  чтобы train.py использовал артефакты из каталога рядом с чекпойнтом: <ckpt_dir>/artifacts/{zones.json,services.json}.
+
+Пример:
   python batch_infer_blocks.py \
     --blocks ./zones.geojson \
     --out ./buildings_gen.geojson \
     --train-script ./train.py \
-    --model-ckpt ./out/checkpoints/graphgen_hcanon_v1.pt \
-    --people 800 \
+    --model-ckpt ./out_2/checkpoints/graphgen_hcanon_v1.pt \
     --zone-attr zone \
+    --targets-by-zone ./targets_by_zone.json \
     --infer-slots 256 --infer-knn 8
-
-Заметки:
-- Для residential: целевая жилплощадь = 15 м² * people (из CLI или properties.population|people).
-- Требуем хотя бы по одному: школа, поликлиника, детсад (если такие сервисы есть в vocab).
-- Скрипт аккуратно подбирает имена сервисов под services.json из artifacts к чекпойнту.
 """
 
 from __future__ import annotations
@@ -111,21 +114,65 @@ def zone_label_of(feat: Dict[str,Any], zone_attr: str, fallback: str|None=None) 
         return fallback
     return None
 
+def load_json_maybe(path_or_json: str) -> Any:
+    """Читает JSON из файла, если путь существует; иначе парсит как строку JSON."""
+    try:
+        if os.path.exists(path_or_json):
+            with open(path_or_json, "r", encoding="utf-8") as f:
+                return json.load(f)
+        else:
+            return json.loads(path_or_json)
+    except Exception as e:
+        print(f"[WARN] failed to read JSON '{path_or_json}': {e}", file=sys.stderr)
+        return None
+
+def normalize_targets_map(raw: Any) -> Dict[str, Dict[str, float]]:
+    """
+    Приводит словарь целей по зонам к виду:
+      { zone_label: { "la": <float or None>, "floors_avg": <float or None> } }
+    Поддерживаем синонимы ключей: la|living_area|la_target и floors_avg|floors.
+    """
+    out: Dict[str, Dict[str, float]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for zone, val in raw.items():
+        if not isinstance(zone, str) or not isinstance(val, dict):
+            continue
+        la = None
+        fl = None
+        # площадь
+        for k in ("la", "living_area", "la_target"):
+            if k in val and val[k] is not None:
+                try:
+                    la = float(val[k]); break
+                except Exception:
+                    pass
+        # этажность
+        for k in ("floors_avg", "floors"):
+            if k in val and val[k] is not None:
+                try:
+                    fl = float(val[k]); break
+                except Exception:
+                    pass
+        out[zone] = {"la": la, "floors_avg": fl}
+    return out
+
 
 # ---- основной скрипт ----
 
 def main():
     ap = argparse.ArgumentParser(description="Batch infer buildings for blocks via train.py --mode infer")
-    ap.add_argument("--blocks", required=True, help="Входной GeoJSON (FeatureCollection) кварталов")
+    ap.add_argument("--blocks", required=True, help="Входной GeoJSON (FeatureCollection) кварталов с полигонами")
     ap.add_argument("--out", required=True, help="Выходной GeoJSON зданий")
     ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
     ap.add_argument("--model-ckpt", required=True, help="Путь к чекпойнту модели (.pt)")
-    ap.add_argument("--zones-json", default="./out/checkpoints/artifacts/zones.json")
-    ap.add_argument("--services-json", default="./out/checkpoints/artifacts/services.json")
+    # ВАЖНО: по умолчанию НЕ передаём эти пути — train.py возьмёт артефакты рядом с чекпойнтом
+    ap.add_argument("--zones-json", default=None, help="(опц.) путь к zones.json; по умолчанию ckpt_dir/artifacts/zones.json")
+    ap.add_argument("--services-json", default=None, help="(опц.) путь к services.json; по умолчанию ckpt_dir/artifacts/services.json")
     ap.add_argument("--config", default=None)
     ap.add_argument("--device", default=None, help="cuda|cpu (пробрасывается в train.py как --device)")
     ap.add_argument("--zone-attr", default="zone", help="Имя свойства с меткой зоны в кварталах")
-    ap.add_argument("--people", type=int, default=1000, help="Число жителей на квартал (если нет значения в properties)")
+    ap.add_argument("--people", type=int, default=1000, help="Число жителей на квартал (fallback для residential)")
     ap.add_argument("--min-services", action="store_true", default=True,
                     help="Требовать минимум по одному: школа, поликлиника, детсад (в residential)")
     # инференс-параметры 1:1 с train.py
@@ -135,29 +182,30 @@ def main():
     ap.add_argument("--infer-il-thr", type=float, default=0.5)
     ap.add_argument("--infer-sv1-thr", type=float, default=0.5)
 
-    # НОВОЕ: словарь целевой LA по зонам
+    # Карта целей по зонам
+    ap.add_argument("--targets-by-zone", default=None,
+                    help="Путь к JSON или JSON-строка вида "
+                         "{\"residential\": {\"la\": 12000, \"floors_avg\": 8}, \"business\": {\"la\": 8000}}")
+    # Устаревшее (оставлено для совместимости): только la по зонам
     ap.add_argument("--la-by-zone", default=None,
-                    help="Путь к JSON или JSON-строка вида {\"residential\": 12000, \"business\": 8000}")
+                    help="DEPRECATED: Путь/JSON с {\"residential\": 12000, ...}; используйте --targets-by-zone")
 
     args = ap.parse_args()
 
-    # подхватим services_vocab из artifacts, чтобы выбрать корректные имена (для мин. сервисов)
+    # services vocab (для синонимов имен сервисов)
     vocab = load_services_vocab_from_artifacts(args.model_ckpt)
     svc_keys = pick_service_keys(vocab)
 
-    # загрузим словарь LA по зонам
-    la_by_zone = {}
-    if args.la_by_zone:
-        src = args.la_by_zone
-        try:
-            if os.path.exists(src):
-                with open(src, "r", encoding="utf-8") as f:
-                    la_by_zone = json.load(f)
-            else:
-                la_by_zone = json.loads(src)
-        except Exception as e:
-            print(f"[WARN] failed to read --la-by-zone: {e}", file=sys.stderr)
-            la_by_zone = {}
+    # Загрузка словаря целей по зонам
+    targets_by_zone: Dict[str, Dict[str, float]] = {}
+    if args.targets_by_zone:
+        raw = load_json_maybe(args.targets_by_zone)
+        targets_by_zone = normalize_targets_map(raw)
+    elif args.la_by_zone:
+        raw_la = load_json_maybe(args.la_by_zone)
+        if isinstance(raw_la, dict):
+            targets_by_zone = {z: {"la": (float(v) if v is not None else None), "floors_avg": None}
+                               for z, v in raw_la.items()}
 
     fc = read_geojson(args.blocks)
     out_feats: List[Dict[str,Any]] = []
@@ -170,23 +218,16 @@ def main():
                 print(f"[WARN] feature #{i}: не найдена зона в properties['{args.zone_attr}'] — пропуск", file=sys.stderr)
                 continue
 
-            # цели
-            la_target = None
+            # цели по зоне
+            t_z = targets_by_zone.get(z, {})
+            la_target = t_z.get("la")
+            floors_avg = t_z.get("floors_avg")
+
+            # fallback для residential по людям (только если la не задана в targets-by-zone)
             services_target: Dict[str, float] = {}
-
-            # приоритет: из словаря --la-by-zone
-            if z in la_by_zone and la_by_zone[z] is not None:
-                try:
-                    la_target = float(la_by_zone[z])
-                except Exception:
-                    print(f"[WARN] feature #{i}: некорректное значение LA для зоны '{z}' в --la-by-zone", file=sys.stderr)
-
-            # fallback: старая логика для residential по числу жителей
             if (la_target is None) and (str(z).casefold() == "residential"):
                 people = get_people(feat.get("properties") or {}, args.people)
                 la_target = float(15.0 * people)
-
-                # минимальные сервисы для residential (если включено)
                 if args.min_services:
                     services_target[svc_keys["school"]]       = 1.0
                     services_target[svc_keys["polyclinic"]]   = 1.0
@@ -215,10 +256,14 @@ def main():
                 cmd += ["--device", args.device]
             if la_target is not None:
                 cmd += ["--la-target", str(la_target)]
+            if floors_avg is not None:
+                cmd += ["--floors-avg", str(floors_avg)]
             if services_target:
                 cmd += ["--services-target", json.dumps(services_target, ensure_ascii=False)]
             if args.config:
                 cmd += ["--config", args.config]
+
+            # ВАЖНО: zones/services НЕ передаём, пока вы явно не попросите — избежим рассинхрона с чекпойнтом
             if args.zones_json:
                 cmd += ["--zones-json", args.zones_json]
             if args.services_json:
