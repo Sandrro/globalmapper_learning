@@ -2,19 +2,23 @@
 # -*- coding: utf-8 -*-
 """
 batch_infer_blocks.py — пакетная генерация застройки через train.py --mode infer
-с последующей нарезкой квартала на кольца (внутренние буферы) и сектора от направлений на точки.
-Площадь сектора ∝ весу точки (living_area/floors, затем living_area, иначе 1).
+с последующим слиянием центроидов внутри кварталов и построением графа соседства.
 
 Совместимо с Shapely < 2.0.
 Зависимости: shapely (1.7/1.8), numpy, tqdm (опц.).
 
-ВЫХОДЫ (4 шт):
-  1) --out                 : полигоны-сектора (rings/sectors)
-  2) --out-points          : исходные точки для разрезки (центроиды полигонов инференса + исходные Point)
-  3) --out-infer-polys     : полигоны, выданные инференсом (Polygon/MultiPolygon как есть)
-  4) --out-infer-centroids : центроиды полигонов инференса (Point), свойства 1:1 с полигоном
+ВЫХОДЫ (3 шт):
+  1) --out                 : граф как линии (LineString) между СЛИТЫМИ центроидами зданий
+  2) --out-infer-polys     : полигоны, выданные инференсом (Polygon/MultiPolygon как есть)
+  3) --out-infer-centroids : СЛИТЫЕ центроиды (Point) с агрегированными свойствами:
+       - e            : из якоря кластера (наиболее вероятного)
+       - floors       : ceil(среднего по кластеру)  (дополнительно floors_avg — само среднее)
+       - is_living    : среднее (0..1)
+       - living_area  : сумма
+       - merged_from  : список infer_fid, вошедших в кластер
+       - merged_count : размер кластера
 
-Для пары (полигон инференса, его центроид) свойства строго идентичны, добавлен общий ключ: infer_fid.
+Примечание: расстояния считаются в тех же единицах, что CRS входа; для «метров» используйте метрическую проекцию.
 """
 
 from __future__ import annotations
@@ -29,8 +33,7 @@ except Exception:
 
 # --- Гео-зависимости (Shapely < 2.0 поддерживается) ---
 try:
-    from shapely.geometry import shape, mapping, Point, Polygon, MultiPolygon
-    from shapely.ops import unary_union
+    from shapely.geometry import shape, mapping, Point, Polygon, MultiPolygon, LineString
 except Exception:
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
@@ -60,7 +63,7 @@ def zone_label_of(feat: Dict[str,Any], zone_attr: str) -> Optional[str]:
     z = props.get(zone_attr)
     return z if isinstance(z, str) else None
 
-# ---- Старые утилиты для целей (оставлены для совместимости с твоими флагами) ----
+# ---- Совместимость (targets) ----
 
 SYNONYMS = {
     "school":       ["school", "школа", "общеобразовательная школа", "образовательная организация"],
@@ -141,79 +144,224 @@ def normalize_targets_map(raw: Any) -> Dict[str, Dict[str, float]]:
         out[zone] = {"la": la, "floors_avg": fl}
     return out
 
-# ---- Гео-хелперы ----
+# ---- Вспомогательные извлечения атрибутов ----
 
-def block_rings(block, step_m: float) -> List[Polygon]:
-    """Возвращает список «колец» (Polygon) как разности последовательных внутренних буферов с шагом step_m.
-       Последнее центральное «ядро» тоже добавляется (как кольцо меньшей ширины)."""
-    if isinstance(block, MultiPolygon):
-        block = unary_union(block)
-    if block.is_empty:
-        return []
-    rings: List[Polygon] = []
-    prev = block
-    k = 1
-    while True:
-        next_poly = block.buffer(-step_m * k)
-        ring = prev.difference(next_poly)
-        if not ring.is_empty and ring.area > 0:
-            if isinstance(ring, MultiPolygon):
-                ring = unary_union(ring)
-            if not ring.is_empty and ring.area > 0:
-                rings.append(ring)
-        if next_poly.is_empty or next_poly.area <= 0:
-            if (not next_poly.is_empty) and (next_poly.area > 0):
-                rings.append(next_poly if isinstance(next_poly, Polygon) else unary_union(next_poly))
-            break
-        prev = next_poly
-        k += 1
-    return rings
+def _to_float(x) -> Optional[float]:
+    try:
+        if isinstance(x, bool): return 1.0 if x else 0.0
+        if isinstance(x, (int, float)): return float(x)
+        if isinstance(x, str):
+            xs = x.strip().lower()
+            if xs in ("true","yes","y","t","1"): return 1.0
+            if xs in ("false","no","n","f","0"): return 0.0
+            return float(x)
+    except Exception:
+        return None
+    return None
 
-def sector_wedge(center: Tuple[float,float], theta0: float, theta1: float, radius: float, arc_pts: int=64) -> Polygon:
-    """Строит «пирог» (сектор круга) от theta0 до theta1 радиуса radius с вершиной в center."""
-    cx, cy = center
-    while theta1 < theta0:
-        theta1 += 2.0*math.pi
-    ts = np.linspace(theta0, theta1, max(3, int(arc_pts * (theta1-theta0)/(2*math.pi))))
-    pts = [(cx, cy)] + [(cx + radius*math.cos(t), cy + radius*math.sin(t)) for t in ts] + [(cx, cy)]
-    return Polygon(pts)
+def get_floors_value(props: Dict[str,Any]) -> Optional[float]:
+    for k in ("floors", "floors_avg", "floors_num"):
+        if k in props and props[k] is not None:
+            v = _to_float(props[k])
+            if v is not None and v > 0:
+                return v
+    return None
 
-def point_weight_from_props(props: Dict[str,Any]) -> float:
-    """w = living_area/floors (если есть), иначе living_area, иначе 1."""
-    la = None; fl = None
+def get_is_living_value(props: Dict[str,Any]) -> Optional[float]:
+    for k in ("is_living", "living", "is_residential"):
+        if k in props and props[k] is not None:
+            v = _to_float(props[k])
+            if v is not None:
+                return max(0.0, min(1.0, v))
+    return None
+
+def get_living_area_value(props: Dict[str,Any]) -> Optional[float]:
     for k in ("living_area", "la", "area_living", "la_target"):
         if k in props and props[k] is not None:
-            try:
-                la = float(props[k]); break
-            except Exception:
-                pass
-    for k in ("floors", "floors_num", "floors_avg"):
-        if k in props and props[k] is not None:
-            try:
-                fl = float(props[k]); break
-            except Exception:
-                pass
-    if la is not None and fl and fl > 0:
-        return max(1e-9, la / fl)
-    if la is not None:
-        return max(1e-9, la)
-    return 1.0
+            v = _to_float(props[k])
+            if v is not None and v >= 0:
+                return v
+    return None
+
+# ---- Слияние центроидов внутри квартала ----
+
+def merge_centroids(points: List[Point],
+                    props_list: List[Dict[str,Any]],
+                    radius_m: float,
+                    prob_field: str = "e") -> Tuple[List[Point], List[Dict[str,Any]]]:
+    """
+    Кластеризуем центроиды внутри квартала: сортировка по убыванию prob_field,
+    якорь поглощает соседей в радиусе radius_m с меньшей/равной вероятностью.
+    Геометрия кластера = точка якоря.
+    """
+    n = len(points)
+    if n <= 1:
+        return list(points), list(props_list)
+
+    order = sorted(range(n), key=lambda i: _to_float(props_list[i].get(prob_field)) or 0.0, reverse=True)
+    taken = [False]*n
+    m_points: List[Point] = []
+    m_props:  List[Dict[str,Any]] = []
+
+    for idx in order:
+        if taken[idx]:
+            continue
+        # создаём кластер с якорем idx
+        anchor_i = idx
+        anchor_p = points[anchor_i]
+        anchor_pr = props_list[anchor_i]
+        anchor_e = _to_float(anchor_pr.get(prob_field)) or 0.0
+
+        cluster_ids = [anchor_i]
+        taken[anchor_i] = True
+
+        # присоединяем соседей
+        for j in order:
+            if taken[j]:
+                continue
+            pj = points[j]
+            ej = _to_float(props_list[j].get(prob_field)) or 0.0
+            if ej <= anchor_e + 1e-12 and anchor_p.distance(pj) <= radius_m:
+                cluster_ids.append(j)
+                taken[j] = True
+
+        # агрегируем атрибуты
+        floors_vals = [get_floors_value(props_list[k]) for k in cluster_ids]
+        floors_vals = [v for v in floors_vals if v is not None]
+        is_living_vals = [get_is_living_value(props_list[k]) for k in cluster_ids]
+        is_living_vals = [v for v in is_living_vals if v is not None]
+        living_area_vals = [get_living_area_value(props_list[k]) for k in cluster_ids]
+        living_area_vals = [v for v in living_area_vals if v is not None]
+
+        merged = dict(anchor_pr)  # e и прочие поля из якоря
+        if floors_vals:
+            mean_fl = float(sum(floors_vals)/len(floors_vals))
+            merged["floors_avg"] = mean_fl
+            merged["floors"] = int(math.ceil(mean_fl))
+        if is_living_vals:
+            merged["is_living"] = float(sum(is_living_vals)/len(is_living_vals))
+        if living_area_vals:
+            merged["living_area"] = float(sum(living_area_vals))
+
+        # служебные поля слияния
+        infer_ids = []
+        for k in cluster_ids:
+            fid = props_list[k].get("infer_fid")
+            if fid is not None:
+                try:
+                    infer_ids.append(int(fid))
+                except Exception:
+                    pass
+        infer_ids = sorted(set(infer_ids))
+        merged["merged_from"] = infer_ids
+        merged["merged_count"] = int(len(cluster_ids))
+
+        # добавляем слитую точку
+        m_points.append(anchor_p)
+        m_props.append(merged)
+
+    return m_points, m_props
+
+# ---- Граф: построение ребер по радиусу ----
+
+def build_gabriel_knn_edges(points: List[Point],
+                            props_list: List[Dict[str,Any]],
+                            knn_k: int,
+                            block_index: int,
+                            zone_label: str,
+                            eps: float = 1e-9) -> List[Dict[str,Any]]:
+    """
+    Gabriel-graph с предварительным отбором кандидатов по kNN (k ближайших соседей).
+    Кандидаты: для каждого i берём k ближайших j != i. Затем фильтруем по критерию Gabriel:
+    диск с диаметром uv не должен содержать других точек.
+    """
+    edges: List[Dict[str,Any]] = []
+    n = len(points)
+    if n <= 1:
+        return edges
+
+    # Координаты в массив для быстрых дистанций
+    coords = np.array([[p.x, p.y] for p in points], dtype=np.float64)
+
+    # Соберём множество неориентированных кандидатных рёбер по kNN
+    cand = set()
+    for i in range(n):
+        # расстояния от i до всех
+        di = coords - coords[i]
+        d2 = (di[:,0]**2 + di[:,1]**2)
+        # исключаем самого себя
+        d2[i] = np.inf
+        # индексы k ближайших
+        if knn_k >= n:
+            nn_idx = np.argsort(d2)
+        else:
+            nn_idx = np.argpartition(d2, knn_k)[:knn_k]
+        for j in nn_idx:
+            a, b = (i, int(j)) if i < j else (int(j), i)
+            cand.add((a, b))
+
+    # Фильтрация по критерию Gabriel
+    for (i, j) in cand:
+        # середина и радиус (половина длины)
+        mx = 0.5 * (coords[i,0] + coords[j,0])
+        my = 0.5 * (coords[i,1] + coords[j,1])
+        mid = Point(mx, my)
+        dij = math.sqrt((coords[i,0]-coords[j,0])**2 + (coords[i,1]-coords[j,1])**2)
+        r = 0.5 * dij
+
+        if r <= eps:
+            # точка-дубликат или почти совпадение — пропускаем ребро
+            continue
+
+        # Проверяем отсутствие других точек внутри диска диаметра (<= r)
+        violates = False
+        for k in range(n):
+            if k == i or k == j:
+                continue
+            if mid.distance(points[k]) <= r - eps:
+                violates = True
+                break
+        if violates:
+            continue
+
+        # Если прошёл — создаём ребро
+        pi, pj = points[i], points[j]
+        line = LineString([(pi.x, pi.y), (pj.x, pj.y)])
+        length_m = float(pi.distance(pj))
+
+        ui = (props_list[i].get("infer_fid"), props_list[i].get("_source_block_index", block_index))
+        uj = (props_list[j].get("infer_fid"), props_list[j].get("_source_block_index", block_index))
+
+        eprops = {
+            "u": int(ui[0]) if ui[0] is not None else i,
+            "v": int(uj[0]) if uj[0] is not None else j,
+            "u_block": int(ui[1]),
+            "v_block": int(uj[1]),
+            "zone": zone_label,
+            "length_m": length_m,
+            "edge_type": "gabriel_knn",
+            "knn_k": int(knn_k),
+            "graph": "centroid_gabriel_v1",
+            "block_index": int(block_index),
+        }
+        edges.append({"type":"Feature", "geometry": mapping(line), "properties": eprops})
+
+    return edges
 
 # ---- Основной скрипт ----
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch infer + ring/sector partition (Shapely < 2.0)")
+    ap = argparse.ArgumentParser(description="Batch infer + centroid merge + graph (Shapely < 2.0)")
     ap.add_argument("--blocks", required=True, help="Входной GeoJSON (FeatureCollection) кварталов")
-    ap.add_argument("--out", required=True, help="Выходной GeoJSON полигонов-секторов")
-    ap.add_argument("--out-points", default=None, help="Выходной GeoJSON исходных точек для разрезки (по умолчанию <OUT>_points.geojson)")
-    ap.add_argument("--out-infer-polys", default=None, help="Выход GeoJSON полигонов, выданных инференсом (Polygon/MultiPolygon)")
-    ap.add_argument("--out-infer-centroids", default=None, help="Выход GeoJSON центроидов этих полигонов (Point), свойства 1:1")
+    ap.add_argument("--out", required=True, help="Выходной GeoJSON линий графа (LineString)")
+    ap.add_argument("--out-infer-polys", default=None, help="Выход GeoJSON полигонов инференса (Polygon/MultiPolygon)")
+    ap.add_argument("--out-infer-centroids", default=None, help="Выход GeoJSON СЛИТЫХ центроидов (Point)")
     ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
     ap.add_argument("--model-ckpt", required=True, help="Путь к чекпойнту модели (.pt)")
     ap.add_argument("--config", default=None)
     ap.add_argument("--device", default=None, help="cuda|cpu")
     ap.add_argument("--zone-attr", default="zone", help="Имя свойства зоны в кварталах")
-    # Совместимость со «старыми» флагами
+    # targets совместимость
     ap.add_argument("--zones-json", default=None)
     ap.add_argument("--services-json", default=None)
     ap.add_argument("--targets-by-zone", default=None)
@@ -221,26 +369,27 @@ def main():
     ap.add_argument("--people", type=int, default=1000)
     ap.add_argument("--min-services", dest="min_services", action="store_true", default=True)
     ap.add_argument("--no-min-services", dest="min_services", action="store_false")
-    # Инференс
+    # инференс
     ap.add_argument("--infer-slots", type=int, default=256)
     ap.add_argument("--infer-knn", type=int, default=8)
     ap.add_argument("--infer-e-thr", type=float, default=0.5)
     ap.add_argument("--infer-il-thr", type=float, default=0.5)
     ap.add_argument("--infer-sv1-thr", type=float, default=0.5)
-    # Параметры разрезки
-    ap.add_argument("--ring-step-m", type=float, default=60.0, help="Шаг внутренних буферов, м")
-    ap.add_argument("--arc-resolution", type=int, default=96, help="Точность аппроксимации дуг")
-    ap.add_argument("--origin", choices=["ring_centroid","block_centroid"], default="ring_centroid",
-                    help="Центр разбиения на сектора (по умолчанию — центроид каждого кольца)")
+    # слияние центроидов
+    ap.add_argument("--merge-centroids-radius-m", type=float, default=10.0,
+                    help="Радиус слияния центроидов внутри квартала (м)")
+    ap.add_argument("--prob-field", default="e",
+                    help="Имя поля вероятности для сортировки якорей (по умолчанию 'e')")
+    # граф
+    ap.add_argument("--graph-knn-k", type=int, default=4,
+                    help="Число ближайших соседей для кандидатных рёбер в Gabriel-графе (по умолчанию 4)")
 
     args = ap.parse_args()
 
     stem = os.path.splitext(args.out)[0]
-    out_points_path = args.out_points or (stem + "_points.geojson")
     out_infer_polys_path = args.out_infer_polys or (stem + "_infer_polys.geojson")
     out_infer_centroids_path = args.out_infer_centroids or (stem + "_infer_centroids.geojson")
 
-    # Цели по зонам (оставлено для совместимости / передачи в train.py)
     vocab = load_services_vocab_from_artifacts(args.model_ckpt)
     svc_keys = pick_service_keys(vocab)
     targets_by_zone: Dict[str, Dict[str, float]] = {}
@@ -254,11 +403,10 @@ def main():
                                    for z, v in raw_targets.items()}
 
     fc_blocks = read_geojson(args.blocks)
-    out_sector_feats: List[Dict[str,Any]] = []
-    out_point_feats:  List[Dict[str,Any]] = []
+    out_edge_feats: List[Dict[str,Any]] = []
     out_infer_poly_feats: List[Dict[str,Any]] = []
     out_infer_centroid_feats: List[Dict[str,Any]] = []
-    infer_uid = 0  # общий идентификатор пар (полигон<->центроид)
+    infer_uid = 0  # общий идентификатор пар (полигон<->центроид до слияния)
 
     tmpdir = tempfile.mkdtemp(prefix="ked_infer_")
     try:
@@ -291,7 +439,7 @@ def main():
                     services_target[svc_keys["polyclinic"]]   = 1.0
                     services_target[svc_keys["kindergarten"]] = 1.0
 
-            # Инференс одного квартала
+            # Инференс квартала
             cmd = [
                 sys.executable, args.train_script,
                 "--mode", "infer",
@@ -326,172 +474,74 @@ def main():
                 print(f"[ERROR] infer failed for block #{bi} (zone={z}): {e}", file=sys.stderr)
                 continue
 
-            # Читаем результат квартала и вытаскиваем полигоны/точки + веса
+            # Читаем результат квартала и вытаскиваем полигоны + центроиды (до слияния)
             try:
                 blk_out = read_geojson(out_path)
             except Exception as e:
                 print(f"[WARN] failed to read output for block #{bi}: {e}", file=sys.stderr)
                 continue
 
-            pts: List[Point] = []
-            pprops_for_weights: List[Dict[str,Any]] = []
-            weights: List[float] = []
+            centroids_raw: List[Point] = []
+            cprops_raw: List[Dict[str,Any]] = []
 
             for b in blk_out.get("features", []):
                 try:
                     g = shape(b["geometry"])
                     raw_props = dict(b.get("properties") or {})
-
-                    # Нормализованные общие свойства, которые хотим иметь и у полигона, и у его центроида
                     shared_props = dict(raw_props)
                     shared_props.setdefault(args.zone_attr, z)
                     shared_props.setdefault("_source_block_index", bi)
 
                     if isinstance(g, (Polygon, MultiPolygon)) and (not g.is_empty) and (g.area > 0):
-                        # 1) Сохраняем полигон инференса
                         infer_uid += 1
                         shared_props["infer_fid"] = infer_uid
 
+                        # исходный полигон — как есть
                         out_infer_poly_feats.append({
-                            "type":"Feature",
-                            "geometry": mapping(g),
-                            "properties": dict(shared_props)  # строго те же свойства
+                            "type":"Feature", "geometry": mapping(g), "properties": dict(shared_props)
                         })
 
-                        # 2) Его центроид (точка) — со строго идентичными свойствами
+                        # исходный центроид — идёт только во «внутренний» список для слияния
                         c = g.centroid
-                        out_infer_centroid_feats.append({
-                            "type":"Feature",
-                            "geometry": mapping(c),
-                            "properties": dict(shared_props)
-                        })
+                        centroids_raw.append(c)
+                        cprops_raw.append(shared_props)
 
-                        # 3) Точка для разрезки/веса — центроид с тех. полями (может отличаться набором полей)
-                        props_for_point = dict(shared_props)
-                        props_for_point["_ptx"] = c.x
-                        props_for_point["_pty"] = c.y
-                        pts.append(c)
-                        pprops_for_weights.append(props_for_point)
-                        weights.append(point_weight_from_props(shared_props))
-
-                    elif isinstance(g, Point):
-                        # Исходный Point из инференса — идёт только в "points" (для разрезки/весов)
-                        p = g
-                        props_for_point = dict(shared_props)
-                        props_for_point["_ptx"] = p.x
-                        props_for_point["_pty"] = p.y
-                        pts.append(p)
-                        pprops_for_weights.append(props_for_point)
-                        weights.append(point_weight_from_props(shared_props))
                     else:
-                        # Другие типы геометрий игнорируем
                         continue
                 except Exception:
                     continue
 
-            # Сохраняем точки как есть (для последующего анализа и как «источники направлений»)
-            for p, props in zip(pts, pprops_for_weights):
-                out_point_feats.append({
-                    "type":"Feature",
-                    "geometry": mapping(p),
-                    "properties": props
-                })
-
-            if not pts:
-                # Нечего нарезать — следующий блок
-                continue
-
-            # Режем квартал на кольца
-            rings = block_rings(block_geom, step_m=float(args.ring_step_m))
-            if not rings:
-                rings = [block_geom]
-
-            # Общая нормировка весов
-            W = float(sum(max(0.0, w) for w in weights))
-            if W <= 0:
-                weights = [1.0 for _ in weights]
-                W = float(len(weights))
-
-            # Подготовим порядок точек по углу (стабильность разметки)
-            cblk = block_geom.centroid
-            ang_order = np.argsort([math.atan2(p.y - cblk.y, p.x - cblk.x) for p in pts])
-            pts_ord   = [pts[i] for i in ang_order]
-            props_ord = [pprops_for_weights[i] for i in ang_order]
-            w_ord     = [weights[i] for i in ang_order]
-
-            # Угловые доли для каждой точки: 2π * w / W
-            theta_sizes = [2.0*math.pi * (w / W) for w in w_ord]
-
-            # Для каждого кольца делаем сектора
-            for ri, ring in enumerate(rings):
-                if ring.is_empty or ring.area <= 0:
-                    continue
-                # Центр разбиения
-                if args.origin == "block_centroid":
-                    c = (cblk.x, cblk.y)
-                else:
-                    cr = ring.centroid
-                    c = (cr.x, cr.y)
-
-                # Радиус для «пирога»
-                minx, miny, maxx, maxy = ring.bounds
-                R = 1.5 * math.hypot(maxx - minx, maxy - miny)
-
-                # Начальный угол — по первой точке
-                theta0 = math.atan2(pts_ord[0].y - c[1], pts_ord[0].x - c[0])
-
-                for j, (prop_j, dth) in enumerate(zip(props_ord, theta_sizes)):
-                    theta1 = theta0 + dth
-                    wedge = sector_wedge(c, theta0, theta1, R, arc_pts=int(args.arc_resolution))
-                    sect = ring.intersection(wedge)
-                    theta0 = theta1  # следующий сектор начинается с конца предыдущего
-
-                    if sect.is_empty:
-                        continue
-
-                    # Клон свойств точки + служебные поля сектора
-                    pprops_dup = dict(prop_j)
-                    pprops_dup.update({
-                        "ring_index": int(ri),
-                        "sector_index": int(j),
-                        "sector_theta_start_deg": float((theta1 - dth) * 180.0 / math.pi),
-                        "sector_theta_end_deg":   float(theta1 * 180.0 / math.pi),
-                        "sector_area_target": float(ring.area * (dth / (2.0*math.pi))),
-                        "sector_area_actual": float(sect.area),
-                        "partition": "rings_sectors_v1",
-                        "ring_step_m": float(args.ring_step_m),
-                        "origin_mode": args.origin,
+            # Слияние центроидов внутри квартала
+            if centroids_raw:
+                m_points, m_props = merge_centroids(
+                    points=centroids_raw,
+                    props_list=cprops_raw,
+                    radius_m=float(args.merge_centroids_radius_m),
+                    prob_field=str(args.prob_field),
+                )
+                # пишем СЛИТЫЕ центроиды в выход
+                for p, pr in zip(m_points, m_props):
+                    out_infer_centroid_feats.append({
+                        "type":"Feature", "geometry": mapping(p), "properties": pr
                     })
-
-                    # sect может быть MultiPolygon — разобьём на компоненты
-                    if isinstance(sect, MultiPolygon):
-                        for k, gk in enumerate(sect.geoms):
-                            if gk.is_empty or gk.area <= 0:
-                                continue
-                            pk = dict(pprops_dup)
-                            pk["sector_part"] = k
-                            out_sector_feats.append({
-                                "type":"Feature",
-                                "geometry": mapping(gk),
-                                "properties": pk
-                            })
-                    else:
-                        out_sector_feats.append({
-                            "type":"Feature",
-                            "geometry": mapping(sect),
-                            "properties": pprops_dup
-                        })
+                # строим граф по слитым центроидам
+                edges = build_gabriel_knn_edges(
+                    points=m_points,
+                    props_list=m_props,
+                    knn_k=int(args.graph_knn_k),
+                    block_index=bi,
+                    zone_label=z,
+                )
+                out_edge_feats.extend(edges)
 
         # Запись результатов
-        write_geojson(args.out, {"type":"FeatureCollection","features": out_sector_feats})
-        write_geojson(out_points_path, {"type":"FeatureCollection","features": out_point_feats})
+        write_geojson(args.out, {"type":"FeatureCollection","features": out_edge_feats})
         write_geojson(out_infer_polys_path, {"type":"FeatureCollection","features": out_infer_poly_feats})
         write_geojson(out_infer_centroids_path, {"type":"FeatureCollection","features": out_infer_centroid_feats})
 
-        print(f"[OK] sectors:         {len(out_sector_feats)} → {args.out}")
-        print(f"[OK] weight points:   {len(out_point_feats)} → {out_points_path}")
-        print(f"[OK] infer polygons:  {len(out_infer_poly_feats)} → {out_infer_polys_path}")
-        print(f"[OK] infer centroids: {len(out_infer_centroid_feats)} → {out_infer_centroids_path}")
+        print(f"[OK] graph edges:           {len(out_edge_feats)} → {args.out}")
+        print(f"[OK] infer polygons:        {len(out_infer_poly_feats)} → {out_infer_polys_path}")
+        print(f"[OK] merged infer centroids:{len(out_infer_centroid_feats)} → {out_infer_centroids_path}")
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
