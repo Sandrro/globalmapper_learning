@@ -2,84 +2,46 @@
 # -*- coding: utf-8 -*-
 """
 show_sample.py — быстрый просмотр сэмпа из Parquet
-Флаг --non-empty-services оставляет только строки с реально НЕпустым services_capacity.
-Добавлен --debug-services для сводки по типам значений.
+Флаг --non-empty-services оставляет только строки с сервисами (по колонкам has_service__).
+Добавлен --debug-services для сводки по сервисам и их capacity.
 """
-import argparse, sys, json
+import argparse, sys
 import pandas as pd
 import numpy as np
 
-def _strict_has_services(x) -> bool:
-    # None
-    if x is None:
-        return False
+from services_processing import infer_service_schema_from_nodes
 
-    # Явные коллекции Python
-    if isinstance(x, (list, tuple, dict)):
-        try:
-            return len(x) > 0
-        except Exception:
-            return False
 
-    # NumPy массивы (избегаем pd.isna на массивах)
-    if isinstance(x, np.ndarray):
-        if x.size == 0:
-            return False
-        # если объектный массив — проверим элементы рекурсивно
-        if x.dtype == object:
-            for el in x.ravel():
-                if _strict_has_services(el):
-                    return True
-            return False
-        # числовые/строковые массивы тут считаем пустыми (нет структур сервиса)
-        return False
+def _any_service_mask(df: pd.DataFrame, schema) -> pd.Series:
+    if not schema:
+        return pd.Series(False, index=df.index)
+    mask = pd.Series(False, index=df.index)
+    for item in schema:
+        col = item.get("has_column")
+        if col and col in df.columns:
+            mask = mask | df[col].fillna(False).astype(bool)
+    return mask
 
-    # Скаляры NaN (float/np.floating)
-    if isinstance(x, (float, np.floating)):
-        return not np.isnan(x) and False  # скаляр float сам по себе сервиса не описывает
 
-    # Байты/строки — пробуем распарсить JSON
-    if isinstance(x, (str, bytes)):
-        s = x.decode("utf-8") if isinstance(x, bytes) else x
-        s = s.strip()
-        if s in ("", "[]", "{}"):
-            return False
-        try:
-            j = json.loads(s)
-            if isinstance(j, (list, tuple, dict)):
-                return len(j) > 0
-            return False
-        except Exception:
-            # Нестандартизованные строки считаем пустыми в строгом режиме
-            return False
-
-    # Всё остальное — пусто
-    return False
-
-def _debug_services_summary(series: pd.Series):
-    total = len(series)
-    cnt_na = int(series.isna().sum()) if hasattr(series, "isna") else 0
-    as_type = series.apply(lambda v: type(v).__name__ if v is not None else "NA")
-    top_types = as_type.value_counts().head(8)
-    try:
-        as_str = series[as_type.eq("str")].astype(str).str.strip()
-        cnt_str_empty = int((as_str.eq("") | as_str.eq("[]") | as_str.eq("{}")).sum())
-    except Exception:
-        cnt_str_empty = 0
-    mask_strict = series.apply(_strict_has_services)
-    cnt_nonempty = int(mask_strict.sum())
-    print("== DEBUG services_capacity ==")
-    print(f"Всего значений: {total:,}")
-    print(f"NA/пропусков : {cnt_na:,}")
-    print("Топ типов:")
-    for k, v in top_types.items():
-        print(f"  {k}: {v:,}")
-    if cnt_str_empty:
-        print(f'Пустые строковые "[]"/"{{}}"/"" : {cnt_str_empty:,}')
-    print(f"Непустых по строгому правилу: {cnt_nonempty:,}")
-    print("Примеры непустых (до 5):")
-    for val in series[mask_strict].head(5).tolist():
-        print("  ", val)
+def _debug_services_summary(df: pd.DataFrame, schema) -> None:
+    if not schema:
+        print("== DEBUG services ==\nСхема сервисов не обнаружена.")
+        return
+    print("== DEBUG services ==")
+    print(f"Строк всего: {len(df):,}")
+    for item in schema:
+        name = item.get("name")
+        has_col = item.get("has_column")
+        cap_col = item.get("capacity_column")
+        if not has_col or has_col not in df.columns:
+            continue
+        has_vals = df[has_col].fillna(False).astype(bool)
+        cnt = int(has_vals.sum())
+        cap_sum = 0.0
+        if cap_col and cap_col in df.columns:
+            caps = pd.to_numeric(df[cap_col], errors="coerce").fillna(0.0)
+            cap_sum = float(caps[has_vals].sum())
+        print(f"  {name}: count={cnt:,}, capacity_sum={cap_sum:.2f}")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -89,25 +51,19 @@ def main():
     ap.add_argument("--seed", type=int, default=42, help="Зерно для случайного сэмпа")
     ap.add_argument("--cols", type=str, default="", help="Список колонок через запятую")
     ap.add_argument("--non-empty-services", action="store_true",
-                    help="Показывать только строки, где services_capacity непустой (строго)")
+                    help="Показывать только строки, где присутствует хотя бы один сервис")
     ap.add_argument("--debug-services", action="store_true",
-                    help="Вывести сводку по services_capacity перед выборкой")
+                    help="Вывести сводку по сервисам перед выборкой")
     args = ap.parse_args()
 
     user_cols = [c.strip() for c in args.cols.split(",") if c.strip()]
-    read_cols = None
-    if user_cols:
-        if args.non_empty_services and "services_capacity" not in user_cols:
-            read_cols = list(dict.fromkeys(user_cols + ["services_capacity"]))
-        else:
-            read_cols = user_cols
 
     pd.set_option("display.width", 160)
     pd.set_option("display.max_columns", 80)
     pd.set_option("display.max_colwidth", 200)
 
     try:
-        df = pd.read_parquet(args.path, columns=read_cols)
+        df = pd.read_parquet(args.path)
     except Exception as e:
         print(f"[ERR] Не удалось прочитать {args.path}: {e}", file=sys.stderr)
         sys.exit(1)
@@ -117,24 +73,20 @@ def main():
         print(f"Файл: {args.path}\nФайл пустой.")
         return
 
+    service_schema = infer_service_schema_from_nodes(df)
+
     if args.debug_services:
-        if "services_capacity" in df.columns:
-            _debug_services_summary(df["services_capacity"])
-        else:
-            print("== DEBUG services_capacity ==\nКолонка 'services_capacity' отсутствует.")
+        _debug_services_summary(df, service_schema)
 
     if args.non_empty_services:
-        if "services_capacity" not in df.columns:
-            print("[!] Колонка 'services_capacity' не найдена — нечем фильтровать.", file=sys.stderr)
-            sys.exit(2)
-        mask = df["services_capacity"].apply(_strict_has_services)
+        mask = _any_service_mask(df, service_schema)
         df = df[mask]
 
     n_after = len(df)
     if n_after == 0:
         print(f"Файл: {args.path}")
         if args.non_empty_services:
-            print("После фильтрации по непустому services_capacity строк не осталось.")
+            print("После фильтрации по сервисам строк не осталось.")
         else:
             print("Файл пустой.")
         return
@@ -149,7 +101,7 @@ def main():
 
     print(f"Файл: {args.path}")
     if args.non_empty_services:
-        print(f"Строк всего: {n_total:,}; с непустым services_capacity: {n_after:,}; показываю {k}")
+        print(f"Строк всего: {n_total:,}; с сервисами: {n_after:,}; показываю {k}")
     else:
         print(f"Строк всего: {n_total:,}; показываю {k}")
     print("\n--- Сэмп ---")

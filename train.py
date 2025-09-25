@@ -10,7 +10,7 @@ train.py — обучение граф-генератора на иерархи�
 - Выгрузка артефактов на Hugging Face Hub (repo_id, token)
 - Совместимость с PyTorch Geometric (если установлен), иначе fallback на простой MLP по узлам
 - Обработка новых признаков из transform.py: zone label, e_i, pos/size/phi/s_i/a_i,
-  floors_num/has_floors/is_living/living_area, services_present (one-hot), services_capacity (суммарные по словарю)
+  floors_num/has_floors/is_living/living_area, пары has_service__*/service_capacity__*
 
 Ожидаемая структура датасета (из transform.py):
   data_dir/
@@ -18,7 +18,7 @@ train.py — обучение граф-генератора на иерархи�
     branches.parquet [block_id, branch_local_id, length]
     nodes_fixed.parquet [block_id, slot_id, e_i, branch_local_id, posx, posy,
       size_x, size_y, phi_resid, s_i, a_i, floors_num, living_area, is_living,
-      has_floors, services_present, services_capacity, aspect_ratio]
+      has_floors, has_service__*, service_capacity__*, aspect_ratio]
     edges.parquet [block_id, src_slot, dst_slot]
 
 Пример:
@@ -57,6 +57,12 @@ from shapely.affinity import rotate as shp_rotate, scale as shp_scale, translate
 from shapely.ops import unary_union
 import math as _math
 from PIL import Image, ImageDraw
+
+from services_processing import (
+    infer_service_schema_from_nodes,
+    load_service_schema,
+    write_service_schema,
+)
 
 try:
     from sklearn.cluster import KMeans  # опционально
@@ -1054,20 +1060,19 @@ class HCanonGraphDataset(Dataset):
 
         # словарь сервисов
         if os.path.exists(services_json):
-            with open(services_json, "r", encoding="utf-8") as f:
-                self.service2id = json.load(f)
+            schema = load_service_schema(services_json)
         else:
-            vocab = set()
-            for x in self.nodes["services_present"].fillna("").values.tolist():
-                lst = _parse_list_any(x)
-                for s in lst:
-                    vocab.add(str(s))
-            self.service2id = {s:i for i,s in enumerate(sorted(vocab))}
-            _ensure_dir(services_json)
-            with open(services_json, "w", encoding="utf-8") as f:
-                json.dump(self.service2id, f, ensure_ascii=False, indent=2)
-        self.id2service = {v:k for k,v in self.service2id.items()}
-        self.num_services = len(self.service2id)
+            schema = infer_service_schema_from_nodes(self.nodes)
+            if schema:
+                _ensure_dir(services_json)
+                write_service_schema(schema, services_json)
+        self.service_schema: List[Dict[str, str]] = schema
+        self.service_order: List[str] = [item["name"] for item in schema]
+        self.service_has_cols: List[str] = [item["has_column"] for item in schema]
+        self.service_cap_cols: List[str] = [item["capacity_column"] for item in schema]
+        self.service2id = {name: idx for idx, name in enumerate(self.service_order)}
+        self.id2service = {idx: name for name, idx in self.service2id.items()}
+        self.num_services = len(self.service_order)
 
         # индексы блоков и сплит
         self.block_ids = sorted(self.blocks["block_id"].astype(str).unique().tolist())
@@ -1120,8 +1125,7 @@ class HCanonGraphDataset(Dataset):
                     continue
                 has = False
                 for r in g.itertuples(index=False):
-                    m, c = self._services_vecs(getattr(r, "services_present", None),
-                                               getattr(r, "services_capacity", None))
+                    m, c = self._services_vecs(r)
                     if (m.sum() > 0) or (float(np.asarray(c).sum()) > 0):
                         has = True
                         break
@@ -1348,30 +1352,22 @@ class HCanonGraphDataset(Dataset):
             v[idx] = 1.0
         return v
 
-    def _services_vecs(self, present_raw, cap_raw) -> Tuple[np.ndarray, np.ndarray]:
-        present = _parse_list_any(present_raw)
-        cap = _parse_list_any(cap_raw)
+    def _services_vecs(self, row) -> Tuple[np.ndarray, np.ndarray]:
         mhot = np.zeros((self.num_services,), dtype=np.float32)
-        for s in present:
-            sid = self.service2id.get(str(s))
-            if sid is not None:
-                mhot[sid] = 1.0
         cap_vec = np.zeros((self.num_services,), dtype=np.float32)
-        if isinstance(cap, list):
-            if cap and isinstance(cap[0], dict):
-                for it in cap:
-                    sid = self.service2id.get(str(it.get("name")))
-                    if sid is not None:
-                        try:
-                            cap_vec[sid] = float(it.get("value", 0.0))
-                        except Exception:
-                            pass
+        for idx, item in enumerate(self.service_schema):
+            has_col = item.get("has_column")
+            cap_col = item.get("capacity_column")
+            if has_col:
+                has_val = bool(getattr(row, has_col, False))
             else:
-                for i, v in enumerate(cap[:self.num_services]):
-                    try:
-                        cap_vec[i] = float(v)
-                    except Exception:
-                        pass
+                has_val = False
+            mhot[idx] = 1.0 if has_val else 0.0
+            if has_val and cap_col:
+                try:
+                    cap_vec[idx] = float(getattr(row, cap_col, 0.0))
+                except Exception:
+                    cap_vec[idx] = 0.0
         return mhot, cap_vec
 
     def _node_targets(self, df_nodes_block: pd.DataFrame) -> Dict[str, torch.Tensor]:
@@ -1403,8 +1399,7 @@ class HCanonGraphDataset(Dataset):
 
         mhot_list, cap_list = [], []
         for r in df_nodes_block.itertuples(index=False):
-            m, c = self._services_vecs(getattr(r, "services_present", None),
-                                       getattr(r, "services_capacity", None))
+            m, c = self._services_vecs(r)
             mhot_list.append(m); cap_list.append(c)
         if self.num_services > 0:
             sv1 = torch.as_tensor(np.vstack(mhot_list), dtype=torch.float32)
@@ -1497,8 +1492,7 @@ class HCanonGraphDataset(Dataset):
             acc_caps = np.zeros((self.num_services,), dtype=np.float32)
             acc_pres = np.zeros((self.num_services,), dtype=np.float32)
             for r in nodes_b.itertuples(index=False):
-                m, c = self._services_vecs(getattr(r, "services_present", None),
-                                           getattr(r, "services_capacity", None))
+                m, c = self._services_vecs(r)
                 acc_caps += c
                 acc_pres = np.maximum(acc_pres, m)
             svc_block_norm = self._normalizer.encode_svc(torch.tensor(acc_caps, dtype=torch.float32)).view(-1)

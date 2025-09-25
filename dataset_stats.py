@@ -23,6 +23,8 @@ from typing import Any, Dict, List, Tuple
 import numpy as np
 import pandas as pd
 
+from services_processing import infer_service_schema_from_nodes
+
 try:
     from tqdm.auto import tqdm
     TQDM = True
@@ -241,32 +243,28 @@ def main():
                     add("floors", f"{int(k)}", "count", int(v))
 
     # --- services (если есть) ---
-    if ("services_present" in nodes.columns) or ("services_capacity" in nodes.columns):
-        # счётчик по присутствию и суммарной вместимости, только по активным узлам
-        e = np.nan_to_num(nodes["e_i"].values, nan=0.0) > 0.5
+    schema = infer_service_schema_from_nodes(nodes)
+    if schema:
+        e_mask = np.nan_to_num(nodes["e_i"].values, nan=0.0) > 0.5
+        active_nodes = nodes.loc[e_mask].copy()
         present_cnt: Dict[str, int] = {}
         cap_sum: Dict[str, float] = {}
-        it = nodes.loc[e, ["services_present","services_capacity"]].itertuples(index=False)
-        for r in tqdm(it, total=int(e.sum()), disable=not TQDM):
-            present = _maybe_json_to_list(getattr(r, "services_present", None))
-            caps    = _maybe_json_to_list(getattr(r, "services_capacity", None))
-            # present: list[str]
-            for s in present:
-                s = str(s)
-                present_cnt[s] = present_cnt.get(s, 0) + 1
-            # capacity: поддержим оба варианта: [{name, value}] или [v0, v1, ...] (тогда без названий пропустим)
-            if caps and isinstance(caps[0], dict):
-                for obj in caps:
-                    name = str(obj.get("name"))
-                    try:
-                        val = float(obj.get("value", 0.0))
-                    except Exception:
-                        val = 0.0
-                    cap_sum[name] = cap_sum.get(name, 0.0) + val
-        # записываем
-        for s,c in present_cnt.items():
+        for item in schema:
+            name = item.get("name")
+            has_col = item.get("has_column")
+            cap_col = item.get("capacity_column")
+            if not has_col or has_col not in active_nodes.columns:
+                continue
+            has_vals = active_nodes[has_col].fillna(False).astype(bool)
+            present_cnt[name] = int(has_vals.sum())
+            if cap_col and cap_col in active_nodes.columns:
+                caps = pd.to_numeric(active_nodes[cap_col], errors="coerce").fillna(0.0)
+                cap_sum[name] = float(caps[has_vals].sum())
+            else:
+                cap_sum[name] = 0.0
+        for s, c in present_cnt.items():
             add("services", s, "present_count", int(c))
-        for s,v in cap_sum.items():
+        for s, v in cap_sum.items():
             add("services", s, "capacity_sum", float(v))
 
     # --- save CSV ---

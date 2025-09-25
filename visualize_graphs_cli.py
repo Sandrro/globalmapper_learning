@@ -13,7 +13,7 @@ visualize_graphs_cli.py — визуализация получившихся г
 
 Вход:
   - nodes_fixed.parquet, edges.parquet, blocks.parquet из папки результатов (out/),
-  - services.json (опц.): карта service_name -> vector_index, чтобы зафиксировать порядок и палитру.
+  - services.json (опц.): схема сервисов (как создаёт transform_pipeline).
 
 Пример запуска:
   python visualize_graphs_cli.py \
@@ -28,7 +28,6 @@ visualize_graphs_cli.py — визуализация получившихся г
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -39,6 +38,8 @@ import networkx as nx
 import numpy as np
 import pandas as pd
 
+from services_processing import infer_service_schema_from_nodes, load_service_schema
+
 
 # ----------------- utils -----------------
 
@@ -46,79 +47,18 @@ def _ensure_dir(p: str) -> None:
     os.makedirs(p, exist_ok=True)
 
 
-def _load_services(services_json: Optional[str], nodes: pd.DataFrame) -> Tuple[List[str], Dict[str, int]]:
-    """Вернём (ordered_services, name→index). Если services.json не задан, инферим по данным.
-    Поддерживаем два формата services_present в nodes:
-      - список имён сервисов (['school','shop',...]) — предпочтительный;
-      - бинарный вектор 0/1 той же длины, что словарь (как в сырье) — тогда даём имена 'svc_<idx>'.
-    """
+def _load_services(
+    services_json: Optional[str], nodes: pd.DataFrame
+) -> Tuple[List[Dict[str, str]], List[str], Dict[str, int]]:
+    """Вернём (schema, ordered_services, name→index)."""
+    schema = []
     if services_json and os.path.exists(services_json):
-        with open(services_json, "r", encoding="utf-8") as f:
-            mp = json.load(f)  # name -> index
-        # Отсортируем по index
-        items = sorted(((name, idx) for name, idx in mp.items()), key=lambda t: int(t[1]))
-        names = [k for k, _ in items]
-        name2idx = {k: i for i, k in enumerate(names)}
-        return names, name2idx
-
-    # Фолбэк: собрать имена из данных
-    names_set: Dict[str, int] = {}
-    for x in nodes.get("services_present", []):
-        if isinstance(x, str):
-            try:
-                x = json.loads(x)
-            except Exception:
-                x = []
-        if isinstance(x, (list, tuple)):
-            if x and isinstance(x[0], (int, float)):
-                # бинарный вектор 0/1: сопоставим индексы с псевдонимами
-                for i, v in enumerate(x):
-                    try:
-                        if float(v) > 0:
-                            names_set.setdefault(f"svc_{i}", i)
-                    except Exception:
-                        pass
-            else:
-                for name in x:
-                    names_set.setdefault(str(name), len(names_set))
-    if not names_set:
-        # нет сервисов — вернём пустой
-        return [], {}
-    # Отсортировать по индексу вставки
-    ordered = sorted(names_set.items(), key=lambda t: t[1])
-    names = [k for k, _ in ordered]
-    return names, {k: i for i, k in enumerate(names)}
-
-
-def _extract_services_present(row_services: Any, name2idx: Dict[str, int]) -> List[int]:
-    """Вернуть список индексов сервисов для узла.
-    Поддержка форматов: список имён; список 0/1; JSON-строка.
-    """
-    x = row_services
-    if isinstance(x, str):
-        try:
-            x = json.loads(x)
-        except Exception:
-            return []
-    if isinstance(x, (list, tuple)):
-        if not x:
-            return []
-        if isinstance(x[0], (int, float)):
-            # 0/1 вектор
-            idxs = [i for i, v in enumerate(x) if (isinstance(v, (int, float)) and float(v) > 0)]
-            # Отфильтруем по известной карте, если задана
-            if name2idx:
-                kmax = max(name2idx.values())
-                return [i for i in idxs if 0 <= i <= kmax]
-            return idxs
-        else:
-            # список имён
-            out = []
-            for name in x:
-                if str(name) in name2idx:
-                    out.append(name2idx[str(name)])
-            return out
-    return []
+        schema = load_service_schema(services_json)
+    if not schema:
+        schema = infer_service_schema_from_nodes(nodes)
+    names = [item.get("name") for item in schema]
+    name2idx = {name: idx for idx, name in enumerate(names)}
+    return schema, names, name2idx
 
 
 def _node_sizes(living_area: pd.Series, min_size: float = 50.0, max_size: float = 800.0) -> np.ndarray:
@@ -169,7 +109,7 @@ def _draw_pie_node(ax, x: float, y: float, parts: Sequence[float], colors: Seque
 def main() -> int:
     ap = argparse.ArgumentParser("Визуализация графов по зонам")
     ap.add_argument("--dataset-dir", required=True, help="Папка с parquet-файлами (nodes_fixed.parquet, edges.parquet, blocks.parquet)")
-    ap.add_argument("--services-json", default=None, help="Файл services.json (name→index), опционально")
+    ap.add_argument("--services-json", default=None, help="Файл services.json со схемой сервисов, опционально")
     ap.add_argument("--out-dir", required=True, help="Куда класть PNG")
     ap.add_argument("--dpi", type=int, default=200)
     ap.add_argument("--node-radius", type=float, default=0.02, help="Базовый радиус круга для pie-узлов (в долях оси)")
@@ -212,7 +152,7 @@ def main() -> int:
         best_blocks = best_blocks.head(int(args.max_zones))
 
     # Палитра сервисов
-    svc_names, name2idx = _load_services(args.services_json, nodes)
+    service_schema, svc_names, _ = _load_services(args.services_json, nodes)
     colors = _make_palette(len(svc_names) if svc_names else 1)
 
     # Легенда по сервисам (proxy artists)
@@ -301,7 +241,11 @@ def main() -> int:
                 pass
             radius = max(0.2 * base_r, base_r + r_add)
 
-            svc_idxs = _extract_services_present(r.get("services_present"), name2idx)
+            svc_idxs = []
+            for idx, item in enumerate(service_schema):
+                has_col = item.get("has_column")
+                if has_col and bool(r.get(has_col, False)):
+                    svc_idxs.append(idx)
             if not svc_idxs:
                 circ = mpatches.Circle((x, y), radius=radius, fc="lightgray", ec="black", lw=0.6, zorder=3)
                 ax.add_patch(circ)
