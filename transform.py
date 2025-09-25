@@ -18,7 +18,7 @@ transform.py
 """
 
 import os, sys, math, time, logging, argparse, multiprocessing as mp
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -31,6 +31,13 @@ import networkx as nx
 import json
 import signal
 from contextlib import contextmanager
+
+from services_processing import (
+    DEFAULT_CAPACITY_FIELDS,
+    DEFAULT_EXCLUDED_SERVICES,
+    attach_services_to_buildings,
+    write_service_schema,
+)
 
 # --- tqdm (optional) ---
 try:
@@ -467,18 +474,50 @@ def fast_assign_blocks(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, log_pr
     return out
 
 # ----------------- EMPTY PAYLOAD HELPER -----------------
-def _empty_block_payload(blk_id: str, zone, mask_path: str, N: int) -> Dict[str, Any]:
+def _empty_block_payload(
+    blk_id: str,
+    zone,
+    mask_path: str,
+    N: int,
+    service_schema: Optional[List[Dict[str, str]]] = None,
+) -> Dict[str, Any]:
     block_row = {
-        "block_id": blk_id, "zone": zone,
-        "n_buildings": 0, "n_branches": 0, "scale_l": 0.0, "mask_path": mask_path
+        "block_id": blk_id,
+        "zone": zone,
+        "n_buildings": 0,
+        "n_branches": 0,
+        "scale_l": 0.0,
+        "mask_path": mask_path,
     }
-    nodes = [{
-        "block_id": blk_id, "slot_id": i, "e_i": 0, "branch_local_id": -1,
-        "posx": 0.0, "posy": 0.0, "size_x": 0.0, "size_y": 0.0, "phi_resid": 0.0,
-        "s_i": 0, "a_i": 0.0, "floors_num": pd.NA, "living_area": 0.0,
-        "is_living": False, "has_floors": False,
-        "services_present": [], "services_capacity": [], "aspect_ratio": 0.0
-    } for i in range(N)]
+    schema = service_schema or []
+    nodes: List[Dict[str, Any]] = []
+    for i in range(N):
+        node: Dict[str, Any] = {
+            "block_id": blk_id,
+            "slot_id": i,
+            "e_i": 0,
+            "branch_local_id": -1,
+            "posx": 0.0,
+            "posy": 0.0,
+            "size_x": 0.0,
+            "size_y": 0.0,
+            "phi_resid": 0.0,
+            "s_i": 0,
+            "a_i": 0.0,
+            "floors_num": pd.NA,
+            "living_area": 0.0,
+            "is_living": False,
+            "has_floors": False,
+            "aspect_ratio": 0.0,
+        }
+        for item in schema:
+            has_col = item.get("has_column")
+            cap_col = item.get("capacity_column")
+            if has_col:
+                node[has_col] = False
+            if cap_col:
+                node[cap_col] = 0.0
+        nodes.append(node)
     return {"block": block_row, "branches": [], "nodes": nodes, "edges": []}
 
 # ----------------- worker: per-block save + timeout -----------------
@@ -516,6 +555,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
     mask_dir    = task["mask_dir"]
     timeout_sec = int(task.get("timeout_sec", 300))
     out_dir     = task["out_dir"]
+    service_schema: List[Dict[str, str]] = list(task.get("service_schema", []))
 
     mask_path = os.path.join(mask_dir, f"{blk_id}.png")
 
@@ -541,13 +581,13 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             pass
         if poly is None:
             # пустой квартал
-            payload = _empty_block_payload(blk_id, zone, mask_path, N)
+            payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
             _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
             return {"block_id": blk_id, "status": "ok_empty"}
 
     if not rows_bldgs:
         scale_l = float(block_scale_l(poly, [])) if poly is not None else 0.0
-        payload = _empty_block_payload(blk_id, zone, mask_path, N)
+        payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
         payload["block"]["scale_l"] = scale_l
         _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
         return {"block_id": blk_id, "status": "ok_empty"}
@@ -582,7 +622,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                 a = dict(r); a.pop("geometry", None)
                 attrs.append(a)
             if len(g_geoms) == 0:
-                payload = _empty_block_payload(blk_id, zone, mask_path, N)
+                payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
                 payload["block"]["scale_l"] = scale_l
                 _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
                 return {"block_id": blk_id, "status": "ok_empty"}
@@ -648,7 +688,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                 if slot >= N: break
 
             # 6) nodes
-            nodes = []
+            nodes: List[Dict[str, Any]] = []
             for slot_id, j, k in slot_meta:
                 feat = per_branch[j]
                 r = feat["rows"].iloc[k]
@@ -656,11 +696,15 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                 a_vec = feat.get("a", [])
                 s_i = int(s_vec[k]) if isinstance(s_vec, (list, tuple, np.ndarray)) and _safe_len(s_vec) > k else 0
                 a_i = float(a_vec[k]) if isinstance(a_vec, (list, tuple, np.ndarray)) and _safe_len(a_vec) > k else 0.0
-                nodes.append({
-                    "block_id": blk_id, "slot_id": slot_id, "e_i": 1,
+                node: Dict[str, Any] = {
+                    "block_id": blk_id,
+                    "slot_id": slot_id,
+                    "e_i": 1,
                     "branch_local_id": int(j),
-                    "posx": float(feat["pos"][k, 0]), "posy": float(feat["pos"][k, 1]),
-                    "size_x": float(feat["size"][k, 0]), "size_y": float(feat["size"][k, 1]),
+                    "posx": float(feat["pos"][k, 0]),
+                    "posy": float(feat["pos"][k, 1]),
+                    "size_x": float(feat["size"][k, 0]),
+                    "size_y": float(feat["size"][k, 1]),
                     "phi_resid": float(feat["phi"][k]),
                     "s_i": s_i,
                     "a_i": a_i,
@@ -668,20 +712,50 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                     "living_area": float(r.get("living_area", 0.0)),
                     "is_living": bool(r.get("is_living", False)),
                     "has_floors": bool(r.get("has_floors", False)),
-                    "services_present": list(r.get("services_present", [])),
-                    "services_capacity": list(r.get("services_capacity", [])),
-                    "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", []))>k else 0.0,
-                })
+                    "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", [])) > k else 0.0,
+                }
+                for item in service_schema:
+                    has_col = item.get("has_column")
+                    cap_col = item.get("capacity_column")
+                    has_val = False
+                    if has_col:
+                        has_val = bool(r.get(has_col, False))
+                        node[has_col] = has_val
+                    if cap_col:
+                        try:
+                            cap_val = float(r.get(cap_col, 0.0)) if has_val else 0.0
+                        except Exception:
+                            cap_val = 0.0
+                        node[cap_col] = cap_val
+                nodes.append(node)
 
             for slot_id in range(len(nodes), N):
-                nodes.append({
-                    "block_id": blk_id, "slot_id": slot_id, "e_i": 0,
+                empty_node: Dict[str, Any] = {
+                    "block_id": blk_id,
+                    "slot_id": slot_id,
+                    "e_i": 0,
                     "branch_local_id": -1,
-                    "posx": 0.0, "posy": 0.0, "size_x": 0.0, "size_y": 0.0, "phi_resid": 0.0,
-                    "s_i": 0, "a_i": 0.0, "floors_num": pd.NA, "living_area": 0.0,
-                    "is_living": False, "has_floors": False,
-                    "services_present": [], "services_capacity": [], "aspect_ratio": 0.0
-                })
+                    "posx": 0.0,
+                    "posy": 0.0,
+                    "size_x": 0.0,
+                    "size_y": 0.0,
+                    "phi_resid": 0.0,
+                    "s_i": 0,
+                    "a_i": 0.0,
+                    "floors_num": pd.NA,
+                    "living_area": 0.0,
+                    "is_living": False,
+                    "has_floors": False,
+                    "aspect_ratio": 0.0,
+                }
+                for item in service_schema:
+                    has_col = item.get("has_column")
+                    cap_col = item.get("capacity_column")
+                    if has_col:
+                        empty_node[has_col] = False
+                    if cap_col:
+                        empty_node[cap_col] = 0.0
+                nodes.append(empty_node)
 
             # 7) edges
             edges = []
@@ -728,34 +802,15 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             "zone": zone,
             "poly_wkb": poly_wkb,
             "bldgs_rows": rows_bldgs,
+            "service_schema": service_schema,
         }
 
-# ----------------- ORPHANS / TIMEOUT DUMPS -----------------
-def _json_safe_list(v) -> str:
-    try:
-        if v is None:
-            return "[]"
-        lst = list(v)
-        out = []
-        for x in lst:
-            if isinstance(x, (np.integer,)):
-                out.append(int(x))
-            elif isinstance(x, (np.floating,)):
-                out.append(float(x))
-            else:
-                out.append(x)
-        return json.dumps(out)
-    except Exception:
-        return "[]"
-
+# ----------------- ORPHANS / TIMEOUT DУMPS -----------------
 def _dump_orphans(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, out_dir: str):
     os.makedirs(out_dir, exist_ok=True)
 
     orphan_b = bldgs[bldgs["block_id"].isna()].copy()
     if not orphan_b.empty:
-        for col in ("services_present", "services_capacity"):
-            if col in orphan_b.columns:
-                orphan_b[col] = orphan_b[col].apply(_json_safe_list)
         outb = os.path.join(out_dir, "orphaned_buildings.geojson")
         try:
             orphan_b.to_file(outb, driver="GeoJSON")
@@ -773,9 +828,16 @@ def _dump_orphans(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, out_dir: st
         except Exception as e:
             log.warning(f"orphaned_blocks: не удалось сохранить GeoJSON: {e}")
 
-def _dump_timeouts(timeout_packets: List[Dict[str, Any]], out_dir: str, crs) -> None:
-    if not timeout_packets: return
+def _dump_timeouts(
+    timeout_packets: List[Dict[str, Any]],
+    out_dir: str,
+    crs,
+    service_schema: Optional[List[Dict[str, str]]] = None,
+) -> None:
+    if not timeout_packets:
+        return
     rows = []
+    schema_default = service_schema or []
     for item in timeout_packets:
         blk_id = item.get("block_id")
         zone   = item.get("zone")
@@ -792,7 +854,7 @@ def _dump_timeouts(timeout_packets: List[Dict[str, Any]], out_dir: str, crs) -> 
                 g = None
             if g is None or g.is_empty:
                 continue
-            rows.append({
+            row = {
                 "kind": "building",
                 "block_id": blk_id,
                 "building_id": r.get("building_id"),
@@ -800,11 +862,22 @@ def _dump_timeouts(timeout_packets: List[Dict[str, Any]], out_dir: str, crs) -> 
                 "living_area": float(r.get("living_area", 0.0)),
                 "is_living": bool(r.get("is_living", False)),
                 "has_floors": bool(r.get("has_floors", False)),
-                "services_present": _json_safe_list(r.get("services_present", [])),
-                "services_capacity": _json_safe_list(r.get("services_capacity", [])),
                 "geometry": g,
-            })
-    if not rows: return
+            }
+            schema_iter = schema_default or list(item.get("service_schema") or [])
+            for item_schema in schema_iter:
+                has_col = item_schema.get("has_column")
+                cap_col = item_schema.get("capacity_column")
+                if has_col:
+                    row[has_col] = bool(r.get(has_col, False))
+                if cap_col:
+                    try:
+                        row[cap_col] = float(r.get(cap_col, 0.0))
+                    except Exception:
+                        row[cap_col] = 0.0
+            rows.append(row)
+    if not rows:
+        return
     gdf = gpd.GeoDataFrame(pd.DataFrame(rows), geometry="geometry", crs=crs)
     outp = os.path.join(out_dir, "timeout.geojson")
     try:
@@ -850,6 +923,20 @@ def main():
     ap.add_argument("--mask-size", type=int, default=64)
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--block-timeout-sec", type=int, default=300, help="Таймаут на обработку одного квартала (сек)")
+    ap.add_argument("--services", type=str, default=None, help="GeoJSON с сервисами")
+    ap.add_argument(
+        "--services-capacity-fields",
+        type=str,
+        default=",".join(DEFAULT_CAPACITY_FIELDS),
+        help="Поля ёмкости в сервисах (через запятую)",
+    )
+    ap.add_argument(
+        "--services-exclude",
+        type=str,
+        default=",".join(DEFAULT_EXCLUDED_SERVICES),
+        help="Названия сервисов, которые нужно игнорировать (через запятую)",
+    )
+    ap.add_argument("--out-services-json", type=str, default=None, help="Куда сохранить services.json")
     ap.add_argument("--log-level", type=str, default="INFO")
     args = ap.parse_args()
 
@@ -864,18 +951,34 @@ def main():
     log.info("Загрузка данных…")
     blocks = load_vector(args.blocks)
     bldgs  = load_vector(args.buildings)
+    services = load_vector(args.services) if args.services else None
 
     log.info(f"Приведение CRS к {target_crs}…")
     blocks = to_metric_crs(blocks, target_crs)
     bldgs  = to_metric_crs(bldgs, target_crs)
+    if services is not None:
+        services = to_metric_crs(services, target_crs)
 
     log.info("Починка геометрий…")
     blocks["geometry"] = ensure_valid_series(blocks.geometry)
     bldgs["geometry"]  = ensure_valid_series(bldgs.geometry)
+    if services is not None:
+        services["geometry"] = ensure_valid_series(services.geometry)
 
     blocks = blocks.reset_index(drop=True).copy()
     bldgs  = bldgs.reset_index(drop=True).copy()
-    blocks["block_id"]   = blocks.index.astype(str)
+    service_schema: List[Dict[str, str]] = []
+    if services is not None and not services.empty:
+        cap_fields = [c.strip() for c in str(args.services_capacity_fields).split(",") if c.strip()]
+        exclude_names = [c.strip() for c in str(args.services_exclude).split(",") if c.strip()]
+        bldgs, service_schema = attach_services_to_buildings(
+            bldgs,
+            services.reset_index(drop=True).copy(),
+            capacity_fields=cap_fields,
+            exclude_names=exclude_names,
+        )
+    blocks["block_id"] = blocks.index.astype(str)
+    bldgs = bldgs.reset_index(drop=True).copy()
     bldgs["building_id"] = bldgs.index.astype(str)
     if "zone" not in blocks.columns:
         blocks["zone"] = pd.NA
@@ -900,19 +1003,21 @@ def main():
     if "floors_num" not in bldgs.columns and "storeys_count" in bldgs.columns:
         bldgs["floors_num"] = bldgs["storeys_count"]
     for k, default in {
-        "floors_num": pd.NA, "living_area": 0.0, "is_living": False, "has_floors": False,
-        "services_present": None, "services_capacity": None
+        "floors_num": pd.NA,
+        "living_area": 0.0,
+        "is_living": False,
+        "has_floors": False,
     }.items():
         if k not in bldgs.columns: bldgs[k] = default
     bldgs["floors_num"] = bldgs["floors_num"].astype("Int64")
     bldgs["living_area"] = pd.to_numeric(bldgs["living_area"], errors="coerce").fillna(0.0).astype(float)
     bldgs["is_living"] = bldgs["is_living"].astype(bool)
     bldgs["has_floors"] = bldgs["has_floors"].astype(bool)
-    def _as_list(x):
-        if isinstance(x, (list, tuple, np.ndarray)): return list(x)
-        return [] if pd.isna(x) else []
-    bldgs["services_present"]  = bldgs["services_present"].apply(_as_list)
-    bldgs["services_capacity"] = bldgs["services_capacity"].apply(_as_list)
+
+    if service_schema:
+        out_json_path = args.out_services_json or os.path.join(args.out_dir, "services.json")
+        write_service_schema(service_schema, out_json_path)
+        log.info(f"[ok] services.json → {out_json_path} (|types|={len(service_schema)})")
 
     # ---------- задачи для воркеров ----------
     log.info("Формирование заданий по кварталам…")
@@ -928,20 +1033,30 @@ def main():
         rows_bldgs = []
         if not sub.empty:
             for r in sub.itertuples(index=False):
-                rows_bldgs.append({
+                row_dict: Dict[str, Any] = {
                     "building_id": r.building_id,
                     "geometry": geom_to_wkb(getattr(r, "geometry")),
                     "floors_num": getattr(r, "floors_num", pd.NA),
                     "living_area": getattr(r, "living_area", 0.0),
                     "is_living": bool(getattr(r, "is_living", False)),
                     "has_floors": bool(getattr(r, "has_floors", False)),
-                    "services_present": list(getattr(r, "services_present", [])),
-                    "services_capacity": list(getattr(r, "services_capacity", [])),
-                })
+                }
+                for item in service_schema:
+                    has_col = item.get("has_column")
+                    cap_col = item.get("capacity_column")
+                    if has_col:
+                        row_dict[has_col] = bool(getattr(r, has_col, False))
+                    if cap_col:
+                        try:
+                            row_dict[cap_col] = float(getattr(r, cap_col, 0.0))
+                        except Exception:
+                            row_dict[cap_col] = 0.0
+                rows_bldgs.append(row_dict)
         tasks.append({
             "block_id": blk_id, "zone": row["zone"], "poly_wkb": row["poly_wkb"],
             "bldgs_rows": rows_bldgs, "N": args.N, "mask_size": args.mask_size, "mask_dir": mask_dir,
-            "timeout_sec": int(args.block_timeout_sec), "out_dir": args.out_dir
+            "timeout_sec": int(args.block_timeout_sec), "out_dir": args.out_dir,
+            "service_schema": service_schema,
         })
 
     num_workers = max(1, int(args.num_workers))
@@ -954,7 +1069,7 @@ def main():
 
     # собрать таймауты
     timeouts = [r for r in results if r and r.get("status") == "timeout"]
-    _dump_timeouts(timeouts, args.out_dir, crs=blocks.crs)
+    _dump_timeouts(timeouts, args.out_dir, crs=blocks.crs, service_schema=service_schema)
 
     # ---------- Мердж per-block parquet в общие 4 файла ----------
     log.info("Сборка результатов и запись Parquet…")

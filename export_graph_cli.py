@@ -51,6 +51,8 @@ import numpy as np
 import pandas as pd
 from networkx.readwrite import json_graph
 
+from services_processing import infer_service_schema_from_nodes
+
 
 # ----------------- helpers -----------------
 
@@ -163,6 +165,8 @@ def build_graph_for_block(
     G: nx.Graph
     G = nx.Graph() if undirected else nx.DiGraph()
 
+    service_schema = infer_service_schema_from_nodes(sub_nodes)
+
     for r in sub_nodes.itertuples(index=False):
         sid = getattr(r, "slot_id", None)
         if pd.isna(sid):
@@ -186,10 +190,16 @@ def build_graph_for_block(
             "aspect_ratio": getattr(r, "aspect_ratio", None),
             "branch_local_id": getattr(r, "branch_local_id", None),
         }
-        if "services_present" in sub_nodes.columns:
-            attr["services_present"] = _as_json_str(getattr(r, "services_present"))
-        if "services_capacity" in sub_nodes.columns:
-            attr["services_capacity"] = _as_json_str(getattr(r, "services_capacity"))
+        for item in service_schema:
+            has_col = item.get("has_column")
+            cap_col = item.get("capacity_column")
+            if has_col:
+                attr[has_col] = bool(getattr(r, has_col, False))
+            if cap_col:
+                try:
+                    attr[cap_col] = float(getattr(r, cap_col, 0.0))
+                except Exception:
+                    attr[cap_col] = 0.0
         G.add_node(sid, **_clean_attrs(attr))
 
     seen_undirected: set[Tuple[int, int]] = set()

@@ -4,9 +4,10 @@
 transform_pipeline_cli.py — оркестратор пайплайна иерархической канонизации
 
 Этапы:
-  1) Загрузка кварталов/зданий, CRS → метрический, починка геометрий.
+  1) Загрузка кварталов/зданий/сервисов, CRS → метрический, починка геометрий.
   2) Быстрый assign зданий → кварталам (STRtree + prepared.contains + fallback по пересечению).
-  3) Нормализация сервисов (в т.ч. бин-векторы по service_type_map.csv → имена) и экспорт services.json.
+  3) Интеграция сервисов: агрегирование по зданиям, добавление синтетических зданий и генерация колонок
+     has_service__*/service_capacity__* вместе со схемой services.json.
   4) Параллельная per-block обработка (ветви, канон-фичи, маски, parquet на блок).
   5) Сборка по дереву by_block/*/*.parquet → четыре глобальных parquet в out/.
   6) Дампы orphaned_buildings.geojson / orphaned_blocks.geojson и timeout.geojson.
@@ -14,7 +15,7 @@ transform_pipeline_cli.py — оркестратор пайплайна иера
 Модули проекта:
   - geo_common.py (I/O, CRS, WKB, маски, масштаб)
   - assign_blocks_cli.py (fast_assign_blocks)
-  - services_utils.py (карта сервисов и нормализация колонок)
+  - services_processing.py (агрегация сервисов и описание схемы)
   - per_block_worker.py (worker_process_block)
 
 Пример запуска:
@@ -24,14 +25,13 @@ transform_pipeline_cli.py — оркестратор пайплайна иера
     --target-crs EPSG:3857 \
     --out-dir out \
     --N 120 --mask-size 64 --num-workers 8 --block-timeout-sec 300 \
-    --services-map service_type_map.csv --out-services-json out/services.json \
+    --services data/services.geojson --out-services-json out/services.json \
     --min-branch-len 5.0 --branch-simplify-tol 0.2 \
     --log-level INFO
 """
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import time
@@ -51,7 +51,12 @@ from geo_common import (
     geom_from_wkb,
 )
 from assign_blocks_cli import fast_assign_blocks
-from services_utils import load_service_map_csv, write_services_json, normalize_services_columns
+from services_processing import (
+    DEFAULT_CAPACITY_FIELDS,
+    DEFAULT_EXCLUDED_SERVICES,
+    attach_services_to_buildings,
+    write_service_schema,
+)
 from per_block_worker import worker_process_block
 
 log = logging.getLogger("transform_pipeline")
@@ -66,164 +71,8 @@ def setup_logger(level: str = "INFO") -> None:
         datefmt="%H:%M:%S",
     )
 
-import json
 import numpy as np
 import pandas as pd
-
-def _coerce_services_present(val, service_map=None):
-    """
-    Привести произвольное значение к списку индексов сервисов (List[int]).
-    Поддерживает: None/NaN/"" → []; JSON-строку; list/tuple; np.ndarray; dict; 
-    бинарный/емкостной вектор длиной == |service_map|.
-    """
-    if val is None:
-        return []
-    # NaN
-    try:
-        if isinstance(val, (float, np.floating)) and np.isnan(val):
-            return []
-    except Exception:
-        pass
-
-    # JSON-строка
-    if isinstance(val, (str, bytes)):
-        s = val.decode("utf-8") if isinstance(val, bytes) else val
-        s = s.strip()
-        if s in ("", "[]", "{}"):
-            return []
-        try:
-            parsed = json.loads(s)
-            return _coerce_services_present(parsed, service_map)
-        except Exception:
-            # строка без JSON — считаем пустой
-            return []
-
-    # numpy массив
-    if isinstance(val, np.ndarray):
-        if val.size == 0:
-            return []
-        # если это вероятно бинарный/емкостной вектор по всей карте
-        if service_map and val.ndim == 1 and val.shape[0] == len(service_map):
-            idx = np.where(np.asarray(val) > 0)[0].tolist()
-            return [int(i) for i in idx]
-        # иначе предполагаем, что это уже список индексов
-        return [int(x) for x in val.tolist() if x is not None and not (isinstance(x, float) and np.isnan(x))]
-
-    # dict: {service_name or idx: capacity/value}
-    if isinstance(val, dict):
-        out = []
-        for k, v in val.items():
-            present = False
-            try:
-                present = (float(v) > 0)
-            except Exception:
-                present = bool(v)
-            if not present:
-                continue
-            # ключ может быть именем сервиса или индексом
-            if isinstance(k, (int, np.integer)):
-                out.append(int(k))
-            else:
-                if service_map and k in service_map:
-                    out.append(int(service_map[k]))
-        return sorted(set(out))
-
-    # list/tuple уже из индексов или имён
-    if isinstance(val, (list, tuple)):
-        out = []
-        for x in val:
-            if x is None or (isinstance(x, float) and np.isnan(x)):
-                continue
-            if isinstance(x, (int, np.integer)):
-                out.append(int(x))
-            elif isinstance(x, str) and service_map and x in service_map:
-                out.append(int(service_map[x]))
-            # прочее игнорируем
-        return sorted(set(out))
-
-    return []
-
-
-def _coerce_services_capacity(val, present_idx=None, service_map=None):
-    """
-    Привести емкости к списку float. Если передан полный вектор по всей карте,
-    он будет спроецирован на present_idx.
-    """
-    if val is None:
-        return []
-    # JSON-строка
-    if isinstance(val, (str, bytes)):
-        s = val.decode("utf-8") if isinstance(val, bytes) else val
-        s = s.strip()
-        if s in ("", "[]", "{}"):
-            return []
-        try:
-            parsed = json.loads(s)
-            return _coerce_services_capacity(parsed, present_idx, service_map)
-        except Exception:
-            return []
-
-    # numpy массив
-    if isinstance(val, np.ndarray):
-        if val.size == 0:
-            return []
-        arr = np.asarray(val).astype(float)
-        # полный вектор по всей карте
-        if service_map and arr.ndim == 1 and arr.shape[0] == len(service_map):
-            if not present_idx:
-                idx = np.where(arr > 0)[0].tolist()
-                return [float(arr[i]) for i in idx]
-            return [float(arr[i]) for i in present_idx]
-        # уже список емкостей под те же индексы
-        return [float(x) for x in arr.tolist()]
-
-    # dict: {service_name or idx: capacity}
-    if isinstance(val, dict):
-        out_map = {}
-        for k, v in val.items():
-            cap = None
-            try:
-                cap = float(v)
-            except Exception:
-                continue
-            if isinstance(k, (int, np.integer)):
-                out_map[int(k)] = cap
-            elif isinstance(k, str) and service_map and k in service_map:
-                out_map[int(service_map[k])] = cap
-        if present_idx:
-            return [float(out_map.get(i, 0.0)) for i in present_idx]
-        # иначе отдаём положительные
-        return [float(c) for i, c in sorted(out_map.items()) if c > 0]
-
-    # list/tuple — уже емкости (предполагаем ту же длину, что и present_idx)
-    if isinstance(val, (list, tuple)):
-        try:
-            caps = [float(x) for x in val]
-        except Exception:
-            return []
-        return caps
-
-    return []
-
-
-# ----------------- ORPHANS / TIMEOUT DUMPS -----------------
-
-def _json_safe_list(v) -> str:
-    try:
-        if v is None:
-            return "[]"
-        lst = list(v)
-        out = []
-        for x in lst:
-            if isinstance(x, (np.integer,)):
-                out.append(int(x))
-            elif isinstance(x, (np.floating,)):
-                out.append(float(x))
-            else:
-                out.append(x)
-        return json.dumps(out)
-    except Exception:
-        return "[]"
 
 
 def dump_orphans_files(
@@ -235,9 +84,6 @@ def dump_orphans_files(
 
     orphan_b = bldgs[bldgs["block_id"].isna()].copy()
     if not orphan_b.empty:
-        for col in ("services_present", "services_capacity"):
-            if col in orphan_b.columns:
-                orphan_b[col] = orphan_b[col].apply(_json_safe_list)
         outb = os.path.join(out_dir, "orphaned_buildings.geojson")
         try:
             orphan_b.to_file(outb, driver="GeoJSON")
@@ -256,10 +102,13 @@ def dump_orphans_files(
             log.warning(f"orphaned_blocks: не удалось сохранить GeoJSON: {e}")
 
 
-def dump_timeouts(timeout_packets: List[Dict[str, Any]], out_dir: str, crs) -> None:
+def dump_timeouts(
+    timeout_packets: List[Dict[str, Any]], out_dir: str, crs, service_schema: Optional[List[Dict[str, str]]] = None
+) -> None:
     if not timeout_packets:
         return
     rows: List[Dict[str, Any]] = []
+    schema = service_schema or []
     for item in timeout_packets:
         blk_id = item.get("block_id")
         zone = item.get("zone")
@@ -276,20 +125,27 @@ def dump_timeouts(timeout_packets: List[Dict[str, Any]], out_dir: str, crs) -> N
                 g = None
             if g is None or g.is_empty:
                 continue
-            rows.append(
-                {
-                    "kind": "building",
-                    "block_id": blk_id,
-                    "building_id": r.get("building_id"),
-                    "floors_num": (None if pd.isna(r.get("floors_num")) else int(r.get("floors_num"))),
-                    "living_area": float(r.get("living_area", 0.0)),
-                    "is_living": bool(r.get("is_living", False)),
-                    "has_floors": bool(r.get("has_floors", False)),
-                    "services_present": _json_safe_list(r.get("services_present", [])),
-                    "services_capacity": _json_safe_list(r.get("services_capacity", [])),
-                    "geometry": g,
-                }
-            )
+            row = {
+                "kind": "building",
+                "block_id": blk_id,
+                "building_id": r.get("building_id"),
+                "floors_num": (None if pd.isna(r.get("floors_num")) else int(r.get("floors_num"))),
+                "living_area": float(r.get("living_area", 0.0)),
+                "is_living": bool(r.get("is_living", False)),
+                "has_floors": bool(r.get("has_floors", False)),
+                "geometry": g,
+            }
+            for item_schema in schema:
+                has_col = item_schema.get("has_column")
+                cap_col = item_schema.get("capacity_column")
+                if has_col:
+                    row[has_col] = bool(r.get(has_col, False))
+                if cap_col:
+                    try:
+                        row[cap_col] = float(r.get(cap_col, 0.0))
+                    except Exception:
+                        row[cap_col] = 0.0
+            rows.append(row)
     if not rows:
         return
     gdf = gpd.GeoDataFrame(pd.DataFrame(rows), geometry="geometry", crs=crs)
@@ -363,7 +219,19 @@ def main() -> int:
     ap.add_argument("--num-workers", type=int, default=4)
     ap.add_argument("--block-timeout-sec", type=int, default=300)
 
-    ap.add_argument("--services-map", type=str, default=None, help="CSV service_type_name,vector_index")
+    ap.add_argument("--services", type=str, default=None, help="GeoJSON с сервисами")
+    ap.add_argument(
+        "--services-capacity-fields",
+        type=str,
+        default=",".join(DEFAULT_CAPACITY_FIELDS),
+        help="Поля ёмкости в GeoJSON сервисов (через запятую)",
+    )
+    ap.add_argument(
+        "--services-exclude",
+        type=str,
+        default=",".join(DEFAULT_EXCLUDED_SERVICES),
+        help="Названия сервисов, которые нужно игнорировать (через запятую)",
+    )
     ap.add_argument("--out-services-json", type=str, default=None, help="Куда сохранить services.json")
 
     ap.add_argument("--min-branch-len", type=float, default=0.0)
@@ -389,16 +257,21 @@ def main() -> int:
     log.info("Загрузка данных…")
     blocks = load_vector(args.blocks)
     bldgs = load_vector(args.buildings)
+    services = load_vector(args.services) if args.services else None
 
     # 2) CRS
     log.info(f"Приведение CRS к {target_crs}…")
     blocks = to_metric_crs(blocks, target_crs)
     bldgs = to_metric_crs(bldgs, target_crs)
+    if services is not None:
+        services = to_metric_crs(services, target_crs)
 
     # 3) Валидность геометрий
     log.info("Починка геометрий…")
     blocks["geometry"] = ensure_valid_series(blocks.geometry)
     bldgs["geometry"] = ensure_valid_series(bldgs.geometry)
+    if services is not None:
+        services["geometry"] = ensure_valid_series(services.geometry)
 
     # Идентификаторы
     blocks = blocks.reset_index(drop=True).copy()
@@ -408,8 +281,18 @@ def main() -> int:
         blocks["block_id"] = blocks["block_id"].astype(str)
 
     bldgs = bldgs.reset_index(drop=True).copy()
-    if "building_id" not in bldgs.columns:
-        bldgs["building_id"] = bldgs.index.astype(str)
+    service_schema: List[Dict[str, str]] = []
+    if services is not None and not services.empty:
+        cap_fields = [c.strip() for c in str(args.services_capacity_fields).split(",") if c.strip()]
+        exclude_names = [c.strip() for c in str(args.services_exclude).split(",") if c.strip()]
+        bldgs, service_schema = attach_services_to_buildings(
+            bldgs,
+            services.reset_index(drop=True).copy(),
+            capacity_fields=cap_fields,
+            exclude_names=exclude_names,
+        )
+    bldgs = bldgs.reset_index(drop=True).copy()
+    bldgs["building_id"] = bldgs.index.astype(str)
 
     zone_col = args.zone_column
     if zone_col is None:
@@ -453,8 +336,6 @@ def main() -> int:
         "living_area": 0.0,
         "is_living": False,
         "has_floors": False,
-        "services_present": None,
-        "services_capacity": None,
     }.items():
         if k not in bldgs.columns:
             bldgs[k] = default
@@ -464,16 +345,10 @@ def main() -> int:
     bldgs["is_living"] = bldgs["is_living"].astype(bool)
     bldgs["has_floors"] = bldgs["has_floors"].astype(bool)
 
-    # Карта сервисов и нормализация present/capacity
-    service_map: Dict[str, int] = {}
-    if args.services_map:
-        service_map = load_service_map_csv(args.services_map)
-    bldgs = normalize_services_columns(bldgs, service_map)
-
-    if service_map:
+    if service_schema:
         out_json_path = args.out_services_json or os.path.join(args.out_dir, "services.json")
-        write_services_json(service_map, out_json_path)
-        log.info(f"[ok] services.json → {out_json_path} (|types|={len(service_map)})")
+        write_service_schema(service_schema, out_json_path)
+        log.info(f"[ok] services.json → {out_json_path} (|types|={len(service_schema)})")
 
     # 6) Формирование задач per-block
     log.info("Формирование заданий по кварталам…")
@@ -491,25 +366,35 @@ def main() -> int:
 
         rows_bldgs: List[Dict[str, Any]] = []
         if not sub.empty:
-            # itertuples максимально быстрый, но значения сервисов приводим акуратно
             for r in sub.itertuples(index=False):
-                pres_idx = _coerce_services_present(getattr(r, "services_present", None), service_map)
-                caps = _coerce_services_capacity(getattr(r, "services_capacity", None), pres_idx, service_map)
-                if pres_idx:
+                row_dict: Dict[str, Any] = {
+                    "building_id": r.building_id,
+                    "geometry": geom_to_wkb(getattr(r, "geometry")),
+                    "floors_num": getattr(r, "floors_num", pd.NA),
+                    "living_area": getattr(r, "living_area", 0.0),
+                    "is_living": bool(getattr(r, "is_living", False)),
+                    "has_floors": bool(getattr(r, "has_floors", False)),
+                }
+                has_service = False
+                for item_schema in service_schema:
+                    has_col = item_schema.get("has_column")
+                    cap_col = item_schema.get("capacity_column")
+                    if has_col:
+                        has_val = bool(getattr(r, has_col, False))
+                        row_dict[has_col] = has_val
+                    else:
+                        has_val = False
+                    if cap_col:
+                        try:
+                            cap_val = float(getattr(r, cap_col, 0.0)) if has_val else 0.0
+                        except Exception:
+                            cap_val = 0.0
+                        row_dict[cap_col] = cap_val
+                    if has_val:
+                        has_service = True
+                if has_service:
                     n_bldgs_with_services += 1
-
-                rows_bldgs.append(
-                    {
-                        "building_id": r.building_id,
-                        "geometry": geom_to_wkb(getattr(r, "geometry")),
-                        "floors_num": getattr(r, "floors_num", pd.NA),
-                        "living_area": getattr(r, "living_area", 0.0),
-                        "is_living": bool(getattr(r, "is_living", False)),
-                        "has_floors": bool(getattr(r, "has_floors", False)),
-                        "services_present": pres_idx,           # уже List[int]
-                        "services_capacity": caps,               # List[float] той же длины либо свернутый
-                    }
-                )
+                rows_bldgs.append(row_dict)
         tasks.append(
             {
                 "block_id": blk_id,
@@ -521,14 +406,16 @@ def main() -> int:
                 "mask_dir": mask_dir,
                 "timeout_sec": int(args.block_timeout_sec),
                 "out_dir": args.out_dir,
-                "service_map": service_map,
+                "service_schema": service_schema,
                 "min_branch_len": float(args.min_branch_len),
                 "branch_simplify_tol": float(args.branch_simplify_tol) if args.branch_simplify_tol else None,
                 "knn_k": int(args.knn_k),
             }
         )
 
-    log.info(f"[services] зданий с непустыми сервисами: {n_bldgs_with_services:,}")
+    log.info(
+        f"[services] типов={len(service_schema)}; зданий с непустыми сервисами: {n_bldgs_with_services:,}"
+    )
 
     # 7) Параллельная обработка блоков
     log.info(f"Параллельная обработка блоков: workers={int(args.num_workers)}, blocks={len(tasks)}")
@@ -541,7 +428,7 @@ def main() -> int:
             results = list(pool.imap_unordered(worker_process_block, tasks))
 
     timeouts = [r for r in results if r and r.get("status") == "timeout"]
-    dump_timeouts(timeouts, args.out_dir, crs=blocks.crs)
+    dump_timeouts(timeouts, args.out_dir, crs=blocks.crs, service_schema=service_schema)
 
     # 8) Сборка parquet
     log.info("Сборка результатов и запись Parquet…")

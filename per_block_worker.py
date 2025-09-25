@@ -25,6 +25,7 @@ per_block_worker.py — обработка одного квартала (block_
     "mask_dir": str,
     "timeout_sec": int,
     "out_dir": str,
+    "service_schema": List[Dict[str,str]],
     # опционально
     "service_map": Dict[str,int],     # для совместимости; не используется напрямую здесь
     "min_branch_len": float,          # фильтр коротких ветвей
@@ -203,6 +204,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
     mask_dir: str = task["mask_dir"]
     timeout_sec: int = int(task.get("timeout_sec", 300))
     out_dir: str = task["out_dir"]
+    service_schema: List[Dict[str, str]] = list(task.get("service_schema", []))
 
     # доп. параметры
     min_branch_len: float = float(task.get("min_branch_len", 0.0))
@@ -236,13 +238,13 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
         if poly is None:
-            payload = _empty_block_payload(blk_id, zone, mask_path, N)
+            payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
             _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
             return {"block_id": blk_id, "status": "ok_empty"}
 
     if not rows_bldgs:
         scale_l = float(block_scale_l(poly, [])) if poly is not None else 0.0
-        payload = _empty_block_payload(blk_id, zone, mask_path, N)
+        payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
         payload["block"]["scale_l"] = scale_l
         _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
         return {"block_id": blk_id, "status": "ok_empty"}
@@ -378,55 +380,67 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                 s_i = int(s_vec[k]) if isinstance(s_vec, (list, tuple, np.ndarray)) and _safe_len(s_vec) > k else 0
                 a_i = float(a_vec[k]) if isinstance(a_vec, (list, tuple, np.ndarray)) and _safe_len(a_vec) > k else 0.0
 
-                pres = _as_list(r.get("services_present", []))
-                caps = _as_list(r.get("services_capacity", []))
-
-                nodes.append(
-                    {
-                        "block_id": blk_id,
-                        "slot_id": slot_id,
-                        "e_i": 1,
-                        "branch_local_id": int(j),
-                        "posx": float(feat["pos"][k, 0]),
-                        "posy": float(feat["pos"][k, 1]),
-                        "size_x": float(feat["size"][k, 0]),
-                        "size_y": float(feat["size"][k, 1]),
-                        "phi_resid": float(feat["phi"][k]),
-                        "s_i": s_i,
-                        "a_i": a_i,
-                        "floors_num": (pd.NA if pd.isna(r.get("floors_num")) else int(r.get("floors_num"))),
-                        "living_area": float(r.get("living_area", 0.0)),
-                        "is_living": bool(r.get("is_living", False)),
-                        "has_floors": bool(r.get("has_floors", False)),
-                        "services_present": pres,
-                        "services_capacity": caps,
-                        "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", [])) > k else 0.0,
-                    }
-                )
+                node = {
+                    "block_id": blk_id,
+                    "slot_id": slot_id,
+                    "e_i": 1,
+                    "branch_local_id": int(j),
+                    "posx": float(feat["pos"][k, 0]),
+                    "posy": float(feat["pos"][k, 1]),
+                    "size_x": float(feat["size"][k, 0]),
+                    "size_y": float(feat["size"][k, 1]),
+                    "phi_resid": float(feat["phi"][k]),
+                    "s_i": s_i,
+                    "a_i": a_i,
+                    "floors_num": (pd.NA if pd.isna(r.get("floors_num")) else int(r.get("floors_num"))),
+                    "living_area": float(r.get("living_area", 0.0)),
+                    "is_living": bool(r.get("is_living", False)),
+                    "has_floors": bool(r.get("has_floors", False)),
+                    "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", [])) > k else 0.0,
+                }
+                for item in service_schema:
+                    has_col = item.get("has_column")
+                    cap_col = item.get("capacity_column")
+                    if has_col:
+                        has_val = bool(getattr(r, has_col, False))
+                        node[has_col] = has_val
+                    else:
+                        has_val = False
+                    if cap_col:
+                        try:
+                            cap_val = float(getattr(r, cap_col, 0.0)) if has_val else 0.0
+                        except Exception:
+                            cap_val = 0.0
+                        node[cap_col] = cap_val
+                nodes.append(node)
 
             for slot_id in range(len(nodes), N):
-                nodes.append(
-                    {
-                        "block_id": blk_id,
-                        "slot_id": slot_id,
-                        "e_i": 0,
-                        "branch_local_id": -1,
-                        "posx": 0.0,
-                        "posy": 0.0,
-                        "size_x": 0.0,
-                        "size_y": 0.0,
-                        "phi_resid": 0.0,
-                        "s_i": 0,
-                        "a_i": 0.0,
-                        "floors_num": pd.NA,
-                        "living_area": 0.0,
-                        "is_living": False,
-                        "has_floors": False,
-                        "services_present": [],
-                        "services_capacity": [],
-                        "aspect_ratio": 0.0,
-                    }
-                )
+                empty_node = {
+                    "block_id": blk_id,
+                    "slot_id": slot_id,
+                    "e_i": 0,
+                    "branch_local_id": -1,
+                    "posx": 0.0,
+                    "posy": 0.0,
+                    "size_x": 0.0,
+                    "size_y": 0.0,
+                    "phi_resid": 0.0,
+                    "s_i": 0,
+                    "a_i": 0.0,
+                    "floors_num": pd.NA,
+                    "living_area": 0.0,
+                    "is_living": False,
+                    "has_floors": False,
+                    "aspect_ratio": 0.0,
+                }
+                for item in service_schema:
+                    has_col = item.get("has_column")
+                    cap_col = item.get("capacity_column")
+                    if has_col:
+                        empty_node[has_col] = False
+                    if cap_col:
+                        empty_node[cap_col] = 0.0
+                nodes.append(empty_node)
 
             # 7) edges — внутри ветвей и между соседними ветвями
             edges: List[Dict[str, Any]] = []
@@ -510,12 +524,15 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             "zone": zone,
             "poly_wkb": poly_wkb,
             "bldgs_rows": rows_bldgs,
+            "service_schema": service_schema,
         }
 
 
 # ----------------- empty payload -----------------
 
-def _empty_block_payload(blk_id: str, zone, mask_path: str, N: int) -> Dict[str, Any]:
+def _empty_block_payload(
+    blk_id: str, zone, mask_path: str, N: int, service_schema: Optional[List[Dict[str, str]]] = None
+) -> Dict[str, Any]:
     block_row = {
         "block_id": blk_id,
         "zone": zone,
@@ -524,8 +541,10 @@ def _empty_block_payload(blk_id: str, zone, mask_path: str, N: int) -> Dict[str,
         "scale_l": 0.0,
         "mask_path": mask_path,
     }
-    nodes = [
-        {
+    schema = service_schema or []
+    nodes = []
+    for i in range(N):
+        node = {
             "block_id": blk_id,
             "slot_id": i,
             "e_i": 0,
@@ -541,10 +560,14 @@ def _empty_block_payload(blk_id: str, zone, mask_path: str, N: int) -> Dict[str,
             "living_area": 0.0,
             "is_living": False,
             "has_floors": False,
-            "services_present": [],
-            "services_capacity": [],
             "aspect_ratio": 0.0,
         }
-        for i in range(N)
-    ]
+        for item in schema:
+            has_col = item.get("has_column")
+            cap_col = item.get("capacity_column")
+            if has_col:
+                node[has_col] = False
+            if cap_col:
+                node[cap_col] = 0.0
+        nodes.append(node)
     return {"block": block_row, "branches": [], "nodes": nodes, "edges": []}
