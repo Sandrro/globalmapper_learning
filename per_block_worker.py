@@ -157,6 +157,11 @@ def _write_block_parquets(
     nodes_df = pd.DataFrame(nodes_rows)
     if "floors_num" in nodes_df.columns:
         nodes_df["floors_num"] = nodes_df["floors_num"].astype("Int64")
+    if "building_id" in nodes_df.columns:
+        try:
+            nodes_df["building_id"] = nodes_df["building_id"].astype("string")
+        except Exception:
+            pass
     nodes_df.to_parquet(os.path.join(bdir, "nodes_fixed.parquet"), index=False)
     pd.DataFrame(edges_rows).to_parquet(os.path.join(bdir, "edges.parquet"), index=False)
 
@@ -214,6 +219,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
     knn_k: int = int(task.get("knn_k", 6))
 
     mask_path = os.path.join(mask_dir, f"{blk_id}.png")
+    block_started = time.perf_counter()
 
     # геометрия квартала
     try:
@@ -240,14 +246,28 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
         if poly is None:
             payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
             _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
-            return {"block_id": blk_id, "status": "ok_empty"}
+            return {
+                "block_id": blk_id,
+                "status": "ok_empty",
+                "n_buildings": 0,
+                "n_nodes": len(payload["nodes"]),
+                "n_edges": 0,
+                "elapsed": time.perf_counter() - block_started,
+            }
 
     if not rows_bldgs:
         scale_l = float(block_scale_l(poly, [])) if poly is not None else 0.0
         payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
         payload["block"]["scale_l"] = scale_l
         _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
-        return {"block_id": blk_id, "status": "ok_empty"}
+        return {
+            "block_id": blk_id,
+            "status": "ok_empty",
+            "n_buildings": 0,
+            "n_nodes": len(payload["nodes"]),
+            "n_edges": 0,
+            "elapsed": time.perf_counter() - block_started,
+        }
 
     try:
         with time_limit(timeout_sec):
@@ -288,10 +308,17 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                 a.pop("geometry", None)
                 attrs.append(a)
             if len(g_geoms) == 0:
-                payload = _empty_block_payload(blk_id, zone, mask_path, N)
+                payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
                 payload["block"]["scale_l"] = scale_l
                 _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
-                return {"block_id": blk_id, "status": "ok_empty"}
+                return {
+                    "block_id": blk_id,
+                    "status": "ok_empty",
+                    "n_buildings": 0,
+                    "n_nodes": len(payload["nodes"]),
+                    "n_edges": 0,
+                    "elapsed": time.perf_counter() - block_started,
+                }
 
             df = pd.DataFrame(attrs)
             gdf = gpd.GeoDataFrame(df, geometry=g_geoms, crs=None)
@@ -397,6 +424,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                     "is_living": bool(r.get("is_living", False)),
                     "has_floors": bool(r.get("has_floors", False)),
                     "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", [])) > k else 0.0,
+                    "building_id": r.get("building_id"),
                 }
                 for item in service_schema:
                     has_col = item.get("has_column")
@@ -432,6 +460,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                     "is_living": False,
                     "has_floors": False,
                     "aspect_ratio": 0.0,
+                    "building_id": pd.NA,
                 }
                 for item in service_schema:
                     has_col = item.get("has_column")
@@ -515,7 +544,14 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             }
 
             _write_block_parquets(out_dir, blk_id, block_row, branches_rows, nodes, edges)
-            return {"block_id": blk_id, "status": "ok"}
+            return {
+                "block_id": blk_id,
+                "status": "ok",
+                "n_buildings": int(len(gdf)),
+                "n_nodes": len(nodes),
+                "n_edges": len(edges),
+                "elapsed": time.perf_counter() - block_started,
+            }
 
     except TimeoutError:
         return {
@@ -525,6 +561,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             "poly_wkb": poly_wkb,
             "bldgs_rows": rows_bldgs,
             "service_schema": service_schema,
+            "elapsed": time.perf_counter() - block_started,
         }
 
 
@@ -561,6 +598,7 @@ def _empty_block_payload(
             "is_living": False,
             "has_floors": False,
             "aspect_ratio": 0.0,
+            "building_id": pd.NA,
         }
         for item in schema:
             has_col = item.get("has_column")
