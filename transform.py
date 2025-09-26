@@ -509,6 +509,7 @@ def _empty_block_payload(
             "is_living": False,
             "has_floors": False,
             "aspect_ratio": 0.0,
+            "building_id": pd.NA,
         }
         for item in schema:
             has_col = item.get("has_column")
@@ -541,6 +542,11 @@ def _write_block_parquets(out_dir: str, blk_id: str, block_row: dict, branches_r
     nodes_df = pd.DataFrame(nodes_rows)
     if "floors_num" in nodes_df.columns:
         nodes_df["floors_num"] = nodes_df["floors_num"].astype("Int64")
+    if "building_id" in nodes_df.columns:
+        try:
+            nodes_df["building_id"] = nodes_df["building_id"].astype("string")
+        except Exception:
+            pass
     nodes_df.to_parquet(os.path.join(bdir, "nodes_fixed.parquet"), index=False)
     pd.DataFrame(edges_rows).to_parquet(os.path.join(bdir, "edges.parquet"), index=False)
 
@@ -558,6 +564,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
     service_schema: List[Dict[str, str]] = list(task.get("service_schema", []))
 
     mask_path = os.path.join(mask_dir, f"{blk_id}.png")
+    block_started = time.perf_counter()
 
     # квартальная геометрия
     try:
@@ -583,14 +590,28 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             # пустой квартал
             payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
             _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
-            return {"block_id": blk_id, "status": "ok_empty"}
+            return {
+                "block_id": blk_id,
+                "status": "ok_empty",
+                "n_buildings": 0,
+                "n_nodes": len(payload["nodes"]),
+                "n_edges": 0,
+                "elapsed": time.perf_counter() - block_started,
+            }
 
     if not rows_bldgs:
         scale_l = float(block_scale_l(poly, [])) if poly is not None else 0.0
         payload = _empty_block_payload(blk_id, zone, mask_path, N, service_schema)
         payload["block"]["scale_l"] = scale_l
         _write_block_parquets(out_dir, blk_id, payload["block"], [], payload["nodes"], [])
-        return {"block_id": blk_id, "status": "ok_empty"}
+        return {
+            "block_id": blk_id,
+            "status": "ok_empty",
+            "n_buildings": 0,
+            "n_nodes": len(payload["nodes"]),
+            "n_edges": 0,
+            "elapsed": time.perf_counter() - block_started,
+        }
 
     try:
         with time_limit(timeout_sec):
@@ -713,6 +734,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                     "is_living": bool(r.get("is_living", False)),
                     "has_floors": bool(r.get("has_floors", False)),
                     "aspect_ratio": float(feat["aspect"][k]) if _safe_len(feat.get("aspect", [])) > k else 0.0,
+                    "building_id": r.get("building_id"),
                 }
                 for item in service_schema:
                     has_col = item.get("has_column")
@@ -747,6 +769,7 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
                     "is_living": False,
                     "has_floors": False,
                     "aspect_ratio": 0.0,
+                    "building_id": pd.NA,
                 }
                 for item in service_schema:
                     has_col = item.get("has_column")
@@ -793,7 +816,14 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
 
             # записать per-block parquet
             _write_block_parquets(out_dir, blk_id, block_row, branches_rows, nodes, edges)
-            return {"block_id": blk_id, "status": "ok"}
+            return {
+                "block_id": blk_id,
+                "status": "ok",
+                "n_buildings": int(len(gdf)),
+                "n_nodes": len(nodes),
+                "n_edges": len(edges),
+                "elapsed": time.perf_counter() - block_started,
+            }
 
     except TimeoutError:
         return {
@@ -803,7 +833,92 @@ def worker_process_block(task: Dict[str, Any]) -> Dict[str, Any]:
             "poly_wkb": poly_wkb,
             "bldgs_rows": rows_bldgs,
             "service_schema": service_schema,
+            "elapsed": time.perf_counter() - block_started,
         }
+
+# ----------------- PROGRESS TRACKER -----------------
+
+
+class BlockProgressTracker:
+    """Aggregate per-block statistics and log them periodically."""
+
+    def __init__(
+        self,
+        total_blocks: int,
+        log_every: int = 20,
+        log_interval_sec: float = 30.0,
+    ) -> None:
+        self.total_blocks = max(0, int(total_blocks))
+        self.log_every = max(1, int(log_every))
+        self.log_interval_sec = float(log_interval_sec)
+        self.processed = 0
+        self.ok = 0
+        self.ok_empty = 0
+        self.timeouts = 0
+        self.other = 0
+        self.total_buildings = 0
+        self.total_nodes = 0
+        self.total_edges = 0
+        self.total_elapsed = 0.0
+        self.last_log_ts = time.perf_counter()
+
+    def update(self, result: Optional[Dict[str, Any]]) -> None:
+        if not result:
+            return
+        self.processed += 1
+        status = result.get("status")
+        if status == "ok":
+            self.ok += 1
+        elif status == "ok_empty":
+            self.ok_empty += 1
+        elif status == "timeout":
+            self.timeouts += 1
+        else:
+            self.other += 1
+        try:
+            self.total_buildings += int(result.get("n_buildings") or 0)
+        except Exception:
+            pass
+        try:
+            self.total_nodes += int(result.get("n_nodes") or 0)
+        except Exception:
+            pass
+        try:
+            self.total_edges += int(result.get("n_edges") or 0)
+        except Exception:
+            pass
+        elapsed = result.get("elapsed")
+        if elapsed is not None:
+            try:
+                self.total_elapsed += float(elapsed)
+            except Exception:
+                pass
+        self._maybe_log()
+
+    def _maybe_log(self, force: bool = False) -> None:
+        now = time.perf_counter()
+        should_log = force or (self.processed % self.log_every == 0)
+        if not should_log and (now - self.last_log_ts) < self.log_interval_sec:
+            return
+        avg_block_time = (self.total_elapsed / self.processed) if self.processed else 0.0
+        log.info(
+            "[progress] blocks %s/%s | ok=%s empty=%s timeout=%s other=%s | buildings=%s nodes=%s edges=%s | avg_block_time=%.2fs",
+            self.processed,
+            self.total_blocks,
+            self.ok,
+            self.ok_empty,
+            self.timeouts,
+            self.other,
+            self.total_buildings,
+            self.total_nodes,
+            self.total_edges,
+            avg_block_time,
+        )
+        self.last_log_ts = now
+
+    def log(self, force: bool = False) -> None:
+        self._maybe_log(force=force)
+
 
 # ----------------- ORPHANS / TIMEOUT DУMPS -----------------
 def _dump_orphans(bldgs: gpd.GeoDataFrame, blocks: gpd.GeoDataFrame, out_dir: str):
@@ -1009,10 +1124,21 @@ def main():
         "has_floors": False,
     }.items():
         if k not in bldgs.columns: bldgs[k] = default
-    bldgs["floors_num"] = bldgs["floors_num"].astype("Int64")
+
+    floors_numeric = pd.to_numeric(bldgs["floors_num"], errors="coerce")
+    storeys_numeric = None
+    if "storeys_count" in bldgs.columns:
+        storeys_numeric = pd.to_numeric(bldgs["storeys_count"], errors="coerce")
+
+    if storeys_numeric is not None:
+        has_floors_mask = storeys_numeric.notna() & (storeys_numeric > 0)
+    else:
+        has_floors_mask = floors_numeric.notna() & (floors_numeric > 0)
+
+    bldgs["floors_num"] = floors_numeric.astype("Int64")
     bldgs["living_area"] = pd.to_numeric(bldgs["living_area"], errors="coerce").fillna(0.0).astype(float)
     bldgs["is_living"] = bldgs["is_living"].astype(bool)
-    bldgs["has_floors"] = bldgs["has_floors"].astype(bool)
+    bldgs["has_floors"] = has_floors_mask.fillna(False).astype(bool)
 
     if service_schema:
         out_json_path = args.out_services_json or os.path.join(args.out_dir, "services.json")
@@ -1061,11 +1187,24 @@ def main():
 
     num_workers = max(1, int(args.num_workers))
     log.info(f"Параллельная обработка блоков: workers={num_workers}, blocks={len(tasks)}")
+    log_every = max(1, min(50, (len(tasks) // 10) or 1))
+    tracker = BlockProgressTracker(total_blocks=len(tasks), log_every=log_every)
+    results: List[Dict[str, Any]] = []
     if num_workers == 1:
-        results = [worker_process_block(t) for t in tqdm(tasks, disable=not TQDM)]
+        iterable = tqdm(tasks, total=len(tasks)) if TQDM else tasks
+        for task in iterable:
+            res = worker_process_block(task)
+            results.append(res)
+            tracker.update(res)
     else:
         with mp.get_context("spawn").Pool(processes=num_workers) as pool:
-            results = list(tqdm(pool.imap_unordered(worker_process_block, tasks), total=len(tasks), disable=not TQDM))
+            it = pool.imap_unordered(worker_process_block, tasks)
+            if TQDM:
+                it = tqdm(it, total=len(tasks))
+            for res in it:
+                results.append(res)
+                tracker.update(res)
+    tracker.log(force=True)
 
     # собрать таймауты
     timeouts = [r for r in results if r and r.get("status") == "timeout"]
