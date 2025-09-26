@@ -65,8 +65,11 @@ def read_geojson(path: str) -> Dict[str,Any]:
         gj = {"type":"FeatureCollection", "features": feats}
     return gj
 
-def write_geojson(path: str, fc: Dict[str,Any]) -> None:
+def write_geojson(path: str, fc: Dict[str,Any], epsg: Optional[int] = None) -> None:
     Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
+    if epsg:
+        fc = dict(fc)
+        fc["crs"] = {"type": "name", "properties": {"name": f"EPSG:{int(epsg)}"}}
     with open(path, "w", encoding="utf-8") as f:
         json.dump(fc, f, ensure_ascii=False, indent=2)
 
@@ -473,6 +476,113 @@ def build_gabriel_knn_edges(points: List[Point],
         edges.append({"type":"Feature", "geometry": mapping(line), "properties": eprops})
     return edges
 
+# ---- Гекс-сетка (pointy-top, сторона side_m) ----
+
+def _hex_polygon(cx: float, cy: float, side_m: float) -> Polygon:
+    """Единичный гекс (pointy-top). Углы: 30°, 90°, 150°, 210°, 270°, 330°."""
+    pts = []
+    for i in range(6):
+        ang = math.radians(60 * i + 30.0)
+        pts.append((cx + side_m * math.cos(ang), cy + side_m * math.sin(ang)))
+    pts.append(pts[0])
+    return Polygon(pts)
+
+def hex_grid_covering_polygon(block_geom, side_m: float) -> List[Polygon]:
+    """
+    Строит pointy-top гекс-сетку с длиной стороны side_m, покрывающую bbox квартала,
+    и возвращает ТОЛЬКО те гексы, которые целиком лежат внутри квартала (hex.within(block)).
+    """
+    if block_geom is None or block_geom.is_empty:
+        return []
+
+    # Геометрические параметры pointy-top
+    s = float(side_m)
+    width = math.sqrt(3.0) * s      # расстояние между центрами по X
+    height = 2.0 * s                # полная высота гекса
+    dx = width                      # шаг по X
+    dy = 1.5 * s                    # шаг по Y
+    x_off_odd = width / 2.0         # сдвиг "нечётных" рядов
+
+    minx, miny, maxx, maxy = block_geom.bounds
+    # небольшой запас, чтобы «закрыть» край
+    pad = max(width, height)
+    minx -= pad; miny -= pad; maxx += pad; maxy += pad
+
+    hexes: List[Polygon] = []
+    row = 0
+    y = miny
+    while y <= maxy + 1e-9:
+        x0 = minx + (x_off_odd if (row % 2) else 0.0)
+        x = x0
+        while x <= maxx + 1e-9:
+            h = _hex_polygon(x, y, s)
+            # берём ТОЛЬКО целиком лежащие в квартале гексы
+            if h.within(block_geom):
+                hexes.append(h)
+            x += dx
+        row += 1
+        y += dy
+    return hexes
+
+def build_hex_grid_features(block_geom,
+                            moved_points: List[Point],
+                            moved_props:  List[Dict[str,Any]],
+                            side_m: float,
+                            block_index: int,
+                            zone_label: str) -> List[Dict[str,Any]]:
+    """
+    Строит гекс-сетку по кварталу и агрегирует показатели по попавшим в гекс сдвинутым центроидам:
+      - pts_count           : количество точек
+      - e_max               : максимальное e
+      - floors_avg          : среднее по floors/floors_avg
+      - is_living_avg       : среднее is_living
+      - living_area_sum     : сумма living_area
+    """
+    hexes = hex_grid_covering_polygon(block_geom, side_m)
+    feats: List[Dict[str,Any]] = []
+
+    # Подготовим числовые векторы свойств
+    e_vals = [(_to_float(pr.get("e")) if _to_float(pr.get("e")) is not None else None) for pr in moved_props]
+    fl_vals = [get_floors_value(pr) for pr in moved_props]
+    il_vals = [get_is_living_value(pr) for pr in moved_props]
+    la_vals = [get_living_area_value(pr) for pr in moved_props]
+
+    # Простой O(N*M) проход (для больших N, M можно заменить на STRtree)
+    for hid, hex_poly in enumerate(hexes):
+        # включаем точки "на границе" — используем covers
+        idxs = [i for i, p in enumerate(moved_points) if hex_poly.covers(p)]
+
+        cnt = len(idxs)
+        if cnt > 0:
+            e_max = max([e_vals[i] for i in idxs if e_vals[i] is not None], default=None)
+            fl = [fl_vals[i] for i in idxs if fl_vals[i] is not None]
+            il = [il_vals[i] for i in idxs if il_vals[i] is not None]
+            la = [la_vals[i] for i in idxs if la_vals[i] is not None]
+
+            floors_avg = (sum(fl)/len(fl)) if fl else None
+            is_living_avg = (sum(il)/len(il)) if il else None
+            living_area_sum = float(sum(la)) if la else 0.0
+        else:
+            e_max = None
+            floors_avg = None
+            is_living_avg = None
+            living_area_sum = 0.0
+
+        props = {
+            "hex_id": int(hid),
+            "block_index": int(block_index),
+            "zone": zone_label,
+            "side_m": float(side_m),
+            "pts_count": int(cnt),
+            "e_max": (float(e_max) if e_max is not None else None),
+            "floors_avg": (float(floors_avg) if floors_avg is not None else None),
+            "is_living_avg": (float(is_living_avg) if is_living_avg is not None else None),
+            "living_area_sum": float(living_area_sum),
+        }
+        feats.append({"type":"Feature", "geometry": mapping(hex_poly), "properties": props})
+
+    return feats
+
 # ---- Основной скрипт ----
 
 def main():
@@ -481,6 +591,8 @@ def main():
     ap.add_argument("--out", required=True, help="Выходной GeoJSON линий графа (LineString)")
     ap.add_argument("--out-infer-polys", default=None, help="Выход GeoJSON ПОЛИГОНОВ-СЕГМЕНТОВ второго кольца")
     ap.add_argument("--out-infer-centroids", default=None, help="Выход GeoJSON СЛИТЫХ (и сдвинутых) центроидов (Point)")
+    ap.add_argument("--out-hex-grid", default=None,
+                help="Выход GeoJSON гекс-сетки по кварталам (Polygon)")
     ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
     ap.add_argument("--model-ckpt", required=True, help="Путь к чекпойнту модели (.pt)")
     ap.add_argument("--config", default=None)
@@ -508,10 +620,18 @@ def main():
     # граф
     ap.add_argument("--graph-knn-k", type=int, default=6,
                     help="Число ближайших соседей для кандидатных рёбер в Gabriel-графе (по умолчанию 6)")
+    # сетка
+    ap.add_argument("--hex-side-m", type=float, default=5.0,
+                    help="Длина стороны гекса в метрах (по умолчанию 5.0)")
+    # crs
+    ap.add_argument("--out-epsg", type=int, default=32636,
+                    help="EPSG-код для записи всех выходных GeoJSON (по умолчанию 32636)")
+    
 
     args = ap.parse_args()
 
     stem = os.path.splitext(args.out)[0]
+    out_hex_grid_path = args.out_hex_grid or (stem + "_hex_grid.geojson")
     out_infer_polys_path = args.out_infer_polys or (stem + "_ring_segments.geojson")
     out_infer_centroids_path = args.out_infer_centroids or (stem + "_infer_centroids.geojson")
 
@@ -531,8 +651,9 @@ def main():
     out_edge_feats: List[Dict[str,Any]] = []
     out_ring_segment_feats: List[Dict[str,Any]] = []
     out_infer_centroid_feats: List[Dict[str,Any]] = []
+    out_hex_feats: List[Dict[str,Any]] = []
     infer_uid = 0  # общий идентификатор пар (полигон<->центроид до слияния)
-
+    
     tmpdir = tempfile.mkdtemp(prefix="ked_infer_")
     try:
         for bi, feat in enumerate(tqdm(fc_blocks.get("features", []), desc="Blocks")):
@@ -574,7 +695,7 @@ def main():
                 "--infer-geojson-in", in_path,
                 "--infer-out", out_path,
                 "--zone", str(z),
-                "--infer-slots", str(slots_side),
+                "--infer-slots", str(args.infer_slots),
                 "--infer-knn",   str(args.infer_knn),
                 "--infer-e-thr", str(args.infer_e_thr),
                 "--infer-il-thr", str(args.infer_il_thr),
@@ -791,11 +912,23 @@ def main():
             )
             out_edge_feats.extend(edges)
 
-        # Запись результатов
-        write_geojson(args.out, {"type":"FeatureCollection","features": out_edge_feats})
-        write_geojson(out_infer_polys_path, {"type":"FeatureCollection","features": out_ring_segment_feats})
-        write_geojson(out_infer_centroids_path, {"type":"FeatureCollection","features": out_infer_centroid_feats})
+            hex_feats = build_hex_grid_features(
+                block_geom=block_geom,
+                moved_points=moved_points,
+                moved_props=moved_props,
+                side_m=float(args.hex_side_m),
+                block_index=bi,
+                zone_label=z,
+            )
+            out_hex_feats.extend(hex_feats)
 
+        # Запись результатов
+        write_geojson(args.out, {"type":"FeatureCollection","features": out_edge_feats}, epsg=args.out_epsg)
+        write_geojson(out_infer_polys_path, {"type":"FeatureCollection","features": out_ring_segment_feats}, epsg=args.out_epsg)
+        write_geojson(out_infer_centroids_path, {"type":"FeatureCollection","features": out_infer_centroid_feats}, epsg=args.out_epsg)
+        write_geojson(out_hex_grid_path, {"type":"FeatureCollection","features": out_hex_feats}, epsg=args.out_epsg)
+
+        print(f"[OK] hex grid cells:         {len(out_hex_feats)} → {out_hex_grid_path}")
         print(f"[OK] graph edges:            {len(out_edge_feats)} → {args.out}")
         print(f"[OK] ring2 segments:         {len(out_ring_segment_feats)} → {out_infer_polys_path}")
         print(f"[OK] merged+snapped points:  {len(out_infer_centroid_feats)} → {out_infer_centroids_path}")
