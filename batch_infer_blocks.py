@@ -2,34 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 batch_infer_blocks.py — пакетная генерация застройки через train.py --mode infer
-с последующим слиянием центроидов внутри кварталов, переформатированием «прибрежной»
-зоны квартала в сегменты второго кольца (10–30 м), и построением графа соседства.
+с последующим слиянием центроидов внутри кварталов, возможным смещением точек на
+срединную линию буфера квартала и построением гекс-сетки зданий. После фильтрации
+гексов (≥2 точек) формируется граф соседства, упрощается до одной основной линии с
+ветвями, затем по ним строятся прямоугольные буферы и полигоны зданий с агрегацией
+атрибутов.
 
 Совместимо с Shapely < 2.0 (проверено на 1.7/1.8).
-Зависимости: shapely, numpy, tqdm (опц.).
+Зависимости: shapely, tqdm (опц.).
 
-ВЫХОДЫ (3 шт):
-  1) --out                 : граф как линии (LineString) между СЛИТЫМИ (и при необходимости
-                             сдвинутыми) центроидами зданий (Gabriel-критерий по kNN).
-  2) --out-infer-polys     : ПОЛИГОНЫ-СЕГМЕНТЫ ВТОРОГО КОЛЬЦА (а НЕ полигоны модели).
-                             Строятся по срединной линии кольца (20 м) с длиной дуги
-                             ∝ весу точки; затем бафер 10 м и клиппинг кольцом; после — укорачиваем
-                             по дуге на 5 м с каждого конца (если возможно).
-  3) --out-infer-centroids : СЛИТЫЕ центроиды (Point) ПОСЛЕ сдвига на срединную линию
-                             (для тех, кто был в кольцах). Свойства агрегированы:
-       - e            : из якоря кластера (наиболее вероятного)
-       - floors       : ceil(среднего по кластеру)  (дополнительно floors_avg — само среднее)
-       - is_living    : среднее (0..1)
-       - living_area  : сумма
-       - merged_from  : список infer_fid, вошедших в кластер
-       - merged_count : размер кластера
-       - ring_snap    : none|to_ring2_midline (маркер сдвига)
-       - ring_zone    : first|second|none (где исходно находился центроид)
+ВЫХОДЫ (4 шт):
+  1) --out                 : линии графа зданий по гексам (LineString) — основная линия и ветви.
+  2) --out-infer-polys     : полигоны зданий, построенные из буферов линий (Polygon).
+  3) --out-infer-centroids : исходные (слитые и, при необходимости, смещённые) точки зданий (Point).
+  4) --out-hex-grid        : гексы с агрегированными показателями по точкам (Polygon).
+
+В полигоны зданий записываются:
+  - e_max             : максимальная вероятность e среди точек;
+  - living_area_sum   : суммарная жилая площадь;
+  - is_living_max     : максимальное значение is_living;
+  - floors_avg_round  : средняя этажность, округлённая до целого;
+  - pts_count         : количество точек в объекте.
 
 Примечания:
 - Расстояния считаются в единицах CRS входа — используйте метрическую проекцию.
 - Второе кольцо: 10–30 м внутрь от внешней границы квартала; срединная линия — 20 м.
-- Если второе кольцо пусто (слишком узкий квартал), сегменты не строятся.
+- Если второе кольцо пусто (слишком узкий квартал), смещение происходит только для тех,
+  кто попал в доступные линии.
 """
 
 from __future__ import annotations
@@ -45,12 +44,10 @@ except Exception:
 # --- Гео-зависимости (Shapely < 2.0 поддерживается) ---
 try:
     from shapely.geometry import shape, mapping, Point, Polygon, MultiPolygon, LineString, MultiLineString
-    from shapely.ops import nearest_points
+    from shapely.ops import nearest_points, unary_union
 except Exception:
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
-
-import numpy as np
 
 # ---- I/O ----
 
@@ -199,16 +196,6 @@ def get_living_area_value(props: Dict[str,Any]) -> Optional[float]:
     return None
 
 # ---- Гео-хелперы для колец и линий ----
-
-def polygon_or_multi(geom) -> List[Polygon]:
-    if geom is None or geom.is_empty:
-        return []
-    if isinstance(geom, Polygon):
-        return [geom]
-    if isinstance(geom, MultiPolygon):
-        return list(geom.geoms)
-    return []
-
 def lines_of(geom) -> List[LineString]:
     if geom is None or geom.is_empty:
         return []
@@ -253,63 +240,6 @@ def nearest_on_lines(lines: List[LineString], p: Point) -> Tuple[int, Point, flo
         return -1, p, 0.0
     return best_i, best_q, best_m
 
-def line_substring(line: LineString, start_d: float, end_d: float) -> Optional[LineString]:
-    """Вырезает подотрезок линии по длинам вдоль геометрии (без shapely.ops.substring)."""
-    L = float(line.length)
-    if L <= 0: return None
-    a = max(0.0, min(L, float(start_d)))
-    b = max(0.0, min(L, float(end_d)))
-    if b - a <= 1e-9: return None
-
-    coords = list(line.coords)
-    acc = 0.0
-    out_pts = []
-
-    def interp(p1, p2, t):
-        return (p1[0] + (p2[0]-p1[0])*t, p1[1] + (p2[1]-p1[1])*t)
-
-    for i in range(len(coords)-1):
-        p1 = coords[i]; p2 = coords[i+1]
-        seg_len = math.hypot(p2[0]-p1[0], p2[1]-p1[1])
-        if seg_len <= 0:
-            continue
-        seg_start = acc
-        seg_end = acc + seg_len
-
-        # сегмент полностью перед нужным диапазоном
-        if seg_end < a - 1e-12:
-            acc = seg_end; continue
-        # сегмент полностью после нужного диапазона
-        if seg_start > b + 1e-12:
-            break
-
-        # пересечение с [a,b]
-        s = max(a, seg_start)
-        e = min(b, seg_end)
-        if e - s <= 1e-9:
-            acc = seg_end; continue
-
-        # добавляем точки от s до e
-        t0 = (s - seg_start) / seg_len
-        t1 = (e - seg_start) / seg_len
-        pt0 = interp(p1, p2, t0)
-        pt1 = interp(p1, p2, t1)
-
-        if not out_pts:
-            out_pts.append(pt0)
-        else:
-            # стыковка с предыдущим концом
-            if out_pts[-1] != pt0:
-                out_pts.append(pt0)
-        out_pts.append(pt1)
-        acc = seg_end
-
-    if len(out_pts) >= 2:
-        try:
-            return LineString(out_pts)
-        except Exception:
-            return None
-    return None
 # ------ вычисление сетки ---------
 def infer_slots_from_block_bbox(block_geom, cell_size_m: float = 100.0) -> int:
     """
@@ -410,72 +340,6 @@ def merge_centroids(points: List[Point],
 
     return m_points, m_props
 
-# ---- Граф: Gabriel с kNN-кандидатами ----
-
-def build_gabriel_knn_edges(points: List[Point],
-                            props_list: List[Dict[str,Any]],
-                            knn_k: int,
-                            block_index: int,
-                            zone_label: str,
-                            eps: float = 1e-9) -> List[Dict[str,Any]]:
-    edges: List[Dict[str,Any]] = []
-    n = len(points)
-    if n <= 1:
-        return edges
-
-    coords = np.array([[p.x, p.y] for p in points], dtype=np.float64)
-    cand = set()
-    for i in range(n):
-        di = coords - coords[i]
-        d2 = (di[:,0]**2 + di[:,1]**2)
-        d2[i] = np.inf
-        if knn_k >= n:
-            nn_idx = np.argsort(d2)
-        else:
-            nn_idx = np.argpartition(d2, knn_k)[:knn_k]
-        for j in nn_idx:
-            a, b = (i, int(j)) if i < j else (int(j), i)
-            cand.add((a, b))
-
-    for (i, j) in cand:
-        mx = 0.5 * (coords[i,0] + coords[j,0])
-        my = 0.5 * (coords[i,1] + coords[j,1])
-        mid = Point(mx, my)
-        dij = math.sqrt((coords[i,0]-coords[j,0])**2 + (coords[i,1]-coords[j,1])**2)
-        r = 0.5 * dij
-        if r <= eps:
-            continue
-        violates = False
-        for k in range(n):
-            if k == i or k == j:
-                continue
-            if mid.distance(points[k]) <= r - eps:
-                violates = True
-                break
-        if violates:
-            continue
-        pi, pj = points[i], points[j]
-        line = LineString([(pi.x, pi.y), (pj.x, pj.y)])
-        length_m = float(pi.distance(pj))
-
-        ui = (props_list[i].get("infer_fid"), props_list[i].get("_source_block_index", block_index))
-        uj = (props_list[j].get("infer_fid"), props_list[j].get("_source_block_index", block_index))
-
-        eprops = {
-            "u": int(ui[0]) if ui[0] is not None else i,
-            "v": int(uj[0]) if uj[0] is not None else j,
-            "u_block": int(ui[1]),
-            "v_block": int(uj[1]),
-            "zone": zone_label,
-            "length_m": length_m,
-            "edge_type": "gabriel_knn",
-            "knn_k": int(knn_k),
-            "graph": "centroid_gabriel_v1",
-            "block_index": int(block_index),
-        }
-        edges.append({"type":"Feature", "geometry": mapping(line), "properties": eprops})
-    return edges
-
 # ---- Гекс-сетка (pointy-top, сторона side_m) ----
 
 def _hex_polygon(cx: float, cy: float, side_m: float) -> Polygon:
@@ -524,75 +388,287 @@ def hex_grid_covering_polygon(block_geom, side_m: float) -> List[Polygon]:
         y += dy
     return hexes
 
-def build_hex_grid_features(block_geom,
-                            moved_points: List[Point],
-                            moved_props:  List[Dict[str,Any]],
-                            side_m: float,
-                            block_index: int,
-                            zone_label: str) -> List[Dict[str,Any]]:
-    """
-    Строит гекс-сетку по кварталу и агрегирует показатели по попавшим в гекс сдвинутым центроидам:
-      - pts_count           : количество точек
-      - e_max               : максимальное e
-      - floors_avg          : среднее по floors/floors_avg
-      - is_living_avg       : среднее is_living
-      - living_area_sum     : сумма living_area
-    """
+def hex_characteristic_width(hex_poly: Polygon) -> float:
+    minx, miny, maxx, maxy = hex_poly.bounds
+    width = min(maxx - minx, maxy - miny)
+    area = hex_poly.area
+    if width <= 0 and area > 0:
+        width = math.sqrt(area)
+    return float(max(width, 1e-6))
+
+
+def build_hex_nodes(block_geom,
+                    moved_points: List[Point],
+                    moved_props: List[Dict[str, Any]],
+                    side_m: float,
+                    block_index: int,
+                    zone_label: str) -> List[Dict[str, Any]]:
     hexes = hex_grid_covering_polygon(block_geom, side_m)
-    feats: List[Dict[str,Any]] = []
+    nodes: List[Dict[str, Any]] = []
 
-    # Подготовим числовые векторы свойств
-    e_vals = [(_to_float(pr.get("e")) if _to_float(pr.get("e")) is not None else None) for pr in moved_props]
-    fl_vals = [get_floors_value(pr) for pr in moved_props]
-    il_vals = [get_is_living_value(pr) for pr in moved_props]
-    la_vals = [get_living_area_value(pr) for pr in moved_props]
-
-    # Простой O(N*M) проход (для больших N, M можно заменить на STRtree)
-    for hid, hex_poly in enumerate(hexes):
-        # включаем точки "на границе" — используем covers
+    for hex_poly in hexes:
         idxs = [i for i, p in enumerate(moved_points) if hex_poly.covers(p)]
+        if len(idxs) <= 1:
+            continue
 
-        cnt = len(idxs)
-        if cnt > 0:
-            e_max = max([e_vals[i] for i in idxs if e_vals[i] is not None], default=None)
-            fl = [fl_vals[i] for i in idxs if fl_vals[i] is not None]
-            il = [il_vals[i] for i in idxs if il_vals[i] is not None]
-            la = [la_vals[i] for i in idxs if la_vals[i] is not None]
+        e_vals = [_to_float(moved_props[i].get("e")) for i in idxs]
+        e_vals = [v for v in e_vals if v is not None]
 
-            floors_avg = (sum(fl)/len(fl)) if fl else None
-            is_living_avg = (sum(il)/len(il)) if il else None
-            living_area_sum = float(sum(la)) if la else 0.0
-        else:
-            e_max = None
-            floors_avg = None
-            is_living_avg = None
-            living_area_sum = 0.0
+        floors_vals = [get_floors_value(moved_props[i]) for i in idxs]
+        floors_vals = [v for v in floors_vals if v is not None]
+
+        is_living_vals = [get_is_living_value(moved_props[i]) for i in idxs]
+        is_living_vals = [v for v in is_living_vals if v is not None]
+
+        living_area_vals = [get_living_area_value(moved_props[i]) for i in idxs]
+        living_area_vals = [v for v in living_area_vals if v is not None]
 
         props = {
-            "hex_id": int(hid),
             "block_index": int(block_index),
             "zone": zone_label,
             "side_m": float(side_m),
-            "pts_count": int(cnt),
-            "e_max": (float(e_max) if e_max is not None else None),
-            "floors_avg": (float(floors_avg) if floors_avg is not None else None),
-            "is_living_avg": (float(is_living_avg) if is_living_avg is not None else None),
-            "living_area_sum": float(living_area_sum),
+            "pts_count": int(len(idxs)),
+            "e_max": (max(e_vals) if e_vals else None),
+            "floors_avg": (sum(floors_vals) / len(floors_vals) if floors_vals else None),
+            "is_living_avg": (sum(is_living_vals) / len(is_living_vals) if is_living_vals else None),
+            "living_area_sum": float(sum(living_area_vals)) if living_area_vals else 0.0,
         }
-        feats.append({"type":"Feature", "geometry": mapping(hex_poly), "properties": props})
 
-    return feats
+        nodes.append({
+            "polygon": hex_poly,
+            "centroid": hex_poly.centroid,
+            "width": hex_characteristic_width(hex_poly),
+            "point_indices": idxs,
+            "props": props,
+        })
+
+    return nodes
+
+
+def build_hex_neighbor_edges(nodes: List[Dict[str, Any]]) -> List[Tuple[int, int, float]]:
+    edges: List[Tuple[int, int, float]] = []
+    for i in range(len(nodes)):
+        for j in range(i + 1, len(nodes)):
+            a = nodes[i]["polygon"]
+            b = nodes[j]["polygon"]
+            try:
+                touches = a.touches(b) or a.intersection(b).length > 0.0
+            except Exception:
+                touches = a.touches(b)
+            if touches:
+                w = nodes[i]["centroid"].distance(nodes[j]["centroid"])
+                edges.append((i, j, float(w)))
+    return edges
+
+
+def _components_from_edges(n_nodes: int, edges: List[Tuple[int, int, float]]) -> Tuple[List[List[int]], Dict[int, List[Tuple[int, float]]]]:
+    adjacency: Dict[int, List[Tuple[int, float]]] = {i: [] for i in range(n_nodes)}
+    for u, v, w in edges:
+        adjacency[u].append((v, w))
+        adjacency[v].append((u, w))
+
+    visited = [False] * n_nodes
+    components: List[List[int]] = []
+    for i in range(n_nodes):
+        if visited[i]:
+            continue
+        stack = [i]
+        comp: List[int] = []
+        while stack:
+            cur = stack.pop()
+            if visited[cur]:
+                continue
+            visited[cur] = True
+            comp.append(cur)
+            for nb, _w in adjacency[cur]:
+                if not visited[nb]:
+                    stack.append(nb)
+        components.append(comp)
+    return components, adjacency
+
+
+def _prim_mst(component_nodes: List[int], adjacency: Dict[int, List[Tuple[int, float]]]) -> List[Tuple[int, int, float]]:
+    if len(component_nodes) <= 1:
+        return []
+
+    start = component_nodes[0]
+    visited = {start}
+    edges_out: List[Tuple[int, int, float]] = []
+
+    import heapq
+
+    heap: List[Tuple[float, int, int]] = []
+    for nb, w in adjacency[start]:
+        if nb in visited:
+            continue
+        heapq.heappush(heap, (w, start, nb))
+
+    component_set = set(component_nodes)
+    while heap and len(visited) < len(component_nodes):
+        w, u, v = heapq.heappop(heap)
+        if v in visited:
+            continue
+        visited.add(v)
+        edges_out.append((u, v, w))
+        for nb, w2 in adjacency[v]:
+            if nb in visited or nb not in component_set:
+                continue
+            heapq.heappush(heap, (w2, v, nb))
+    return edges_out
+
+
+def _longest_path_in_tree(tree_edges: List[Tuple[int, int, float]]) -> List[int]:
+    if not tree_edges:
+        return []
+
+    adjacency: Dict[int, List[int]] = {}
+    weights: Dict[Tuple[int, int], float] = {}
+    nodes_set = set()
+    for u, v, w in tree_edges:
+        adjacency.setdefault(u, []).append(v)
+        adjacency.setdefault(v, []).append(u)
+        weights[(u, v)] = w
+        weights[(v, u)] = w
+        nodes_set.add(u)
+        nodes_set.add(v)
+
+    def farthest(start: int) -> Tuple[int, Dict[int, Optional[int]], Dict[int, float]]:
+        stack: List[Tuple[int, Optional[int]]] = [(start, None)]
+        parent: Dict[int, Optional[int]] = {start: None}
+        dist: Dict[int, float] = {start: 0.0}
+        order: List[int] = []
+        while stack:
+            node, par = stack.pop()
+            order.append(node)
+            for nb in adjacency.get(node, []):
+                if nb == par:
+                    continue
+                parent[nb] = node
+                dist[nb] = dist[node] + weights.get((node, nb), 0.0)
+                stack.append((nb, node))
+        far_node = max(order, key=lambda n: dist.get(n, 0.0)) if order else start
+        return far_node, parent, dist
+
+    start = next(iter(nodes_set))
+    a, _, _ = farthest(start)
+    b, parent, _ = farthest(a)
+    path: List[int] = []
+    cur = b
+    while cur is not None:
+        path.append(cur)
+        if cur == a:
+            break
+        cur = parent.get(cur)
+    path.reverse()
+    return path
+
+
+def _branch_components(branch_edges: List[Tuple[int, int, float]]) -> List[Tuple[set[int], List[Tuple[int, int, float]]]]:
+    if not branch_edges:
+        return []
+    adjacency: Dict[int, List[Tuple[int, float]]] = {}
+    for u, v, w in branch_edges:
+        adjacency.setdefault(u, []).append((v, w))
+        adjacency.setdefault(v, []).append((u, w))
+
+    visited: set[int] = set()
+    comps: List[Tuple[set[int], List[Tuple[int, int, float]]]] = []
+    for node in list(adjacency.keys()):
+        if node in visited:
+            continue
+        stack = [node]
+        comp_nodes: set[int] = set()
+        comp_edges: List[Tuple[int, int, float]] = []
+        seen_edges: set[Tuple[int, int]] = set()
+        while stack:
+            cur = stack.pop()
+            if cur in visited:
+                continue
+            visited.add(cur)
+            comp_nodes.add(cur)
+            for nb, w in adjacency.get(cur, []):
+                ek = (min(cur, nb), max(cur, nb))
+                if ek not in seen_edges:
+                    seen_edges.add(ek)
+                    comp_edges.append((cur, nb, w))
+                if nb not in visited:
+                    stack.append(nb)
+        comps.append((comp_nodes, comp_edges))
+    return comps
+
+
+def _rectangle_for_segment(p0: Point, p1: Point, width: float) -> Optional[Polygon]:
+    if width <= 0:
+        return None
+    dx = p1.x - p0.x
+    dy = p1.y - p0.y
+    length = math.hypot(dx, dy)
+    if length <= 1e-9:
+        return None
+    ux = dx / length
+    uy = dy / length
+    px = -uy
+    py = ux
+    half_w = width / 2.0
+    extend = half_w
+    p0x = p0.x - ux * extend
+    p0y = p0.y - uy * extend
+    p1x = p1.x + ux * extend
+    p1y = p1.y + uy * extend
+    corners = [
+        (p0x - px * half_w, p0y - py * half_w),
+        (p0x + px * half_w, p0y + py * half_w),
+        (p1x + px * half_w, p1y + py * half_w),
+        (p1x - px * half_w, p1y - py * half_w),
+        (p0x - px * half_w, p0y - py * half_w),
+    ]
+    poly = Polygon(corners)
+    return poly if poly.is_valid else poly.buffer(0)
+
+
+def _aggregate_points(point_indices: List[int], moved_props: List[Dict[str, Any]]) -> Dict[str, Any]:
+    idx_set = sorted(set(point_indices))
+    e_vals = []
+    floors_vals = []
+    is_living_vals = []
+    living_area_vals = []
+    for idx in idx_set:
+        pr = moved_props[idx]
+        v = _to_float(pr.get("e"))
+        if v is not None:
+            e_vals.append(v)
+        fl = get_floors_value(pr)
+        if fl is not None:
+            floors_vals.append(fl)
+        il = get_is_living_value(pr)
+        if il is not None:
+            is_living_vals.append(il)
+        la = get_living_area_value(pr)
+        if la is not None:
+            living_area_vals.append(la)
+
+    floors_avg_round = None
+    if floors_vals:
+        floors_avg_round = int(round(sum(floors_vals) / len(floors_vals)))
+
+    return {
+        "pts_count": len(idx_set),
+        "e_max": (max(e_vals) if e_vals else None),
+        "is_living_max": (max(is_living_vals) if is_living_vals else None),
+        "living_area_sum": float(sum(living_area_vals)) if living_area_vals else 0.0,
+        "floors_avg_round": floors_avg_round,
+    }
 
 # ---- Основной скрипт ----
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch infer + centroid merge + ring segments + graph (Shapely < 2.0)")
+    ap = argparse.ArgumentParser(description="Batch infer + centroid merge + hex building graph (Shapely < 2.0)")
     ap.add_argument("--blocks", required=True, help="Входной GeoJSON (FeatureCollection) кварталов")
-    ap.add_argument("--out", required=True, help="Выходной GeoJSON линий графа (LineString)")
-    ap.add_argument("--out-infer-polys", default=None, help="Выход GeoJSON ПОЛИГОНОВ-СЕГМЕНТОВ второго кольца")
-    ap.add_argument("--out-infer-centroids", default=None, help="Выход GeoJSON СЛИТЫХ (и сдвинутых) центроидов (Point)")
+    ap.add_argument("--out", required=True, help="Выходной GeoJSON линий графа зданий (LineString)")
+    ap.add_argument("--out-infer-polys", default=None, help="Выход GeoJSON полигонов зданий (Polygon)")
+    ap.add_argument("--out-infer-centroids", default=None, help="Выход GeoJSON исходных точек зданий (Point)")
     ap.add_argument("--out-hex-grid", default=None,
-                help="Выход GeoJSON гекс-сетки по кварталам (Polygon)")
+                help="Выход GeoJSON гекс-сетки зданий (Polygon)")
     ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
     ap.add_argument("--model-ckpt", required=True, help="Путь к чекпойнту модели (.pt)")
     ap.add_argument("--config", default=None)
@@ -617,9 +693,6 @@ def main():
                     help="Радиус слияния центроидов внутри квартала (м)")
     ap.add_argument("--prob-field", default="e",
                     help="Имя поля вероятности для сортировки якорей (по умолчанию 'e')")
-    # граф
-    ap.add_argument("--graph-knn-k", type=int, default=6,
-                    help="Число ближайших соседей для кандидатных рёбер в Gabriel-графе (по умолчанию 6)")
     # сетка
     ap.add_argument("--hex-side-m", type=float, default=5.0,
                     help="Длина стороны гекса в метрах (по умолчанию 5.0)")
@@ -631,9 +704,9 @@ def main():
     args = ap.parse_args()
 
     stem = os.path.splitext(args.out)[0]
-    out_hex_grid_path = args.out_hex_grid or (stem + "_hex_grid.geojson")
-    out_infer_polys_path = args.out_infer_polys or (stem + "_ring_segments.geojson")
-    out_infer_centroids_path = args.out_infer_centroids or (stem + "_infer_centroids.geojson")
+    out_hex_grid_path = args.out_hex_grid or (stem + "_hexes.geojson")
+    out_buildings_path = args.out_infer_polys or (stem + "_buildings.geojson")
+    out_points_path = args.out_infer_centroids or (stem + "_points.geojson")
 
     vocab = load_services_vocab_from_artifacts(args.model_ckpt)
     svc_keys = pick_service_keys(vocab)
@@ -648,10 +721,12 @@ def main():
                                    for z, v in raw_targets.items()}
 
     fc_blocks = read_geojson(args.blocks)
-    out_edge_feats: List[Dict[str,Any]] = []
-    out_ring_segment_feats: List[Dict[str,Any]] = []
-    out_infer_centroid_feats: List[Dict[str,Any]] = []
+    out_point_feats: List[Dict[str,Any]] = []
     out_hex_feats: List[Dict[str,Any]] = []
+    out_graph_feats: List[Dict[str,Any]] = []
+    out_building_feats: List[Dict[str,Any]] = []
+    global_hex_id = 0
+    global_component_id = 0
     infer_uid = 0  # общий идентификатор пар (полигон<->центроид до слияния)
     
     tmpdir = tempfile.mkdtemp(prefix="ked_infer_")
@@ -766,12 +841,10 @@ def main():
             # Построение колец и срединной линии 20 м
             ring1, ring2, midline = build_rings(block_geom)
             mid_lines = lines_of(midline)
-            ring2_polys = polygon_or_multi(ring2)
 
             # Сдвиг центроидов: те, что в 0–10 м и 10–30 м — на срединную линию (20 м)
             moved_points: List[Point] = []
             moved_props:  List[Dict[str,Any]] = []
-            ring_assigned_for_segments = []  # индексы точек, попавших в кольцо 2 (после сдвига)
             for p, pr in zip(m_points, m_props):
                 status = "none"
                 q = p
@@ -783,11 +856,9 @@ def main():
                         li, q_on, _m = nearest_on_lines(mid_lines, p)
                         if li >= 0:
                             q = q_on
-                            ring_assigned_for_segments.append((len(moved_points), li))  # (idx в moved_points, линия)
                         pr = dict(pr)
                         pr["ring_snap"] = "to_ring2_midline"
                         pr["ring_zone"] = status
-                # точки вне колец оставляем
                 if "ring_snap" not in pr:
                     pr = dict(pr)
                     pr["ring_snap"] = "none"
@@ -795,124 +866,13 @@ def main():
                 moved_points.append(q)
                 moved_props.append(pr)
 
-            # Собираем точки на срединной линии для распределения сегментов
-            # Берём только те, что были в 0–10 или 10–30 (status != none) и у которых есть линия
-            pts_for_segments_idx = [i for (i, li) in ring_assigned_for_segments]
-            lines_map = {}
-            for (i, li) in ring_assigned_for_segments:
-                lines_map.setdefault(li, []).append(i)
-
-            # Подсчёт LA_sum по всем точкам кольца (для формулы веса)
-            la_vals = []
-            for idx in pts_for_segments_idx:
-                la = get_living_area_value(moved_props[idx])
-                la_vals.append(la if (la is not None and la > 0) else 0.0)
-            LA_sum = float(sum(la_vals)) if la_vals else 0.0
-
-            # Формируем сегменты на каждой компоненте срединной линии
-            for li, idxs in lines_map.items():
-                line = mid_lines[li]
-                if not line or line.length <= 1e-6:
-                    continue
-                # Сортируем точки по параметру вдоль линии
-                items = []
-                for idx in idxs:
-                    m = line.project(moved_points[idx])
-                    la = get_living_area_value(moved_props[idx])
-                    if la is not None and la > 0 and LA_sum > 0:
-                        w = 1.0 + (float(la) / LA_sum)
-                    else:
-                        w = 1.0
-                    items.append((m, idx, w))
-                items.sort(key=lambda t: t[0])
-
-                W = sum(w for _m, _idx, w in items)
-                if W <= 0:
-                    continue
-
-                L = float(line.length)
-                cursor = 0.0
-                order_local = 0
-                for m_along, idx, w in items:
-                    share = float(w) / W
-                    seg_len_raw = L * share
-
-                    start = cursor
-                    end = cursor + seg_len_raw
-                    cursor = end
-
-                    # Укорачиваем по 5 м с каждого края
-                    shrink = 5.0
-                    start_sh = start + shrink
-                    end_sh = end - shrink
-                    if end_sh - start_sh <= 1e-6:
-                        # слишком короткий сегмент — пропустим
-                        order_local += 1
-                        continue
-
-                    seg_line = line_substring(line, start_sh, end_sh)
-                    if seg_line is None or seg_line.length <= 1e-6:
-                        order_local += 1
-                        continue
-
-                    # Бафер 10 м (толщина полосы 20 м), потом клиппим вторым кольцом
-                    seg_poly_raw = seg_line.buffer(10.0, cap_style=2, join_style=2)
-                    # кольцо может быть мультиполигоном; пересечём со всем
-                    seg_poly = None
-                    for rp in ring2_polys or []:
-                        inter = seg_poly_raw.intersection(rp)
-                        if inter and not inter.is_empty:
-                            seg_poly = inter if seg_poly is None else seg_poly.union(inter)
-                    if (ring2 and not ring2.is_empty) and seg_poly is None:
-                        # как fallback: пересечение с ring2 целиком
-                        inter = seg_poly_raw.intersection(ring2)
-                        if inter and not inter.is_empty:
-                            seg_poly = inter
-
-                    if seg_poly is None or seg_poly.is_empty:
-                        order_local += 1
-                        continue
-
-                    # Свойства сегмента — от соответствующей точки + служебные
-                    pr = dict(moved_props[idx])
-                    pr.update({
-                        "ring": "second",
-                        "ring_inner_m": 10.0,
-                        "ring_outer_m": 30.0,
-                        "seg_line_len_raw_m": float(seg_len_raw),
-                        "seg_line_len_shrunk_m": float(end_sh - start_sh),
-                        "seg_weight": float(w),
-                        "seg_weight_norm_line": float(w / W),
-                        "seg_order_on_line": int(order_local),
-                        "seg_line_component": int(li),
-                        "block_index": int(bi),
-                        "zone": z,
-                    })
-
-                    out_ring_segment_feats.append({
-                        "type":"Feature",
-                        "geometry": mapping(seg_poly),
-                        "properties": pr
-                    })
-                    order_local += 1
-
             # Записываем СЛИТЫЕ и (возможные) СДВИНУТЫЕ центроиды
             for p, pr in zip(moved_points, moved_props):
-                out_infer_centroid_feats.append({
-                    "type":"Feature", "geometry": mapping(p), "properties": pr
+                out_point_feats.append({
+                    "type": "Feature", "geometry": mapping(p), "properties": pr
                 })
 
-            # строим граф по сдвинутым центроидам
-            edges = build_gabriel_knn_edges(
-                points=moved_points,
-                props_list=moved_props,
-                knn_k=int(args.graph_knn_k),
-                block_index=bi,
-                zone_label=z,
-            )
-            out_edge_feats.extend(edges)
-
-            hex_feats = build_hex_grid_features(
+            hex_nodes = build_hex_nodes(
                 block_geom=block_geom,
                 moved_points=moved_points,
                 moved_props=moved_props,
@@ -920,18 +880,128 @@ def main():
                 block_index=bi,
                 zone_label=z,
             )
-            out_hex_feats.extend(hex_feats)
+
+            if not hex_nodes:
+                continue
+
+            for node in hex_nodes:
+                props = dict(node["props"])
+                props["hex_id"] = int(global_hex_id)
+                node["hex_id"] = int(global_hex_id)
+                out_hex_feats.append({
+                    "type": "Feature",
+                    "geometry": mapping(node["polygon"]),
+                    "properties": props,
+                })
+                global_hex_id += 1
+
+            hex_edges = build_hex_neighbor_edges(hex_nodes)
+            components, adjacency = _components_from_edges(len(hex_nodes), hex_edges)
+
+            for comp in components:
+                if not comp:
+                    continue
+
+                tree_edges = _prim_mst(comp, adjacency)
+                if tree_edges:
+                    main_path = _longest_path_in_tree(tree_edges)
+                    if not main_path:
+                        main_path = [comp[0]]
+                else:
+                    main_path = [comp[0]]
+
+                main_edge_keys: set[Tuple[int, int]] = set()
+                for i in range(len(main_path) - 1):
+                    a = main_path[i]
+                    b = main_path[i + 1]
+                    main_edge_keys.add((min(a, b), max(a, b)))
+
+                comp_widths = [hex_nodes[idx]["width"] for idx in comp if hex_nodes[idx]["width"] > 0]
+                default_width = float(sum(comp_widths) / len(comp_widths)) if comp_widths else float(args.hex_side_m)
+
+                main_widths = [hex_nodes[idx]["width"] for idx in main_path if hex_nodes[idx]["width"] > 0]
+                main_width = float(sum(main_widths) / len(main_widths)) if main_widths else default_width
+
+                branch_edges = [e for e in tree_edges if (min(e[0], e[1]), max(e[0], e[1])) not in main_edge_keys]
+                branch_comps = _branch_components(branch_edges)
+
+                edge_widths: Dict[Tuple[int, int], float] = {}
+                for key in main_edge_keys:
+                    edge_widths[key] = main_width
+
+                for nodes_set, branch_edge_list in branch_comps:
+                    b_widths = [hex_nodes[idx]["width"] for idx in nodes_set if hex_nodes[idx]["width"] > 0]
+                    branch_width = float(sum(b_widths) / len(b_widths)) if b_widths else default_width
+                    for u, v, _w in branch_edge_list:
+                        key = (min(u, v), max(u, v))
+                        edge_widths[key] = branch_width
+
+                rectangles: List[Polygon] = []
+
+                for u, v, _w in tree_edges:
+                    key = (min(u, v), max(u, v))
+                    width = edge_widths.get(key, default_width)
+                    rect = _rectangle_for_segment(hex_nodes[u]["centroid"], hex_nodes[v]["centroid"], width)
+                    if rect and not rect.is_empty:
+                        rectangles.append(rect)
+                    line_props = {
+                        "component_id": int(global_component_id),
+                        "block_index": int(bi),
+                        "zone": z,
+                        "line_type": "main" if key in main_edge_keys else "branch",
+                        "buffer_width_m": float(width),
+                        "hex_u": int(hex_nodes[u]["hex_id"]),
+                        "hex_v": int(hex_nodes[v]["hex_id"]),
+                    }
+                    out_graph_feats.append({
+                        "type": "Feature",
+                        "geometry": mapping(LineString([hex_nodes[u]["centroid"], hex_nodes[v]["centroid"]])),
+                        "properties": line_props,
+                    })
+
+                if rectangles:
+                    building_geom = unary_union(rectangles)
+                else:
+                    building_geom = unary_union([hex_nodes[idx]["polygon"] for idx in comp])
+
+                if building_geom is None or building_geom.is_empty:
+                    global_component_id += 1
+                    continue
+
+                point_indices: List[int] = []
+                for idx in comp:
+                    point_indices.extend(hex_nodes[idx]["point_indices"])
+
+                agg = _aggregate_points(point_indices, moved_props)
+                poly_props = {
+                    "component_id": int(global_component_id),
+                    "block_index": int(bi),
+                    "zone": z,
+                    "pts_count": int(agg["pts_count"]),
+                    "e_max": (float(agg["e_max"]) if agg["e_max"] is not None else None),
+                    "living_area_sum": float(agg["living_area_sum"]),
+                    "is_living_max": (float(agg["is_living_max"]) if agg["is_living_max"] is not None else None),
+                    "floors_avg_round": (int(agg["floors_avg_round"]) if agg["floors_avg_round"] is not None else None),
+                }
+
+                out_building_feats.append({
+                    "type": "Feature",
+                    "geometry": mapping(building_geom),
+                    "properties": poly_props,
+                })
+
+                global_component_id += 1
 
         # Запись результатов
-        write_geojson(args.out, {"type":"FeatureCollection","features": out_edge_feats}, epsg=args.out_epsg)
-        write_geojson(out_infer_polys_path, {"type":"FeatureCollection","features": out_ring_segment_feats}, epsg=args.out_epsg)
-        write_geojson(out_infer_centroids_path, {"type":"FeatureCollection","features": out_infer_centroid_feats}, epsg=args.out_epsg)
-        write_geojson(out_hex_grid_path, {"type":"FeatureCollection","features": out_hex_feats}, epsg=args.out_epsg)
+        write_geojson(args.out, {"type": "FeatureCollection", "features": out_graph_feats}, epsg=args.out_epsg)
+        write_geojson(out_buildings_path, {"type": "FeatureCollection", "features": out_building_feats}, epsg=args.out_epsg)
+        write_geojson(out_points_path, {"type": "FeatureCollection", "features": out_point_feats}, epsg=args.out_epsg)
+        write_geojson(out_hex_grid_path, {"type": "FeatureCollection", "features": out_hex_feats}, epsg=args.out_epsg)
 
-        print(f"[OK] hex grid cells:         {len(out_hex_feats)} → {out_hex_grid_path}")
-        print(f"[OK] graph edges:            {len(out_edge_feats)} → {args.out}")
-        print(f"[OK] ring2 segments:         {len(out_ring_segment_feats)} → {out_infer_polys_path}")
-        print(f"[OK] merged+snapped points:  {len(out_infer_centroid_feats)} → {out_infer_centroids_path}")
+        print(f"[OK] hex cells:              {len(out_hex_feats)} → {out_hex_grid_path}")
+        print(f"[OK] building graph lines:   {len(out_graph_feats)} → {args.out}")
+        print(f"[OK] building polygons:      {len(out_building_feats)} → {out_buildings_path}")
+        print(f"[OK] points:                 {len(out_point_feats)} → {out_points_path}")
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
