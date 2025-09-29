@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import unicodedata
@@ -61,9 +62,11 @@ def _extract_capacity(row: Mapping[str, object], fields: Sequence[str]) -> float
     for field in fields:
         if field in row and row[field] is not None:
             try:
-                return float(row[field])
+                value = float(row[field])
             except Exception:
                 continue
+            if math.isfinite(value):
+                return value
     return 1.0
 
 

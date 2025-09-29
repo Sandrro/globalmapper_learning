@@ -1365,9 +1365,12 @@ class HCanonGraphDataset(Dataset):
             mhot[idx] = 1.0 if has_val else 0.0
             if has_val and cap_col:
                 try:
-                    cap_vec[idx] = float(getattr(row, cap_col, 0.0))
+                    val = float(getattr(row, cap_col, 0.0))
                 except Exception:
-                    cap_vec[idx] = 0.0
+                    val = 0.0
+                if not np.isfinite(val):
+                    val = 0.0
+                cap_vec[idx] = val
         return mhot, cap_vec
 
     def _node_targets(self, df_nodes_block: pd.DataFrame) -> Dict[str, torch.Tensor]:
@@ -1402,9 +1405,26 @@ class HCanonGraphDataset(Dataset):
             m, c = self._services_vecs(r)
             mhot_list.append(m); cap_list.append(c)
         if self.num_services > 0:
-            sv1 = torch.as_tensor(np.vstack(mhot_list), dtype=torch.float32)
-            svc_raw = torch.as_tensor(np.vstack(cap_list), dtype=torch.float32)
-            svc = self._normalizer.encode_svc(svc_raw)
+            mhot_arr = np.nan_to_num(
+                np.vstack(mhot_list).astype(np.float32),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            cap_arr = np.nan_to_num(
+                np.vstack(cap_list).astype(np.float32),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
+            sv1 = torch.as_tensor(mhot_arr, dtype=torch.float32)
+            svc_raw = torch.as_tensor(cap_arr, dtype=torch.float32)
+            svc = torch.nan_to_num(
+                self._normalizer.encode_svc(svc_raw),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
             svc_mask = (sv1 > 0).float()
         else:
             sv1 = torch.zeros((N,0), dtype=torch.float32)
@@ -1495,8 +1515,18 @@ class HCanonGraphDataset(Dataset):
                 m, c = self._services_vecs(r)
                 acc_caps += c
                 acc_pres = np.maximum(acc_pres, m)
-            svc_block_norm = self._normalizer.encode_svc(torch.tensor(acc_caps, dtype=torch.float32)).view(-1)
-            sv1_block = torch.tensor(acc_pres, dtype=torch.float32).view(-1)
+            acc_caps = np.nan_to_num(acc_caps, nan=0.0, posinf=0.0, neginf=0.0)
+            acc_pres = np.nan_to_num(acc_pres, nan=0.0, posinf=0.0, neginf=0.0)
+            svc_block_raw = torch.tensor(acc_caps, dtype=torch.float32)
+            svc_block_raw = torch.nan_to_num(svc_block_raw, nan=0.0, posinf=0.0, neginf=0.0)
+            svc_block_norm = torch.nan_to_num(
+                self._normalizer.encode_svc(svc_block_raw),
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).view(-1)
+            sv1_block = torch.tensor(acc_pres, dtype=torch.float32)
+            sv1_block = torch.nan_to_num(sv1_block, nan=0.0, posinf=0.0, neginf=0.0).view(-1)
         else:
             svc_block_norm = torch.zeros((0,), dtype=torch.float32)
             sv1_block = torch.zeros((0,), dtype=torch.float32)
