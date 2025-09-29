@@ -4,11 +4,11 @@ experiment: graphgen_hcanon_v1
 seed: 42
 
 paths:
-  data_dir: ./out_2
-  model_ckpt: ./out_2/checkpoints/graphgen_hcanon_v1.pt
-  zones_json: ./out_2/zones.json
-  services_json: ./out_2/services.json
-  mask_dir: ./out_2/masks
+  data_dir: ./out_4
+  model_ckpt: ./out_4/checkpoints/graphgen_hcanon_v1.pt
+  zones_json: ./out_4/zones.json
+  services_json: ./out_4/services.json
+  mask_dir: ./out_4/masks
 
 model:
   hidden: 256           # -> GraphModel(hidden)
