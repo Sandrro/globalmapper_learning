@@ -44,7 +44,7 @@ except Exception:
 # --- Гео-зависимости (Shapely < 2.0 поддерживается) ---
 try:
     from shapely.geometry import shape, mapping, Point, Polygon, MultiPolygon, LineString, MultiLineString
-    from shapely.ops import nearest_points, unary_union
+    from shapely.ops import nearest_points, unary_union, linemerge
 except Exception:
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
@@ -157,6 +157,171 @@ def normalize_targets_map(raw: Any) -> Dict[str, Dict[str, float]]:
     return out
 
 # ---- Вспомогательные извлечения атрибутов ----
+
+def _flatten_polygons(g):
+    """Достаёт список Polygon из произвольной геометрии (Polygon/MultiPolygon/GeometryCollection)."""
+    if g is None or g.is_empty:
+        return []
+    polys = []
+    if isinstance(g, Polygon):
+        polys.append(g)
+    elif isinstance(g, MultiPolygon):
+        polys.extend(list(g.geoms))
+    else:
+        # Например, GeometryCollection: вытаскиваем полигоны рекурсивно
+        if hasattr(g, "geoms"):
+            for sub in g.geoms:
+                polys.extend(_flatten_polygons(sub))
+    return polys
+
+def postprocess_building_geom(geom,
+                              simplify_m=0.75,
+                              fill_buffer_m=1.5,
+                              min_area_m2=4.0,
+                              clip_to=None):
+    """
+    Морфологическая пост-обработка итоговой геометрии здания(ий):
+      1) Закрытие мелких дыр и щелей: buffer(+d) -> buffer(-d) (d = fill_buffer_m).
+      2) Топологически безопасное упрощение: simplify(simplify_m, preserve_topology=True).
+      3) Удаление микрополигонов: площадь < min_area_m2.
+      4) Починка валидности: buffer(0).
+      5) (Опц.) Клип по кварталу (clip_to).
+
+    Совместимо с Shapely < 2.0.
+    """
+    if geom is None or geom.is_empty:
+        return geom
+
+    g = geom
+
+    # 1) «Заливка» отверстий/щелей через плюс-минус буфер
+    if abs(float(fill_buffer_m)) > 0.0:
+        try:
+            g = g.buffer(float(fill_buffer_m),  join_style=3)
+            g = g.buffer(-float(fill_buffer_m), join_style=3)
+        except Exception:
+            # Если что-то пошло не так — починим и попробуем минимально
+            g = g.buffer(0)
+
+    # 2) Упрощение контура с сохранением топологии
+    if float(simplify_m) > 0.0:
+        try:
+            g = g.simplify(float(simplify_m), preserve_topology=True)
+        except Exception:
+            pass
+
+    # 3) Отсев микрополигонов
+    polys = _flatten_polygons(g)
+    if polys:
+        polys = [p if p.is_valid else p.buffer(0) for p in polys]
+        polys = [p for p in polys if (p and (p.area or 0.0) >= float(min_area_m2))]
+        if polys:
+            g = unary_union(polys)
+        else:
+            return Polygon()  # пусто после отсева
+    else:
+        # Если это не полигоны (вдруг), починим и вернём как есть
+        g = g.buffer(0)
+
+    # 4) Починка валидности
+    try:
+       g = g.buffer(0, join_style=3)
+    except Exception:
+        pass
+
+    # 5) (Опционально) ограничиваем границами квартала,
+    #    чтобы буфер не «выползал» за пределы
+    if clip_to is not None and (not clip_to.is_empty):
+        try:
+            g = g.intersection(clip_to)
+            g = g.buffer(0)  # ещё раз на всякий
+        except Exception:
+            pass
+
+    return g
+
+def _angle_deg(p_prev: Point, p_mid: Point, p_next: Point) -> float:
+    """Внутренний угол в градусах в вершине p_mid для полилинии p_prev -> p_mid -> p_next."""
+    ax, ay = p_prev.x - p_mid.x, p_prev.y - p_mid.y
+    bx, by = p_next.x - p_mid.x, p_next.y - p_mid.y
+    la = math.hypot(ax, ay); lb = math.hypot(bx, by)
+    if la <= 1e-9 or lb <= 1e-9:
+        return 180.0
+    cosv = max(-1.0, min(1.0, (ax*bx + ay*by) / (la*lb)))
+    return math.degrees(math.acos(cosv))
+
+def _hexes_touch(poly_a: Polygon, poly_c: Polygon) -> bool:
+    """Соприкасаются ли гексы (общая граница/вершина)."""
+    try:
+        return poly_a.touches(poly_c) or poly_a.intersection(poly_c).length > 0.0
+    except Exception:
+        return poly_a.touches(poly_c)
+
+def simplify_main_path_by_angles(main_path: List[int],
+                                 hex_nodes: List[Dict[str, Any]],
+                                 angle_thr_deg: float,
+                                 require_touch: bool) -> List[int]:
+    """
+    Удаляет «острые» переломы: для троек (a,b,c) с углом < angle_thr_deg
+    заменяем отрезки a-b, b-c на прямой a-c, если (опц.) гексы a и c соприкасаются.
+    Повторяем до стабилизации.
+    """
+    if len(main_path) < 3:
+        return main_path[:]
+    path = main_path[:]
+    changed = True
+    safe_iters = 0
+    while changed and len(path) >= 3 and safe_iters < 100:
+        changed = False
+        safe_iters += 1
+        i = 1
+        while i < len(path) - 1:
+            a, b, c = path[i-1], path[i], path[i+1]
+            pa = hex_nodes[a]["centroid"]; pb = hex_nodes[b]["centroid"]; pc = hex_nodes[c]["centroid"]
+            ang = _angle_deg(pa, pb, pc)
+            ok_touch = True
+            if require_touch:
+                ok_touch = _hexes_touch(hex_nodes[a]["polygon"], hex_nodes[c]["polygon"])
+            if ang < angle_thr_deg and ok_touch:
+                # выкидываем b
+                path.pop(i)
+                changed = True
+            else:
+                i += 1
+    return path
+
+def _bbox_from_points(pts: List[Point]) -> Optional[Polygon]:
+    if not pts:
+        return None
+    xs = [p.x for p in pts]; ys = [p.y for p in pts]
+    minx, maxx = min(xs), max(xs)
+    miny, maxy = min(ys), max(ys)
+    if maxx - minx <= 0 or maxy - miny <= 0:
+        return None
+    return Polygon([(minx, miny),(maxx, miny),(maxx, maxy),(minx, maxy)])
+
+def _inset_bbox_rect(rect: Polygon, inset: float) -> Optional[Polygon]:
+    """Вычисляет внутренний прямоугольник, сдвинутый на inset со всех сторон."""
+    if rect is None or rect.is_empty:
+        return None
+    minx, miny, maxx, maxy = rect.bounds
+    minx2 = minx + inset; maxx2 = maxx - inset
+    miny2 = miny + inset; maxy2 = maxy - inset
+    if minx2 >= maxx2 or miny2 >= maxy2:
+        return None
+    return Polygon([(minx2, miny2),(maxx2, miny2),(maxx2, maxy2),(minx2, maxy2)])
+
+def is_almost_closed_loop(main_path: List[int],
+                          hex_nodes: List[Dict[str, Any]],
+                          main_width: float,
+                          min_nodes: int,
+                          close_thr_mult: float) -> bool:
+    if len(main_path) < max(3, min_nodes):
+        return False
+    p0 = hex_nodes[main_path[0]]["centroid"]
+    pN = hex_nodes[main_path[-1]]["centroid"]
+    # «почти замкнуто»: концы достаточно близко
+    return p0.distance(pN) <= close_thr_mult * max(main_width, 1.0)
 
 def _to_float(x) -> Optional[float]:
     try:
@@ -699,7 +864,35 @@ def main():
     # crs
     ap.add_argument("--out-epsg", type=int, default=32636,
                     help="EPSG-код для записи всех выходных GeoJSON (по умолчанию 32636)")
-    
+     # пост-обработка полигонов
+    ap.add_argument("--poly-simplify-m", type=float, default=0.75,
+                    help="Допуск упрощения полигонов зданий (м), preserve_topology=True (по умолчанию 0.75)")
+    ap.add_argument("--poly-fill-buffer-m", type=float, default=1.5,
+                    help="Дельта морфологического закрытия дыр: buffer(+d)->buffer(-d) (м), по умолчанию 1.5")
+    ap.add_argument("--poly-min-area-m2", type=float, default=4.0,
+                    help="Минимальная площадь части полигона (м²) после обработки (по умолчанию 4.0)")
+    ap.add_argument("--clip-to-block", dest="clip_to_block", action="store_true", default=True,
+                    help="Обрезать финальные полигоны по границе квартала (вкл. по умолчанию)")
+    ap.add_argument("--no-clip-to-block", dest="clip_to_block", action="store_false")
+    # режим построения полигонов
+    ap.add_argument("--poly-main-only", dest="poly_main_only", action="store_true", default=False,
+                    help="Создавать полигоны только по рёбрам основной ветки (longest path) MST в компоненте")
+    ap.add_argument("--poly-all-branches", dest="poly_main_only", action="store_false",
+                    help="(По умолчанию) Использовать и основную ветку, и ветви при построении полигонов")
+        # выпрямление главной цепочки и двор-колецо
+    ap.add_argument("--main-angle-straighten-deg", type=float, default=70.0,
+                    help="Порог острого угла (в градусах) для выпрямления главной цепочки (по умолчанию 70)")
+    ap.add_argument("--main-angle-require-touch", action="store_true", default=True,
+                    help="Требовать соприкосновение гексов концов при выпрямлении (по умолчанию да)")
+    ap.add_argument("--loop-min-nodes", type=int, default=6,
+                    help="Мин. число узлов в главной цепочке для проверки почти-цикла")
+    ap.add_argument("--loop-close-thr-mult", type=float, default=1.2,
+                    help="Порог замыкания: dist(start,end) <= mult * main_width (по умолчанию 1.2)")
+    ap.add_argument("--poly-rect-courtyard-if-loop", dest="poly_rect_courtyard_if_loop",
+                    action="store_true", default=True,
+                    help="Если главная цепочка почти замкнута — строить прямоугольник с внутренним двором")
+    ap.add_argument("--no-poly-rect-courtyard-if-loop", dest="poly_rect_courtyard_if_loop",
+                    action="store_false")
 
     args = ap.parse_args()
 
@@ -910,10 +1103,15 @@ def main():
                 else:
                     main_path = [comp[0]]
 
-                main_edge_keys: set[Tuple[int, int]] = set()
+                main_path = simplify_main_path_by_angles(
+                    main_path, hex_nodes,
+                    angle_thr_deg=float(args.main_angle_straighten_deg),
+                    require_touch=bool(args.main_angle_require_touch)
+                )
+
+                main_edge_keys: set[Tuple[int,int]] = set()
                 for i in range(len(main_path) - 1):
-                    a = main_path[i]
-                    b = main_path[i + 1]
+                    a = main_path[i]; b = main_path[i + 1]
                     main_edge_keys.add((min(a, b), max(a, b)))
 
                 comp_widths = [hex_nodes[idx]["width"] for idx in comp if hex_nodes[idx]["width"] > 0]
@@ -921,6 +1119,13 @@ def main():
 
                 main_widths = [hex_nodes[idx]["width"] for idx in main_path if hex_nodes[idx]["width"] > 0]
                 main_width = float(sum(main_widths) / len(main_widths)) if main_widths else default_width
+
+                loop_detected = is_almost_closed_loop(
+                    main_path, hex_nodes,
+                    main_width=main_width,
+                    min_nodes=int(args.loop_min_nodes),
+                    close_thr_mult=float(args.loop_close_thr_mult)
+                )
 
                 branch_edges = [e for e in tree_edges if (min(e[0], e[1]), max(e[0], e[1])) not in main_edge_keys]
                 branch_comps = _branch_components(branch_edges)
@@ -936,40 +1141,85 @@ def main():
                         key = (min(u, v), max(u, v))
                         edge_widths[key] = branch_width
 
-                rectangles: List[Polygon] = []
+                main_lines = []
+                for i in range(len(main_path) - 1):
+                    u = main_path[i]; v = main_path[i + 1]
+                    main_lines.append(LineString([hex_nodes[u]["centroid"], hex_nodes[v]["centroid"]]))
+                merged_main_line = None
+                if main_lines:
+                    try:
+                        merged_main_line = linemerge(MultiLineString(main_lines))
+                    except Exception:
+                        merged_main_line = unary_union(main_lines)
 
+                # --- RECTANGLES & LINES (как раньше, для вывода линий и/или ветвей) ---
+                rectangles_main: List[Polygon] = []
+                rectangles_all:  List[Polygon] = []
                 for u, v, _w in tree_edges:
                     key = (min(u, v), max(u, v))
                     width = edge_widths.get(key, default_width)
+
+                    # прямоугольник по ребру (оставим; нужен для ветвей и общего режима)
                     rect = _rectangle_for_segment(hex_nodes[u]["centroid"], hex_nodes[v]["centroid"], width)
                     if rect and not rect.is_empty:
-                        rectangles.append(rect)
-                    line_props = {
-                        "component_id": int(global_component_id),
-                        "block_index": int(bi),
-                        "zone": z,
-                        "line_type": "main" if key in main_edge_keys else "branch",
-                        "buffer_width_m": float(width),
-                        "hex_u": int(hex_nodes[u]["hex_id"]),
-                        "hex_v": int(hex_nodes[v]["hex_id"]),
-                    }
+                        rectangles_all.append(rect)
+                        if key in main_edge_keys:
+                            rectangles_main.append(rect)
+
+                    # запись линий графа — как было
                     out_graph_feats.append({
                         "type": "Feature",
                         "geometry": mapping(LineString([hex_nodes[u]["centroid"], hex_nodes[v]["centroid"]])),
-                        "properties": line_props,
+                        "properties": {
+                            "component_id": int(global_component_id),
+                            "block_index": int(bi),
+                            "zone": z,
+                            "line_type": "main" if key in main_edge_keys else "branch",
+                            "buffer_width_m": float(width),
+                            "hex_u": int(hex_nodes[u]["hex_id"]),
+                            "hex_v": int(hex_nodes[v]["hex_id"]),
+                        },
                     })
 
-                if rectangles:
-                    building_geom = unary_union(rectangles)
+                # --- ГЕОМЕТРИЯ ЗДАНИЙ ---
+                if args.poly_main_only and merged_main_line and (not merged_main_line.is_empty):
+                    if args.poly_rect_courtyard_if_loop and loop_detected:
+                        # Прямоугольник с внутренним двором из bbox
+                        bbox_poly = _bbox_from_points([hex_nodes[i]["centroid"] for i in main_path])
+                        inner = _inset_bbox_rect(bbox_poly, inset=float(main_width))
+                        if bbox_poly is not None and inner is not None:
+                            building_geom = bbox_poly.difference(inner)
+                        else:
+                            # fallback: обычный буфер
+                            building_geom = merged_main_line.buffer(float(main_width)/2.0, cap_style=2, join_style=3)
+                    else:
+                        # Обычный коридор по слитой линии главной цепочки
+                        building_geom = merged_main_line.buffer(float(main_width)/2.0, cap_style=2, join_style=3)
+                    node_ids_for_poly = main_path
                 else:
-                    building_geom = unary_union([hex_nodes[idx]["polygon"] for idx in comp])
+                    # общий режим: используем либо все прямоугольники, либо только главные
+                    rectangles_to_use = rectangles_main if args.poly_main_only else rectangles_all
+                    node_ids_for_poly = main_path if args.poly_main_only else comp
+                    if rectangles_to_use:
+                        building_geom = unary_union(rectangles_to_use)
+                    else:
+                        building_geom = unary_union([hex_nodes[idx]["polygon"] for idx in node_ids_for_poly]) if node_ids_for_poly else None
 
+                # пост-обработка (как раньше)
+                building_geom = postprocess_building_geom(
+                    building_geom,
+                    simplify_m=float(args.poly_simplify_m),
+                    fill_buffer_m=float(args.poly_fill_buffer_m),
+                    min_area_m2=float(args.poly_min_area_m2),
+                    clip_to=(block_geom if args.clip_to_block else None),
+                )
                 if building_geom is None or building_geom.is_empty:
                     global_component_id += 1
                     continue
 
+                # агрегации — без изменений
                 point_indices: List[int] = []
-                for idx in comp:
+                for idx in node_ids_for_poly:
                     point_indices.extend(hex_nodes[idx]["point_indices"])
 
                 agg = _aggregate_points(point_indices, moved_props)
