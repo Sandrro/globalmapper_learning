@@ -1,0 +1,21 @@
+clustering:
+  algorithm: auto  # auto -> пытается hdbscan, затем DBSCAN из sklearn
+  min_cluster_size: 8
+  min_samples: 5
+  dbscan:
+    eps: 35.0
+    min_samples: 5
+
+geometry:
+  round_ratio_max: 1.5      # Отношение длин сторон min_rotated_rectangle для «круглых» кластеров
+  elongated_ratio_min: 2.0  # Порог отношения для вытянутых кластеров
+  narrow_width_max: 70.0    # Порог ширины для узких вытянутых кластеров
+  wall_thickness: 15.0      # Толщина стен (м)
+  min_courtyard_area: 100.0 # Минимальная площадь двора (м²)
+  center_distance_min: 45.0 # Мин. расстояние до границы квартала для «центрального» здания
+  corner_distance_max: 35.0 # Макс. расстояние до ближайшей вершины квартала для «углового» здания
+  circle_segments: 32       # Количество сегментов при аппроксимации окружности (buffer)
+  bend_angle_min: 90.0      # Нижний предел угла для изломанных кластеров
+  bend_angle_max: 170.0     # Верхний предел угла для изломанных кластеров
+  h_bar_gap: 20.0           # Расстояние между «ножками» H-образного здания
+  h_bar_length_factor: 0.8  # Во сколько раз ножки H короче длинной стороны прямоугольника
