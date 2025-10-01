@@ -1,10 +1,9 @@
 clustering:
-  algorithm: auto  # auto -> пытается hdbscan, затем DBSCAN из sklearn
-  min_cluster_size: 8
-  min_samples: 5
-  dbscan:
-    eps: 35.0
-    min_samples: 5
+  min_cluster_size: 8       # Минимальный размер сообщества, которое считаем кластером
+  knn_k: 8                  # Число соседей в kNN-графе (0 — отключить kNN-рёбра)
+  use_gabriel: true         # Строить ли дополнительно рёбра Габриелевой графы
+  community_algorithm: greedy  # greedy | label_propagation
+  min_samples: 5            # Legacy: используется как значение по умолчанию для knn_k
 
 geometry:
   round_ratio_max: 1.5      # Отношение длин сторон min_rotated_rectangle для «круглых» кластеров

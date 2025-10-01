@@ -9,14 +9,14 @@
 Основные этапы:
 1. Вызов train.py --mode infer по каждому кварталу (аналог batch_infer_blocks).
 2. Слияние центроидов в радиусе и «прилипание» к срединной линии второго кольца.
-3. Пространственная кластеризация точек (hdbscan, при недоступности — DBSCAN).
+3. Формирование графа близости (Gabriel + kNN) и поиск сообществ.
 4. Построение геометрии зданий для каждого кластера с учётом параметров из YAML.
 5. Агрегация атрибутов точек (e_max, is_living_max, living_area_sum, floors_avg_round).
 
 Требования:
 - Shapely < 2.0 (проверено на 1.7/1.8).
 - PyYAML для чтения параметров.
-- Опционально hdbscan, иначе sklearn.cluster.DBSCAN.
+- NetworkX для построения графа и поиска сообществ.
 
 Выходы:
   --out-buildings        : полигоны зданий (Polygon) с агрегированными атрибутами.
@@ -63,6 +63,8 @@ except Exception:  # pragma: no cover
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
 
+import networkx as nx
+
 # ---- Переиспользование функций исходного пайплайна ----
 
 from batch_infer_blocks import (  # noqa: E402
@@ -83,11 +85,10 @@ from batch_infer_blocks import (  # noqa: E402
 )
 @dataclass
 class ClusterParams:
-    algorithm: str
     min_cluster_size: int
-    min_samples: int
-    dbscan_eps: float
-    dbscan_min_samples: int
+    knn_k: int
+    use_gabriel: bool
+    community_algorithm: str
 
 
 @dataclass
@@ -112,12 +113,13 @@ def load_params(path: str) -> Tuple[ClusterParams, GeometryParams]:
     data = data or {}
     cl = data.get("clustering") or {}
     geom = data.get("geometry") or {}
+    min_samples = int(cl.get("min_samples", 5))
+    knn_k = int(cl.get("knn_k", max(1, min_samples)))
     cparams = ClusterParams(
-        algorithm=str(cl.get("algorithm", "auto")),
         min_cluster_size=int(cl.get("min_cluster_size", 8)),
-        min_samples=int(cl.get("min_samples", 5)),
-        dbscan_eps=float(((cl.get("dbscan") or {}).get("eps", 35.0))),
-        dbscan_min_samples=int(((cl.get("dbscan") or {}).get("min_samples", 5))),
+        knn_k=max(0, knn_k),
+        use_gabriel=bool(cl.get("use_gabriel", True)),
+        community_algorithm=str(cl.get("community_algorithm", "greedy")),
     )
     gparams = GeometryParams(
         round_ratio_max=float(geom.get("round_ratio_max", 1.5)),
@@ -141,49 +143,108 @@ def load_params(path: str) -> Tuple[ClusterParams, GeometryParams]:
 class Clusterer:
     def __init__(self, params: ClusterParams):
         self.params = params
-        self._algo = None
-        self._init_algorithm()
-
-    def _init_algorithm(self) -> None:
-        algo = self.params.algorithm.lower()
-        if algo not in {"auto", "hdbscan", "dbscan"}:
-            algo = "auto"
-        self._algo = algo
-        if algo in ("auto", "hdbscan"):
-            try:
-                import hdbscan  # type: ignore
-
-                self._hdbscan_cls = hdbscan.HDBSCAN
-                self._algo = "hdbscan"
-                return
-            except Exception:
-                if algo == "hdbscan":
-                    print("[WARN] hdbscan не доступен, переключаемся на DBSCAN.", file=sys.stderr)
-        try:
-            from sklearn.cluster import DBSCAN  # type: ignore
-
-            self._dbscan_cls = DBSCAN
-            self._algo = "dbscan"
-        except Exception as exc:
-            raise RuntimeError("Не удалось инициализировать алгоритм кластеризации: {}".format(exc))
 
     def fit_predict(self, coords: np.ndarray) -> np.ndarray:
-        if len(coords) == 0:
+        n = len(coords)
+        if n == 0:
             return np.empty((0,), dtype=int)
-        if getattr(self, "_algo", None) == "hdbscan":
-            clusterer = self._hdbscan_cls(
-                min_cluster_size=self.params.min_cluster_size,
-                min_samples=self.params.min_samples,
-                allow_single_cluster=False,
-            )
-            labels = clusterer.fit_predict(coords)
-        else:
-            clusterer = self._dbscan_cls(
-                eps=self.params.dbscan_eps,
-                min_samples=self.params.dbscan_min_samples,
-            )
-            labels = clusterer.fit_predict(coords)
+
+        labels = np.full((n,), -1, dtype=int)
+        graph = self._build_graph(coords)
+        if graph.number_of_nodes() == 0:
+            return labels
+
+        communities = self._detect_communities(graph)
+        cluster_id = 0
+        for community in communities:
+            if len(community) < max(1, self.params.min_cluster_size):
+                continue
+            for idx in community:
+                labels[idx] = cluster_id
+            cluster_id += 1
         return labels
+
+    def _build_graph(self, coords: np.ndarray) -> nx.Graph:
+        graph = nx.Graph()
+        n = len(coords)
+        graph.add_nodes_from(range(n))
+        if n <= 1:
+            return graph
+
+        dist2 = self._pairwise_squared_distances(coords)
+        edges = set()
+
+        if self.params.use_gabriel and n >= 2:
+            edges.update(self._gabriel_edges(dist2))
+
+        k = min(self.params.knn_k, n - 1)
+        if k > 0:
+            edges.update(self._knn_edges(dist2, k))
+
+        for i, j in edges:
+            if i == j:
+                continue
+            d = math.sqrt(dist2[i, j])
+            weight = 1.0 / max(d, 1e-6)
+            graph.add_edge(int(i), int(j), weight=weight, distance=d)
+        return graph
+
+    @staticmethod
+    def _pairwise_squared_distances(coords: np.ndarray) -> np.ndarray:
+        diff = coords[:, None, :] - coords[None, :, :]
+        return np.einsum("ijk,ijk->ij", diff, diff)
+
+    def _gabriel_edges(self, dist2: np.ndarray) -> List[Tuple[int, int]]:
+        n = dist2.shape[0]
+        edges: List[Tuple[int, int]] = []
+        eps = 1e-9
+        for i in range(n):
+            for j in range(i + 1, n):
+                dij = dist2[i, j]
+                if dij <= eps:
+                    edges.append((i, j))
+                    continue
+                keep = True
+                for k in range(n):
+                    if k == i or k == j:
+                        continue
+                    if dij > dist2[i, k] + dist2[j, k] + eps:
+                        keep = False
+                        break
+                if keep:
+                    edges.append((i, j))
+        return edges
+
+    def _knn_edges(self, dist2: np.ndarray, k: int) -> List[Tuple[int, int]]:
+        n = dist2.shape[0]
+        edges: List[Tuple[int, int]] = []
+        for i in range(n):
+            order = np.argsort(dist2[i])
+            neighbors = [idx for idx in order[1 : k + 1] if idx != i]
+            for j in neighbors:
+                if j < 0 or j >= n:
+                    continue
+                edge = (min(i, j), max(i, j))
+                edges.append(edge)
+        return edges
+
+    def _detect_communities(self, graph: nx.Graph) -> List[set[int]]:
+        if graph.number_of_nodes() == 0:
+            return []
+        if graph.number_of_edges() == 0:
+            return [
+                {int(node)}
+                for node in graph.nodes()
+            ]
+
+        algo = self.params.community_algorithm.lower()
+        if algo == "label_propagation":
+            communities = nx.algorithms.community.label_propagation_communities(graph)
+        else:
+            communities = nx.algorithms.community.greedy_modularity_communities(
+                graph, weight="weight"
+            )
+        return [set(map(int, comm)) for comm in communities]
 
 
 # ---- Геометрические утилиты ----
