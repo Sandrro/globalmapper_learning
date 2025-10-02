@@ -274,6 +274,7 @@ def main():
             "--infer-il-thr", str(args.infer_il_thr),
             "--infer-sv1-thr", str(args.infer_sv1_thr),
             "--infer-slots", str(infer_slots),
+            "--zone", str(zone_label),
         ]
         if args.config:
             cmd.extend(["--config", args.config])
