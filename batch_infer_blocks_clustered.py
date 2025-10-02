@@ -21,7 +21,8 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from collections import defaultdict
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 try:  # tqdm опционален
     from tqdm import tqdm
@@ -36,6 +37,7 @@ except Exception as exc:  # pragma: no cover
 
 try:
     from shapely.geometry import Point, Polygon, box, mapping, shape
+    from shapely.ops import unary_union
 except Exception:  # pragma: no cover
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
@@ -80,18 +82,16 @@ class QuadTreeSegmenter:
     def __init__(self, params: QuadTreeParams):
         self.params = params
 
-    def segment(self, coords: np.ndarray, block_geom: Polygon) -> List[QuadTreeLeaf]:
+    def segment(
+        self,
+        coords: np.ndarray,
+        block_geom: Polygon,
+        start_polygon: Polygon | None = None,
+    ) -> List[QuadTreeLeaf]:
         if len(coords) == 0:
             return []
 
-        minx, miny, maxx, maxy = block_geom.bounds
-        size = max(maxx - minx, maxy - miny)
-        if size <= 0:
-            size = max(1.0, self.params.min_size)
-        cx = (minx + maxx) / 2.0
-        cy = (miny + maxy) / 2.0
-        half = size / 2.0
-        root_bounds = (cx - half, cy - half, cx + half, cy + half)
+        root_bounds = self._initial_bounds(coords, block_geom, start_polygon)
 
         leaves: List[QuadTreeLeaf] = []
 
@@ -161,6 +161,39 @@ class QuadTreeSegmenter:
         subdivide(root_bounds, 0, list(range(len(coords))), "0")
         return leaves
 
+    def _initial_bounds(
+        self,
+        coords: np.ndarray,
+        block_geom: Polygon,
+        start_polygon: Polygon | None = None,
+    ) -> Tuple[float, float, float, float]:
+        coords_minx = float(np.min(coords[:, 0]))
+        coords_maxx = float(np.max(coords[:, 0]))
+        coords_miny = float(np.min(coords[:, 1]))
+        coords_maxy = float(np.max(coords[:, 1]))
+
+        block_bounds = block_geom.bounds
+
+        if start_polygon is not None and not start_polygon.is_empty:
+            start_bounds = start_polygon.bounds
+            minx, miny, maxx, maxy = start_bounds
+            width = maxx - minx
+            height = maxy - miny
+            if width > 0 and height > 0 and coords_minx >= minx - 1e-6 and coords_miny >= miny - 1e-6:
+                size = max(width, height, self.params.min_size)
+                size = max(size, coords_maxx - minx, coords_maxy - miny)
+                size = max(size, block_bounds[2] - minx, block_bounds[3] - miny)
+                return minx, miny, minx + size, miny + size
+
+        minx, miny, maxx, maxy = block_bounds
+        size = max(maxx - minx, maxy - miny)
+        if size <= 0:
+            size = max(1.0, self.params.min_size)
+        cx = (minx + maxx) / 2.0
+        cy = (miny + maxy) / 2.0
+        half = size / 2.0
+        return (cx - half, cy - half, cx + half, cy + half)
+
 
 def _distance_to_bounds(x: float, y: float,
                         bounds: Tuple[float, float, float, float]) -> float:
@@ -174,22 +207,6 @@ def aggregate_segment_attributes(indices: List[int], props: List[Dict[str, Any]]
     agg = _aggregate_points(indices, props)
     agg["point_count"] = len(indices)
     return agg
-
-
-def compute_gaussian_kde(coords: np.ndarray, bandwidth: float) -> np.ndarray:
-    """Вычисляет гауссовскую KDE для указанных координат."""
-
-    if coords.size == 0:
-        return np.array([], dtype=float)
-
-    bw = max(float(bandwidth), 1e-6)
-    diff = coords[:, None, :] - coords[None, :, :]
-    dist2 = np.sum(diff * diff, axis=2)
-    scale = bw * bw
-    kernel = np.exp(-0.5 * dist2 / scale)
-    norm = 1.0 / (2.0 * np.pi * scale)
-    densities = kernel.sum(axis=1) * norm
-    return densities.astype(float)
 
 
 # ---- Основной цикл ----
@@ -219,15 +236,12 @@ def main():
     ap.add_argument("--prob-field", default="e")
     ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON квадратов")
     ap.add_argument("--out-centroids", default=None, help="Выход GeoJSON центроидов")
-    ap.add_argument("--out-kde", default=None, help="Выход GeoJSON с KDE по центроидам")
     ap.add_argument("--out-epsg", type=int, default=32636)
     ap.add_argument("--quad-max-depth", type=int, default=6, help="Максимальная глубина quad-tree")
     ap.add_argument("--quad-min-points", type=int, default=10,
                     help="Минимальное число точек в квадрате перед остановкой деления")
     ap.add_argument("--quad-min-size", type=float, default=30.0,
                     help="Минимальный размер стороны квадрата в метрах")
-    ap.add_argument("--kde-bandwidth", type=float, default=50.0,
-                    help="Ширина (bandwidth) гауссовского KDE в метрах")
     ap.add_argument("--temp-dir", default=None)
     args = ap.parse_args()
 
@@ -247,7 +261,6 @@ def main():
 
     out_square_features: List[Dict[str, Any]] = []
     out_centroids_features: List[Dict[str, Any]] = []
-    out_kde_features: List[Dict[str, Any]] = []
 
     temp_root = Path(args.temp_dir or "./_infer_tmp")
     temp_root.mkdir(parents=True, exist_ok=True)
@@ -378,39 +391,65 @@ def main():
             })
 
         coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
-        if args.out_kde:
-            densities = compute_gaussian_kde(coords, bandwidth=float(args.kde_bandwidth))
-            for point, density in zip(moved_points, densities):
-                out_kde_features.append({
-                    "type": "Feature",
-                    "geometry": mapping(point),
-                    "properties": {
-                        "block_index": block_idx,
-                        "zone": zone_label,
-                        "kde_bandwidth": float(args.kde_bandwidth),
-                        "density": float(density),
-                    },
-                })
-        leaves = segmenter.segment(coords, geom)
+        inner_start_polygon = None
+        try:
+            inner_candidate = geom.buffer(-10.0)
+            if inner_candidate is not None and not inner_candidate.is_empty:
+                inner_start_polygon = inner_candidate
+        except Exception:
+            inner_start_polygon = None
+
+        leaves = segmenter.segment(coords, geom, start_polygon=inner_start_polygon)
         if not leaves:
             continue
 
+        grouped_by_depth: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         for leaf in leaves:
             attrs = aggregate_segment_attributes(leaf.indices, moved_props)
-            props = {
-                "block_index": block_idx,
-                "zone": zone_label,
-                "quad_path": leaf.path,
-                "quad_depth": leaf.depth,
-                "quad_bounds": list(leaf.bounds),
-                "quad_area": float(leaf.polygon.area),
-            }
-            props.update(attrs)
-            out_square_features.append({
-                "type": "Feature",
-                "geometry": mapping(leaf.polygon),
-                "properties": props,
+            e_max = attrs.get("e_max")
+            if e_max is None or e_max < 0.9:
+                continue
+            grouped_by_depth[leaf.depth].append({
+                "leaf": leaf,
+                "attrs": attrs,
             })
+
+        for depth, items in grouped_by_depth.items():
+            if not items:
+                continue
+            for component in _merge_touching(items):
+                comp_indices: List[int] = []
+                comp_paths: List[str] = []
+                polygons: List[Polygon] = []
+                for item in component:
+                    leaf = item["leaf"]
+                    polygons.append(leaf.polygon)
+                    comp_paths.append(leaf.path)
+                    comp_indices.extend(leaf.indices)
+                merged_polygon = unary_union(polygons).buffer(0)
+                if merged_polygon.is_empty:
+                    continue
+                if merged_polygon.geom_type == "MultiPolygon":
+                    geoms = [poly for poly in merged_polygon.geoms if not poly.is_empty]
+                    if not geoms:
+                        continue
+                    merged_polygon = max(geoms, key=lambda poly: poly.area)
+
+                agg_attrs = aggregate_segment_attributes(comp_indices, moved_props)
+                props = {
+                    "block_index": block_idx,
+                    "zone": zone_label,
+                    "quad_path": "|".join(sorted(comp_paths)),
+                    "quad_depth": depth,
+                    "quad_bounds": list(merged_polygon.bounds),
+                    "quad_area": float(merged_polygon.area),
+                }
+                props.update(agg_attrs)
+                out_square_features.append({
+                    "type": "Feature",
+                    "geometry": mapping(merged_polygon),
+                    "properties": props,
+                })
 
     if out_square_features:
         write_geojson(args.out_buildings, {
@@ -424,11 +463,43 @@ def main():
             "features": out_centroids_features,
         }, epsg=args.out_epsg)
 
-    if args.out_kde:
-        write_geojson(args.out_kde, {
-            "type": "FeatureCollection",
-            "features": out_kde_features,
-        }, epsg=args.out_epsg)
+def _merge_touching(items: List[Dict[str, Any]]) -> Iterable[List[Dict[str, Any]]]:
+    n = len(items)
+    if n == 0:
+        return []
+
+    adjacency: List[List[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        poly_i: Polygon = items[i]["leaf"].polygon
+        for j in range(i + 1, n):
+            poly_j: Polygon = items[j]["leaf"].polygon
+            try:
+                touching = poly_i.touches(poly_j) or poly_i.intersects(poly_j)
+            except Exception:
+                touching = poly_i.touches(poly_j)
+            if touching:
+                adjacency[i].append(j)
+                adjacency[j].append(i)
+
+    visited = [False] * n
+    components: List[List[Dict[str, Any]]] = []
+    for i in range(n):
+        if visited[i]:
+            continue
+        stack = [i]
+        comp_indices = []
+        while stack:
+            cur = stack.pop()
+            if visited[cur]:
+                continue
+            visited[cur] = True
+            comp_indices.append(cur)
+            for nb in adjacency[cur]:
+                if not visited[nb]:
+                    stack.append(nb)
+        components.append([items[idx] for idx in comp_indices])
+
+    return components
 
 
 def json_dumps(obj: Any) -> str:
