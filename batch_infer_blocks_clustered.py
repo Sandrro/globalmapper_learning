@@ -4,9 +4,9 @@
 
 Актуализированная утилита для пакетного инференса кварталов.
 Этап подготовки точек совпадает с исходной версией: вызывается модель,
-центроиды объединяются и при необходимости смещаются ко второму кольцу.
-Далее квартал делится на сегменты с помощью quad-tree, и в итоговых
-квадратах вычисляется агрегированная статистика по точкам.
+центроиды при необходимости смещаются ко второму кольцу. Далее квартал
+делится на сегменты с помощью quad-tree, и в итоговых квадратах
+вычисляется агрегированная статистика по точкам.
 
 Выходные данные:
   --out-buildings : квадраты quad-tree (Polygon) c агрегированными атрибутами.
@@ -49,7 +49,6 @@ from batch_infer_blocks import (  # noqa: E402
     lines_of,
     load_json_maybe,
     load_services_vocab_from_artifacts,
-    merge_centroids,
     nearest_on_lines,
     normalize_targets_map,
     pick_service_keys,
@@ -172,27 +171,18 @@ class QuadTreeSegmenter:
         coords_miny = float(np.min(coords[:, 1]))
         coords_maxy = float(np.max(coords[:, 1]))
 
-        block_bounds = block_geom.bounds
-
-        if start_polygon is not None and not start_polygon.is_empty:
-            start_bounds = start_polygon.bounds
-            minx, miny, maxx, maxy = start_bounds
-            width = maxx - minx
-            height = maxy - miny
-            if width > 0 and height > 0 and coords_minx >= minx - 1e-6 and coords_miny >= miny - 1e-6:
-                size = max(width, height, self.params.min_size)
-                size = max(size, coords_maxx - minx, coords_maxy - miny)
-                size = max(size, block_bounds[2] - minx, block_bounds[3] - miny)
-                return minx, miny, minx + size, miny + size
-
-        minx, miny, maxx, maxy = block_bounds
-        size = max(maxx - minx, maxy - miny)
-        if size <= 0:
-            size = max(1.0, self.params.min_size)
-        cx = (minx + maxx) / 2.0
-        cy = (miny + maxy) / 2.0
-        half = size / 2.0
-        return (cx - half, cy - half, cx + half, cy + half)
+        minx, miny, maxx, maxy = block_geom.bounds
+        width = maxx - minx
+        height = maxy - miny
+        if width <= 0:
+            padding = max(self.params.min_size, coords_maxx - coords_minx)
+            minx -= padding / 2.0
+            maxx += padding / 2.0
+        if height <= 0:
+            padding = max(self.params.min_size, coords_maxy - coords_miny)
+            miny -= padding / 2.0
+            maxy += padding / 2.0
+        return (float(minx), float(miny), float(maxx), float(maxy))
 
 
 def _distance_to_bounds(x: float, y: float,
@@ -232,8 +222,6 @@ def main():
     ap.add_argument("--infer-e-thr", type=float, default=0.5)
     ap.add_argument("--infer-il-thr", type=float, default=0.5)
     ap.add_argument("--infer-sv1-thr", type=float, default=0.5)
-    ap.add_argument("--merge-centroids-radius-m", type=float, default=10.0)
-    ap.add_argument("--prob-field", default="e")
     ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON квадратов")
     ap.add_argument("--out-centroids", default=None, help="Выход GeoJSON центроидов")
     ap.add_argument("--out-epsg", type=int, default=32636)
@@ -351,12 +339,8 @@ def main():
         if not centroids_raw:
             continue
 
-        merged_points, merged_props = merge_centroids(
-            points=centroids_raw,
-            props_list=cprops_raw,
-            radius_m=float(args.merge_centroids_radius_m),
-            prob_field=str(args.prob_field),
-        )
+        merged_points = list(centroids_raw)
+        merged_props = list(cprops_raw)
 
         ring1, ring2, midline = build_rings(geom)
         mid_lines = lines_of(midline)
@@ -391,27 +375,38 @@ def main():
             })
 
         coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
-        inner_start_polygon = None
+        inner_clip = None
         try:
             inner_candidate = geom.buffer(-10.0)
             if inner_candidate is not None and not inner_candidate.is_empty:
-                inner_start_polygon = inner_candidate
+                inner_clip = inner_candidate
         except Exception:
-            inner_start_polygon = None
+            inner_clip = None
 
-        leaves = segmenter.segment(coords, geom, start_polygon=inner_start_polygon)
+        leaves = segmenter.segment(coords, geom, start_polygon=None)
         if not leaves:
             continue
 
         grouped_by_depth: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         for leaf in leaves:
+            if leaf.depth < 5:
+                continue
             attrs = aggregate_segment_attributes(leaf.indices, moved_props)
             e_max = attrs.get("e_max")
             if e_max is None or e_max < 0.9:
                 continue
+            geometry = leaf.polygon
+            if inner_clip is not None and not inner_clip.is_empty:
+                try:
+                    geometry = geometry.intersection(inner_clip).buffer(0)
+                except Exception:
+                    geometry = geometry.intersection(inner_clip)
+            if geometry.is_empty:
+                continue
             grouped_by_depth[leaf.depth].append({
                 "leaf": leaf,
                 "attrs": attrs,
+                "geometry": geometry,
             })
 
         for depth, items in grouped_by_depth.items():
@@ -423,7 +418,7 @@ def main():
                 polygons: List[Polygon] = []
                 for item in component:
                     leaf = item["leaf"]
-                    polygons.append(leaf.polygon)
+                    polygons.append(item["geometry"])
                     comp_paths.append(leaf.path)
                     comp_indices.extend(leaf.indices)
                 merged_polygon = unary_union(polygons).buffer(0)
@@ -470,14 +465,26 @@ def _merge_touching(items: List[Dict[str, Any]]) -> Iterable[List[Dict[str, Any]
 
     adjacency: List[List[int]] = [[] for _ in range(n)]
     for i in range(n):
-        poly_i: Polygon = items[i]["leaf"].polygon
+        poly_i = items[i]["geometry"]
+        if poly_i is None or poly_i.is_empty:
+            continue
         for j in range(i + 1, n):
-            poly_j: Polygon = items[j]["leaf"].polygon
+            poly_j = items[j]["geometry"]
+            if poly_j is None or poly_j.is_empty:
+                continue
+            share_boundary = False
             try:
-                touching = poly_i.touches(poly_j) or poly_i.intersects(poly_j)
+                inter = poly_i.intersection(poly_j)
             except Exception:
-                touching = poly_i.touches(poly_j)
-            if touching:
+                inter = poly_i.boundary.intersection(poly_j.boundary)
+            try:
+                if hasattr(inter, "area") and inter.area > 0:
+                    share_boundary = True
+                elif hasattr(inter, "length") and inter.length > 1e-6:
+                    share_boundary = True
+            except Exception:
+                share_boundary = False
+            if share_boundary:
                 adjacency[i].append(j)
                 adjacency[j].append(i)
 
