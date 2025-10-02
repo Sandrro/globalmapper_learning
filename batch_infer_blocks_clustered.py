@@ -237,10 +237,10 @@ def main():
     ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON квадратов")
     ap.add_argument("--out-centroids", default=None, help="Выход GeoJSON центроидов")
     ap.add_argument("--out-epsg", type=int, default=32636)
-    ap.add_argument("--quad-max-depth", type=int, default=6, help="Максимальная глубина quad-tree")
+    ap.add_argument("--quad-max-depth", type=int, default=8, help="Максимальная глубина quad-tree")
     ap.add_argument("--quad-min-points", type=int, default=10,
                     help="Минимальное число точек в квадрате перед остановкой деления")
-    ap.add_argument("--quad-min-size", type=float, default=30.0,
+    ap.add_argument("--quad-min-size", type=float, default=15.0,
                     help="Минимальный размер стороны квадрата в метрах")
     ap.add_argument("--temp-dir", default=None)
     args = ap.parse_args()
