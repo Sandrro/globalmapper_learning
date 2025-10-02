@@ -176,6 +176,22 @@ def aggregate_segment_attributes(indices: List[int], props: List[Dict[str, Any]]
     return agg
 
 
+def compute_gaussian_kde(coords: np.ndarray, bandwidth: float) -> np.ndarray:
+    """Вычисляет гауссовскую KDE для указанных координат."""
+
+    if coords.size == 0:
+        return np.array([], dtype=float)
+
+    bw = max(float(bandwidth), 1e-6)
+    diff = coords[:, None, :] - coords[None, :, :]
+    dist2 = np.sum(diff * diff, axis=2)
+    scale = bw * bw
+    kernel = np.exp(-0.5 * dist2 / scale)
+    norm = 1.0 / (2.0 * np.pi * scale)
+    densities = kernel.sum(axis=1) * norm
+    return densities.astype(float)
+
+
 # ---- Основной цикл ----
 
 def main():
@@ -203,12 +219,15 @@ def main():
     ap.add_argument("--prob-field", default="e")
     ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON квадратов")
     ap.add_argument("--out-centroids", default=None, help="Выход GeoJSON центроидов")
+    ap.add_argument("--out-kde", default=None, help="Выход GeoJSON с KDE по центроидам")
     ap.add_argument("--out-epsg", type=int, default=32636)
     ap.add_argument("--quad-max-depth", type=int, default=6, help="Максимальная глубина quad-tree")
     ap.add_argument("--quad-min-points", type=int, default=10,
                     help="Минимальное число точек в квадрате перед остановкой деления")
     ap.add_argument("--quad-min-size", type=float, default=30.0,
                     help="Минимальный размер стороны квадрата в метрах")
+    ap.add_argument("--kde-bandwidth", type=float, default=50.0,
+                    help="Ширина (bandwidth) гауссовского KDE в метрах")
     ap.add_argument("--temp-dir", default=None)
     args = ap.parse_args()
 
@@ -228,6 +247,7 @@ def main():
 
     out_square_features: List[Dict[str, Any]] = []
     out_centroids_features: List[Dict[str, Any]] = []
+    out_kde_features: List[Dict[str, Any]] = []
 
     temp_root = Path(args.temp_dir or "./_infer_tmp")
     temp_root.mkdir(parents=True, exist_ok=True)
@@ -358,6 +378,19 @@ def main():
             })
 
         coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
+        if args.out_kde:
+            densities = compute_gaussian_kde(coords, bandwidth=float(args.kde_bandwidth))
+            for point, density in zip(moved_points, densities):
+                out_kde_features.append({
+                    "type": "Feature",
+                    "geometry": mapping(point),
+                    "properties": {
+                        "block_index": block_idx,
+                        "zone": zone_label,
+                        "kde_bandwidth": float(args.kde_bandwidth),
+                        "density": float(density),
+                    },
+                })
         leaves = segmenter.segment(coords, geom)
         if not leaves:
             continue
@@ -389,6 +422,12 @@ def main():
         write_geojson(args.out_centroids, {
             "type": "FeatureCollection",
             "features": out_centroids_features,
+        }, epsg=args.out_epsg)
+
+    if args.out_kde:
+        write_geojson(args.out_kde, {
+            "type": "FeatureCollection",
+            "features": out_kde_features,
         }, epsg=args.out_epsg)
 
 
