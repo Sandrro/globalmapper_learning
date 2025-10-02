@@ -1,53 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """batch_infer_blocks_clustered.py
-Альтернативная версия batch_infer_blocks.py, которая повторяет весь пайплайн
-инференса, объединения и возможного смещения центроидов зданий внутри квартала,
-но вместо построения гекс-сетки и графа соседства формирует кластеры точек
-и строит полигоны зданий по эвристикам.
 
-Основные этапы:
-1. Вызов train.py --mode infer по каждому кварталу (аналог batch_infer_blocks).
-2. Слияние центроидов в радиусе и «прилипание» к срединной линии второго кольца.
-3. Формирование графа близости (Gabriel + kNN) и поиск сообществ.
-4. Построение геометрии зданий для каждого кластера с учётом параметров из YAML.
-5. Агрегация атрибутов точек (e_max, is_living_max, living_area_sum, floors_avg_round).
+Актуализированная утилита для пакетного инференса кварталов.
+Этап подготовки точек совпадает с исходной версией: вызывается модель,
+центроиды объединяются и при необходимости смещаются ко второму кольцу.
+Далее квартал делится на сегменты с помощью quad-tree, и в итоговых
+квадратах вычисляется агрегированная статистика по точкам.
 
-Требования:
-- Shapely < 2.0 (проверено на 1.7/1.8).
-- PyYAML для чтения параметров.
-- NetworkX для построения графа и поиска сообществ.
+Выходные данные:
+  --out-buildings : квадраты quad-tree (Polygon) c агрегированными атрибутами.
+  --out-centroids : (опц.) итоговые (слитые и смещённые) точки зданий (Point).
 
-Выходы:
-  --out-buildings        : полигоны зданий (Polygon) с агрегированными атрибутами.
-  --out-clusters-centers : (опц.) точки-кластеры (Point) с параметрами кластеров.
-  --out-centroids        : (опц.) итоговые (слитые и смещённые) точки зданий (Point).
-
-Параметры геометрии и кластеризации читаются из YAML-файла (см. building_shape_params.yaml).
 """
 
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import subprocess
 import sys
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 try:  # tqdm опционален
     from tqdm import tqdm
 except Exception:  # pragma: no cover - резерв
     tqdm = lambda x, **k: x
-
-try:
-    import yaml
-except Exception as exc:  # pragma: no cover - критично
-    print("[FATAL] Требуется PyYAML для загрузки параметров: {}".format(exc), file=sys.stderr)
-    raise
 
 try:
     import numpy as np
@@ -56,16 +35,10 @@ except Exception as exc:  # pragma: no cover
     raise
 
 try:
-    from shapely import affinity
-    from shapely.geometry import (LineString, MultiPoint, Point, Polygon, mapping,
-                                  shape)
+    from shapely.geometry import Point, Polygon, box, mapping, shape
 except Exception:  # pragma: no cover
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
-
-import networkx as nx
-
-# ---- Переиспользование функций исходного пайплайна ----
 
 from batch_infer_blocks import (  # noqa: E402
     build_rings,
@@ -83,457 +56,130 @@ from batch_infer_blocks import (  # noqa: E402
     zone_label_of,
     _aggregate_points,
 )
-@dataclass
-class ClusterParams:
-    min_cluster_size: int
-    knn_k: int
-    use_gabriel: bool
-    community_algorithm: str
 
 
 @dataclass
-class GeometryParams:
-    round_ratio_max: float
-    elongated_ratio_min: float
-    narrow_width_max: float
-    wall_thickness: float
-    min_courtyard_area: float
-    center_distance_min: float
-    corner_distance_max: float
-    circle_segments: int
-    bend_angle_min: float
-    bend_angle_max: float
-    h_bar_gap: float
-    h_bar_length_factor: float
+class QuadTreeParams:
+    max_depth: int
+    min_points: int
+    min_size: float
 
 
-def load_params(path: str) -> Tuple[ClusterParams, GeometryParams]:
-    with open(path, "r", encoding="utf-8") as f:
-        data = yaml.safe_load(f)
-    data = data or {}
-    cl = data.get("clustering") or {}
-    geom = data.get("geometry") or {}
-    min_samples = int(cl.get("min_samples", 5))
-    knn_k = int(cl.get("knn_k", max(1, min_samples)))
-    cparams = ClusterParams(
-        min_cluster_size=int(cl.get("min_cluster_size", 8)),
-        knn_k=max(0, knn_k),
-        use_gabriel=bool(cl.get("use_gabriel", True)),
-        community_algorithm=str(cl.get("community_algorithm", "greedy")),
-    )
-    gparams = GeometryParams(
-        round_ratio_max=float(geom.get("round_ratio_max", 1.5)),
-        elongated_ratio_min=float(geom.get("elongated_ratio_min", 2.0)),
-        narrow_width_max=float(geom.get("narrow_width_max", 70.0)),
-        wall_thickness=float(geom.get("wall_thickness", 15.0)),
-        min_courtyard_area=float(geom.get("min_courtyard_area", 100.0)),
-        center_distance_min=float(geom.get("center_distance_min", 45.0)),
-        corner_distance_max=float(geom.get("corner_distance_max", 35.0)),
-        circle_segments=int(geom.get("circle_segments", 32)),
-        bend_angle_min=float(geom.get("bend_angle_min", 90.0)),
-        bend_angle_max=float(geom.get("bend_angle_max", 170.0)),
-        h_bar_gap=float(geom.get("h_bar_gap", 20.0)),
-        h_bar_length_factor=float(geom.get("h_bar_length_factor", 0.8)),
-    )
-    return cparams, gparams
+@dataclass
+class QuadTreeLeaf:
+    polygon: Polygon
+    indices: List[int]
+    path: str
+    depth: int
+    bounds: Tuple[float, float, float, float]
 
 
-# ---- Кластеризация ----
+class QuadTreeSegmenter:
+    """Делит квартал на квадраты quad-tree по точкам."""
 
-class Clusterer:
-    def __init__(self, params: ClusterParams):
+    def __init__(self, params: QuadTreeParams):
         self.params = params
 
-    def fit_predict(self, coords: np.ndarray) -> np.ndarray:
-        n = len(coords)
-        if n == 0:
-            return np.empty((0,), dtype=int)
-
-        labels = np.full((n,), -1, dtype=int)
-        graph = self._build_graph(coords)
-        if graph.number_of_nodes() == 0:
-            return labels
-
-        communities = self._detect_communities(graph)
-        cluster_id = 0
-        for community in communities:
-            if len(community) < max(1, self.params.min_cluster_size):
-                continue
-            for idx in community:
-                labels[idx] = cluster_id
-            cluster_id += 1
-        return labels
-
-    def _build_graph(self, coords: np.ndarray) -> nx.Graph:
-        graph = nx.Graph()
-        n = len(coords)
-        graph.add_nodes_from(range(n))
-        if n <= 1:
-            return graph
-
-        dist2 = self._pairwise_squared_distances(coords)
-        edges = set()
-
-        if self.params.use_gabriel and n >= 2:
-            edges.update(self._gabriel_edges(dist2))
-
-        k = min(self.params.knn_k, n - 1)
-        if k > 0:
-            edges.update(self._knn_edges(dist2, k))
-
-        for i, j in edges:
-            if i == j:
-                continue
-            d = math.sqrt(dist2[i, j])
-            weight = 1.0 / max(d, 1e-6)
-            graph.add_edge(int(i), int(j), weight=weight, distance=d)
-        return graph
-
-    @staticmethod
-    def _pairwise_squared_distances(coords: np.ndarray) -> np.ndarray:
-        diff = coords[:, None, :] - coords[None, :, :]
-        return np.einsum("ijk,ijk->ij", diff, diff)
-
-    def _gabriel_edges(self, dist2: np.ndarray) -> List[Tuple[int, int]]:
-        n = dist2.shape[0]
-        edges: List[Tuple[int, int]] = []
-        eps = 1e-9
-        for i in range(n):
-            for j in range(i + 1, n):
-                dij = dist2[i, j]
-                if dij <= eps:
-                    edges.append((i, j))
-                    continue
-                keep = True
-                for k in range(n):
-                    if k == i or k == j:
-                        continue
-                    if dij > dist2[i, k] + dist2[j, k] + eps:
-                        keep = False
-                        break
-                if keep:
-                    edges.append((i, j))
-        return edges
-
-    def _knn_edges(self, dist2: np.ndarray, k: int) -> List[Tuple[int, int]]:
-        n = dist2.shape[0]
-        edges: List[Tuple[int, int]] = []
-        for i in range(n):
-            order = np.argsort(dist2[i])
-            neighbors = [idx for idx in order[1 : k + 1] if idx != i]
-            for j in neighbors:
-                if j < 0 or j >= n:
-                    continue
-                edge = (min(i, j), max(i, j))
-                edges.append(edge)
-        return edges
-
-    def _detect_communities(self, graph: nx.Graph) -> List[set[int]]:
-        if graph.number_of_nodes() == 0:
+    def segment(self, coords: np.ndarray, block_geom: Polygon) -> List[QuadTreeLeaf]:
+        if len(coords) == 0:
             return []
-        if graph.number_of_edges() == 0:
-            return [
-                {int(node)}
-                for node in graph.nodes()
-            ]
 
-        algo = self.params.community_algorithm.lower()
-        if algo == "label_propagation":
-            communities = nx.algorithms.community.label_propagation_communities(graph)
-        else:
-            communities = nx.algorithms.community.greedy_modularity_communities(
-                graph, weight="weight"
+        minx, miny, maxx, maxy = block_geom.bounds
+        size = max(maxx - minx, maxy - miny)
+        if size <= 0:
+            size = max(1.0, self.params.min_size)
+        cx = (minx + maxx) / 2.0
+        cy = (miny + maxy) / 2.0
+        half = size / 2.0
+        root_bounds = (cx - half, cy - half, cx + half, cy + half)
+
+        leaves: List[QuadTreeLeaf] = []
+
+        def subdivide(bounds: Tuple[float, float, float, float], depth: int,
+                      indices: Sequence[int], path: str) -> None:
+            if not indices:
+                return
+            width = bounds[2] - bounds[0]
+            height = bounds[3] - bounds[1]
+            stop = (
+                depth >= self.params.max_depth
+                or len(indices) <= self.params.min_points
+                or width <= self.params.min_size
+                or height <= self.params.min_size
             )
-        return [set(map(int, comm)) for comm in communities]
+            polygon = box(*bounds).intersection(block_geom)
+            if polygon.is_empty:
+                return
+            polygon = polygon.buffer(0)
+            if stop:
+                leaves.append(
+                    QuadTreeLeaf(
+                        polygon=polygon,
+                        indices=list(indices),
+                        path=path,
+                        depth=depth,
+                        bounds=bounds,
+                    )
+                )
+                return
 
-
-# ---- Геометрические утилиты ----
-
-def _rectangle_dimensions(rect: Polygon) -> Tuple[float, float, float]:
-    coords = list(rect.exterior.coords)
-    if len(coords) < 4:
-        return 0.0, 0.0, 0.0
-    dx = coords[1][0] - coords[0][0]
-    dy = coords[1][1] - coords[0][1]
-    angle = math.atan2(dy, dx)
-    lengths = []
-    for i in range(4):
-        x1, y1 = coords[i]
-        x2, y2 = coords[(i + 1) % 4]
-        lengths.append(math.hypot(x2 - x1, y2 - y1))
-    if not lengths:
-        return 0.0, 0.0, angle
-    lengths.sort(reverse=True)
-    long_side, short_side = lengths[0], lengths[2]
-    return long_side, short_side, angle
-
-
-def _cluster_roundness(long_side: float, short_side: float) -> float:
-    if short_side <= 0:
-        return float("inf")
-    return long_side / short_side
-
-
-def _is_central(centroid: Point, block: Polygon, params: GeometryParams) -> bool:
-    dist = block.boundary.distance(centroid)
-    return dist >= params.center_distance_min
-
-
-def _is_corner(centroid: Point, block: Polygon, params: GeometryParams) -> bool:
-    verts = list(block.exterior.coords)[:-1]
-    if not verts:
-        return False
-    dist = min(Point(v).distance(centroid) for v in verts)
-    return dist <= params.corner_distance_max
-
-
-def _convex_hull_angles(hull: Polygon) -> List[float]:
-    angles: List[float] = []
-    coords = list(hull.exterior.coords)[:-1]
-    if len(coords) < 3:
-        return angles
-    for i in range(len(coords)):
-        prev_pt = coords[(i - 1) % len(coords)]
-        cur_pt = coords[i]
-        next_pt = coords[(i + 1) % len(coords)]
-        v1 = (prev_pt[0] - cur_pt[0], prev_pt[1] - cur_pt[1])
-        v2 = (next_pt[0] - cur_pt[0], next_pt[1] - cur_pt[1])
-        ang = _angle_between(v1, v2)
-        if ang is not None:
-            angles.append(ang)
-    return angles
-
-
-def _angle_between(v1: Tuple[float, float], v2: Tuple[float, float]) -> Optional[float]:
-    x1, y1 = v1
-    x2, y2 = v2
-    norm1 = math.hypot(x1, y1)
-    norm2 = math.hypot(x2, y2)
-    if norm1 <= 1e-9 or norm2 <= 1e-9:
-        return None
-    dot = x1 * x2 + y1 * y2
-    cos_val = max(-1.0, min(1.0, dot / (norm1 * norm2)))
-    return math.degrees(math.acos(cos_val))
-
-
-def _square_polygon(size: float, angle: float, center: Point,
-                    params: GeometryParams, add_courtyard: bool) -> Polygon:
-    half = size / 2.0
-    square_coords = [
-        (-half, -half),
-        (half, -half),
-        (half, half),
-        (-half, half),
-        (-half, -half),
-    ]
-    square = Polygon(square_coords)
-    if add_courtyard:
-        inner_side = size - 2.0 * params.wall_thickness
-        if inner_side > 0 and inner_side * inner_side >= params.min_courtyard_area:
-            hole_half = inner_side / 2.0
-            hole = [
-                (-hole_half, -hole_half),
-                (hole_half, -hole_half),
-                (hole_half, hole_half),
-                (-hole_half, hole_half),
-                (-hole_half, -hole_half),
+            midx = (bounds[0] + bounds[2]) / 2.0
+            midy = (bounds[1] + bounds[3]) / 2.0
+            children = [
+                (bounds[0], midy, midx, bounds[3]),  # северо-запад
+                (midx, midy, bounds[2], bounds[3]),  # северо-восток
+                (midx, bounds[1], bounds[2], midy),  # юго-восток
+                (bounds[0], bounds[1], midx, midy),  # юго-запад
             ]
-            square = Polygon(square_coords, holes=[hole])
-    rotated = affinity.rotate(square, math.degrees(angle), origin=(0, 0))
-    moved = affinity.translate(rotated, xoff=center.x, yoff=center.y)
-    return moved.buffer(0)
+            child_indices: List[List[int]] = [[] for _ in range(4)]
+            eps = 1e-9
+            for idx in indices:
+                x, y = coords[idx]
+                assigned = False
+                for ci, child in enumerate(children):
+                    if (
+                        x >= child[0] - eps
+                        and x <= child[2] + eps
+                        and y >= child[1] - eps
+                        and y <= child[3] + eps
+                    ):
+                        child_indices[ci].append(idx)
+                        assigned = True
+                        break
+                if not assigned:
+                    # на случай численных артефактов
+                    closest = min(
+                        range(4),
+                        key=lambda ci: _distance_to_bounds(x, y, children[ci]),
+                    )
+                    child_indices[closest].append(idx)
+
+            for ci, child_bounds in enumerate(children):
+                child_path = f"{path}{ci}"
+                subdivide(child_bounds, depth + 1, child_indices[ci], child_path)
+
+        subdivide(root_bounds, 0, list(range(len(coords))), "0")
+        return leaves
 
 
-def _h_shape_polygon(long_side: float, short_side: float, angle: float, center: Point,
-                     params: GeometryParams) -> Polygon:
-    width = max(short_side, params.wall_thickness * 3)
-    height = max(long_side, width)
-    leg_width = params.wall_thickness
-    gap = params.h_bar_gap
-    leg_length = height * params.h_bar_length_factor
-    top = leg_length / 2.0
-    base = -leg_length / 2.0
-    # Ножки
-    left_leg = Polygon([
-        (-width / 2.0, base),
-        (-width / 2.0 + leg_width, base),
-        (-width / 2.0 + leg_width, top),
-        (-width / 2.0, top),
-        (-width / 2.0, base),
-    ])
-    right_leg = affinity.translate(left_leg, xoff=width - leg_width)
-    # Перемычки
-    bar_half = leg_width
-    top_bar = Polygon([
-        (-gap / 2.0, top - bar_half),
-        (gap / 2.0, top - bar_half),
-        (gap / 2.0, top),
-        (-gap / 2.0, top),
-        (-gap / 2.0, top - bar_half),
-    ])
-    bottom_bar = affinity.translate(top_bar, yoff=-(leg_length - leg_width))
-    middle_bar = Polygon([
-        (-gap / 2.0, -bar_half / 2.0),
-        (gap / 2.0, -bar_half / 2.0),
-        (gap / 2.0, bar_half / 2.0),
-        (-gap / 2.0, bar_half / 2.0),
-        (-gap / 2.0, -bar_half / 2.0),
-    ])
-    h_poly = left_leg.union(right_leg).union(top_bar).union(bottom_bar).union(middle_bar)
-    rotated = affinity.rotate(h_poly, math.degrees(angle), origin=(0, 0))
-    moved = affinity.translate(rotated, xoff=center.x, yoff=center.y)
-    return moved.buffer(0)
+def _distance_to_bounds(x: float, y: float,
+                        bounds: Tuple[float, float, float, float]) -> float:
+    minx, miny, maxx, maxy = bounds
+    dx = max(minx - x, 0.0, x - maxx)
+    dy = max(miny - y, 0.0, y - maxy)
+    return dx * dx + dy * dy
 
 
-def _circle_polygon(radius: float, center: Point, params: GeometryParams) -> Polygon:
-    return Point(center.x, center.y).buffer(radius, resolution=max(8, params.circle_segments))
-
-
-def _rectangle_with_optional_courtyard(length: float, width: float, angle: float,
-                                       center: Point, params: GeometryParams,
-                                       with_courtyard: bool) -> Polygon:
-    length = max(length, width)
-    width = max(width, params.wall_thickness * 2)
-    rect_coords = [
-        (-length / 2.0, -width / 2.0),
-        (length / 2.0, -width / 2.0),
-        (length / 2.0, width / 2.0),
-        (-length / 2.0, width / 2.0),
-        (-length / 2.0, -width / 2.0),
-    ]
-    rect = Polygon(rect_coords)
-    if with_courtyard:
-        inner_len = length - 2.0 * params.wall_thickness
-        inner_w = width - 2.0 * params.wall_thickness
-        if inner_len > 0 and inner_w > 0 and inner_len * inner_w >= params.min_courtyard_area:
-            hole = [
-                (-inner_len / 2.0, -inner_w / 2.0),
-                (inner_len / 2.0, -inner_w / 2.0),
-                (inner_len / 2.0, inner_w / 2.0),
-                (-inner_len / 2.0, inner_w / 2.0),
-                (-inner_len / 2.0, -inner_w / 2.0),
-            ]
-            rect = Polygon(rect_coords, holes=[hole])
-    rotated = affinity.rotate(rect, math.degrees(angle), origin=(0, 0))
-    moved = affinity.translate(rotated, xoff=center.x, yoff=center.y)
-    return moved.buffer(0)
-
-
-def _rectangle_for_angle(points: List[Tuple[float, float]], width: float,
-                         params: GeometryParams) -> Polygon:
-    if len(points) < 3:
-        return MultiPoint(points).buffer(width / 2.0)
-    line = LineString(points)
-    return line.buffer(width / 2.0, cap_style=2, join_style=2)
-
-
-def build_geometry_for_cluster(points: List[Point], block_geom: Polygon,
-                               params: GeometryParams) -> Tuple[Polygon, Dict[str, Any]]:
-    multipoint = MultiPoint([p for p in points if not p.is_empty])
-    centroid = multipoint.centroid
-    hull = multipoint.convex_hull
-    if hull.is_empty:
-        return centroid.buffer(params.wall_thickness), {"shape": "point"}
-    rect = hull.minimum_rotated_rectangle
-    if rect.geom_type != "Polygon":
-        rect = hull.envelope
-    long_side, short_side, angle = _rectangle_dimensions(rect)
-    if long_side <= 0 or short_side <= 0:
-        size = max(math.sqrt(hull.area), params.wall_thickness * 2)
-        return _square_polygon(size, 0.0, centroid, params, add_courtyard=False), {
-            "shape": "fallback",
-            "roundness": 1.0,
-            "long_side": size,
-            "short_side": size,
-        }
-    roundness = _cluster_roundness(long_side, short_side)
-    geom_info: Dict[str, Any] = {
-        "roundness": roundness,
-        "long_side": long_side,
-        "short_side": short_side,
-    }
-
-    add_courtyard_square = False
-    shape_type = "square"
-
-    if roundness <= params.round_ratio_max:
-        # Кластер похож на круг
-        add_courtyard_square = True
-        if _is_central(centroid, block_geom, params):
-            shape_type = "h"
-            geom = _h_shape_polygon(long_side, short_side, angle, centroid, params)
-        elif _is_corner(centroid, block_geom, params):
-            shape_type = "circle"
-            radius = max(short_side, params.wall_thickness * 2) / 2.0
-            geom = _circle_polygon(radius, centroid, params)
-        else:
-            size = max(short_side, params.wall_thickness * 3)
-            geom = _square_polygon(size, angle, centroid, params, add_courtyard_square)
-    else:
-        elongated = (long_side / max(short_side, 1e-6)) >= params.elongated_ratio_min
-        angles = _convex_hull_angles(hull)
-        bend_angles = [a for a in angles if params.bend_angle_min <= a <= params.bend_angle_max]
-        is_bent = bool(bend_angles)
-        shape_type = "rectangle"
-        with_courtyard = elongated and short_side >= params.narrow_width_max
-        width = short_side
-        if short_side < params.wall_thickness * 2:
-            width = params.wall_thickness * 2
-        if short_side < params.narrow_width_max:
-            width = max(params.wall_thickness, min(30.0, short_side))
-            with_courtyard = False
-            shape_type = "rectangle_narrow"
-        if is_bent and len(bend_angles) > 0:
-            shape_type = "rectangle_bent"
-            bend_vertex = _pick_bend_vertex(hull, params)
-            bend_pts = _bend_polyline(hull, bend_vertex)
-            geom = _rectangle_for_angle(bend_pts, width, params)
-        else:
-            geom = _rectangle_with_optional_courtyard(long_side, width, angle, centroid,
-                                                      params, with_courtyard)
-
-    geom_info["shape"] = shape_type
-    return geom, geom_info
-
-
-def _pick_bend_vertex(hull: Polygon, params: GeometryParams) -> Tuple[int, Tuple[float, float]]:
-    coords = list(hull.exterior.coords)[:-1]
-    best_idx = 0
-    best_angle = 0.0
-    for i in range(len(coords)):
-        prev_pt = coords[(i - 1) % len(coords)]
-        cur_pt = coords[i]
-        next_pt = coords[(i + 1) % len(coords)]
-        ang = _angle_between((prev_pt[0] - cur_pt[0], prev_pt[1] - cur_pt[1]),
-                             (next_pt[0] - cur_pt[0], next_pt[1] - cur_pt[1]))
-        if ang is None:
-            continue
-        if params.bend_angle_min <= ang <= params.bend_angle_max and ang > best_angle:
-            best_angle = ang
-            best_idx = i
-    return best_idx, coords[best_idx]
-
-
-def _bend_polyline(hull: Polygon, bend_info: Tuple[int, Tuple[float, float]]) -> List[Tuple[float, float]]:
-    coords = list(hull.exterior.coords)[:-1]
-    if not coords:
-        return []
-    idx, vertex = bend_info
-    prev_pt = coords[(idx - 1) % len(coords)]
-    next_pt = coords[(idx + 1) % len(coords)]
-    return [prev_pt, vertex, next_pt]
-
-
-def aggregate_cluster_attributes(indices: List[int], props: List[Dict[str, Any]]) -> Dict[str, Any]:
+def aggregate_segment_attributes(indices: List[int], props: List[Dict[str, Any]]) -> Dict[str, Any]:
     agg = _aggregate_points(indices, props)
-    agg["cluster_size"] = len(indices)
+    agg["point_count"] = len(indices)
     return agg
 
 
 # ---- Основной цикл ----
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch infer + clustering-based building polygons")
+    ap = argparse.ArgumentParser(description="Batch infer + quad-tree segmentation")
     ap.add_argument("--blocks", required=True, help="GeoJSON FeatureCollection кварталов")
     ap.add_argument("--model-ckpt", required=True, help="Путь к чекпойнту модели (.pt)")
     ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
@@ -555,18 +201,23 @@ def main():
     ap.add_argument("--infer-sv1-thr", type=float, default=0.5)
     ap.add_argument("--merge-centroids-radius-m", type=float, default=10.0)
     ap.add_argument("--prob-field", default="e")
-    ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON полигонов зданий")
+    ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON квадратов")
     ap.add_argument("--out-centroids", default=None, help="Выход GeoJSON центроидов")
-    ap.add_argument("--out-clusters-centers", default=None,
-                    help="Выход GeoJSON центров кластеров")
     ap.add_argument("--out-epsg", type=int, default=32636)
-    ap.add_argument("--shape-params", default="building_shape_params.yaml",
-                    help="YAML с параметрами геометрии зданий")
+    ap.add_argument("--quad-max-depth", type=int, default=6, help="Максимальная глубина quad-tree")
+    ap.add_argument("--quad-min-points", type=int, default=10,
+                    help="Минимальное число точек в квадрате перед остановкой деления")
+    ap.add_argument("--quad-min-size", type=float, default=30.0,
+                    help="Минимальный размер стороны квадрата в метрах")
     ap.add_argument("--temp-dir", default=None)
     args = ap.parse_args()
 
-    cparams, gparams = load_params(args.shape_params)
-    clusterer = Clusterer(cparams)
+    qt_params = QuadTreeParams(
+        max_depth=max(0, args.quad_max_depth),
+        min_points=max(1, args.quad_min_points),
+        min_size=max(0.1, float(args.quad_min_size)),
+    )
+    segmenter = QuadTreeSegmenter(qt_params)
 
     blocks = read_geojson(args.blocks)
     features = blocks.get("features", [])
@@ -575,9 +226,8 @@ def main():
     services_vocab = load_services_vocab_from_artifacts(args.model_ckpt)
     service_keys = pick_service_keys(services_vocab)
 
-    out_building_features: List[Dict[str, Any]] = []
+    out_square_features: List[Dict[str, Any]] = []
     out_centroids_features: List[Dict[str, Any]] = []
-    out_cluster_centers: List[Dict[str, Any]] = []
 
     temp_root = Path(args.temp_dir or "./_infer_tmp")
     temp_root.mkdir(parents=True, exist_ok=True)
@@ -598,9 +248,10 @@ def main():
             }
         la_target = None
         floors_avg = None
-        if zone_label in targets_map:
-            la_target = targets_map[zone_label].get("la")
-            floors_avg = targets_map[zone_label].get("floors_avg")
+        targets = targets_map.get(zone_label)
+        if targets:
+            la_target = targets.get("la")
+            floors_avg = targets.get("floors_avg")
         elif zone_label in la_by_zone:
             la_target = la_by_zone[zone_label].get("la")
 
@@ -618,46 +269,32 @@ def main():
             "--model-ckpt", args.model_ckpt,
             "--infer-geojson-in", str(in_path),
             "--infer-out", str(out_path),
-            "--zone", str(zone_label),
-            "--infer-slots", str(infer_slots),
             "--infer-knn", str(args.infer_knn),
             "--infer-e-thr", str(args.infer_e_thr),
             "--infer-il-thr", str(args.infer_il_thr),
             "--infer-sv1-thr", str(args.infer_sv1_thr),
+            "--infer-slots", str(infer_slots),
         ]
-        if args.device:
-            cmd += ["--device", args.device]
         if args.config:
-            cmd += ["--config", args.config]
-        if args.zones_json:
-            cmd += ["--zones-json", args.zones_json]
-        if args.services_json:
-            cmd += ["--services-json", args.services_json]
-        if la_target is not None:
-            cmd += ["--la-target", str(la_target)]
-        if floors_avg is not None:
-            cmd += ["--floors-avg", str(floors_avg)]
+            cmd.extend(["--config", args.config])
+        if args.device:
+            cmd.extend(["--device", args.device])
         if services_target:
-            cmd += ["--services-target", json.dumps(services_target, ensure_ascii=False)]
+            cmd.extend(["--services-target", json_dumps(services_target)])
+        if la_target is not None:
+            cmd.extend(["--la-target", str(la_target)])
+        if floors_avg is not None:
+            cmd.extend(["--floors-avg", str(floors_avg)])
 
-        try:
-            subprocess.run(cmd, check=True, stdout=sys.stdout, stderr=sys.stderr)
-        except subprocess.CalledProcessError as exc:
-            print(f"[ERROR] infer failed for block #{bi}: {exc}", file=sys.stderr)
-            continue
-
-        try:
-            infer_output = read_geojson(str(out_path))
-        except Exception as exc:
-            print(f"[WARN] failed to read infer output for block #{bi}: {exc}", file=sys.stderr)
-            continue
+        subprocess.run(cmd, check=True)
+        infer_out = read_geojson(str(out_path))
 
         centroids_raw: List[Point] = []
         cprops_raw: List[Dict[str, Any]] = []
         infer_uid = 0
-        for b in infer_output.get("features", []):
+        for block in infer_out.get("features", []):
             try:
-                g = shape(b.get("geometry"))
+                g = shape(block.get("geometry"))
             except Exception:
                 continue
             if g is None or g.is_empty:
@@ -669,7 +306,7 @@ def main():
                 g = max(geoms, key=lambda poly: poly.area)
             if g.geom_type != "Polygon" or g.area <= 0:
                 continue
-            raw_props = dict(b.get("properties") or {})
+            raw_props = dict(block.get("properties") or {})
             raw_props.setdefault(args.zone_attr, zone_label)
             raw_props.setdefault("_source_block_index", block_idx)
             infer_uid += 1
@@ -692,16 +329,16 @@ def main():
 
         moved_points: List[Point] = []
         moved_props: List[Dict[str, Any]] = []
-        for p, pr in zip(merged_points, merged_props):
-            q = p
+        for point, props in zip(merged_points, merged_props):
+            q = point
             status = "none"
-            props_copy = dict(pr)
+            props_copy = dict(props)
             if ring2 and not ring2.is_empty and mid_lines:
-                in_r1 = ring1.contains(p) or ring1.touches(p)
-                in_r2 = ring2.contains(p) or ring2.touches(p)
+                in_r1 = ring1.contains(point) or ring1.touches(point)
+                in_r2 = ring2.contains(point) or ring2.touches(point)
                 if in_r1 or in_r2:
                     status = "first" if in_r1 and not in_r2 else "second"
-                    li, q_on, _m = nearest_on_lines(mid_lines, p)
+                    li, q_on, _ = nearest_on_lines(mid_lines, point)
                     if li >= 0:
                         q = q_on
                     props_copy["ring_snap"] = "to_ring2_midline"
@@ -712,58 +349,39 @@ def main():
             moved_points.append(q)
             moved_props.append(props_copy)
 
-        for p, pr in zip(moved_points, moved_props):
+        for point, props in zip(moved_points, moved_props):
             out_centroids_features.append({
                 "type": "Feature",
-                "geometry": mapping(p),
-                "properties": pr,
-            })
-
-        coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
-        labels = clusterer.fit_predict(coords)
-        cluster_to_indices: Dict[int, List[int]] = defaultdict(list)
-        for idx, label in enumerate(labels):
-            if label < 0:
-                continue
-            cluster_to_indices[label].append(idx)
-
-        if not cluster_to_indices:
-            continue
-
-        for cluster_id, indices in cluster_to_indices.items():
-            pts = [moved_points[i] for i in indices]
-            geom_cluster, geom_info = build_geometry_for_cluster(pts, geom, gparams)
-            attrs = aggregate_cluster_attributes(indices, moved_props)
-            props = {
-                "block_index": block_idx,
-                "zone": zone_label,
-                "cluster_id": int(cluster_id),
-            }
-            props.update(attrs)
-            props.update(geom_info)
-
-            out_building_features.append({
-                "type": "Feature",
-                "geometry": mapping(geom_cluster),
+                "geometry": mapping(point),
                 "properties": props,
             })
 
-            out_cluster_centers.append({
+        coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
+        leaves = segmenter.segment(coords, geom)
+        if not leaves:
+            continue
+
+        for leaf in leaves:
+            attrs = aggregate_segment_attributes(leaf.indices, moved_props)
+            props = {
+                "block_index": block_idx,
+                "zone": zone_label,
+                "quad_path": leaf.path,
+                "quad_depth": leaf.depth,
+                "quad_bounds": list(leaf.bounds),
+                "quad_area": float(leaf.polygon.area),
+            }
+            props.update(attrs)
+            out_square_features.append({
                 "type": "Feature",
-                "geometry": mapping(MultiPoint(pts).centroid),
-                "properties": {
-                    "block_index": block_idx,
-                    "zone": zone_label,
-                    "cluster_id": int(cluster_id),
-                    "shape": geom_info.get("shape"),
-                    "roundness": geom_info.get("roundness"),
-                },
+                "geometry": mapping(leaf.polygon),
+                "properties": props,
             })
 
-    if out_building_features:
+    if out_square_features:
         write_geojson(args.out_buildings, {
             "type": "FeatureCollection",
-            "features": out_building_features,
+            "features": out_square_features,
         }, epsg=args.out_epsg)
 
     if args.out_centroids:
@@ -772,11 +390,14 @@ def main():
             "features": out_centroids_features,
         }, epsg=args.out_epsg)
 
-    if args.out_clusters_centers:
-        write_geojson(args.out_clusters_centers, {
-            "type": "FeatureCollection",
-            "features": out_cluster_centers,
-        }, epsg=args.out_epsg)
+
+def json_dumps(obj: Any) -> str:
+    try:
+        import json
+
+        return json.dumps(obj)
+    except Exception:  # pragma: no cover
+        raise
 
 
 if __name__ == "__main__":  # pragma: no cover
