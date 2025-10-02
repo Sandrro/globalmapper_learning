@@ -3,13 +3,14 @@
 """batch_infer_blocks_clustered.py
 
 Актуализированная утилита для пакетного инференса кварталов.
-Этап подготовки точек совпадает с исходной версией: вызывается модель,
-центроиды при необходимости смещаются ко второму кольцу. Далее квартал
-делится на сегменты с помощью quad-tree, и в итоговых квадратах
-вычисляется агрегированная статистика по точкам.
+Инференс и подготовка точек совпадают с исходной версией: вызывается
+модель, центроиды при необходимости смещаются ко второму кольцу.
+Далее строится регулярная сетка квадратов 15×15 м, обрезанная по
+внутренней границе первого кольца, в ячейках подсчитывается статистика
+по точкам и выполняется кластеризация по плотности и вытянутости.
 
 Выходные данные:
-  --out-buildings : квадраты quad-tree (Polygon) c агрегированными атрибутами.
+  --out-buildings : квадраты сетки (Polygon) с агрегированными атрибутами.
   --out-centroids : (опц.) итоговые (слитые и смещённые) точки зданий (Point).
 
 """
@@ -17,12 +18,11 @@
 from __future__ import annotations
 
 import argparse
+import math
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
-from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 try:  # tqdm опционален
     from tqdm import tqdm
@@ -37,7 +37,7 @@ except Exception as exc:  # pragma: no cover
 
 try:
     from shapely.geometry import Point, Polygon, box, mapping, shape
-    from shapely.ops import unary_union
+    from shapely.prepared import prep
 except Exception:  # pragma: no cover
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
@@ -59,150 +59,138 @@ from batch_infer_blocks import (  # noqa: E402
 )
 
 
-@dataclass
-class QuadTreeParams:
-    max_depth: int
-    min_points: int
-    min_size: float
+def _generate_square_grid(area: Polygon, cell_size: float) -> List[Polygon]:
+    if area is None or area.is_empty or cell_size <= 0:
+        return []
+
+    minx, miny, maxx, maxy = area.bounds
+    if maxx - minx <= 0 or maxy - miny <= 0:
+        return []
+
+    start_x = math.floor(minx / cell_size) * cell_size
+    start_y = math.floor(miny / cell_size) * cell_size
+    end_x = math.ceil(maxx / cell_size) * cell_size
+    end_y = math.ceil(maxy / cell_size) * cell_size
+
+    grid: List[Polygon] = []
+    y = start_y
+    while y < end_y - 1e-9:
+        x = start_x
+        while x < end_x - 1e-9:
+            cell = box(x, y, x + cell_size, y + cell_size)
+            try:
+                clipped = cell.intersection(area)
+            except Exception:
+                clipped = cell
+            if clipped.is_empty:
+                x += cell_size
+                continue
+            try:
+                clipped = clipped.buffer(0)
+            except Exception:
+                pass
+            if not clipped.is_empty and clipped.area > 1e-4:
+                grid.append(clipped)
+            x += cell_size
+        y += cell_size
+    return grid
 
 
-@dataclass
-class QuadTreeLeaf:
-    polygon: Polygon
-    indices: List[int]
-    path: str
-    depth: int
-    bounds: Tuple[float, float, float, float]
+def _points_in_polygon(points: Sequence[Point], polygon: Polygon) -> List[int]:
+    if not points:
+        return []
+    try:
+        prepared = prep(polygon)
+    except Exception:
+        prepared = None
+    indices: List[int] = []
+    for idx, point in enumerate(points):
+        inside = False
+        try:
+            if prepared is not None:
+                inside = prepared.contains(point) or prepared.intersects(point)
+            else:
+                inside = polygon.contains(point) or polygon.touches(point)
+        except Exception:
+            inside = polygon.distance(point) <= 1e-6
+        if inside:
+            indices.append(idx)
+    return indices
 
 
-class QuadTreeSegmenter:
-    """Делит квартал на квадраты quad-tree по точкам."""
-
-    def __init__(self, params: QuadTreeParams):
-        self.params = params
-
-    def segment(
-        self,
-        coords: np.ndarray,
-        block_geom: Polygon,
-        start_polygon: Polygon | None = None,
-    ) -> List[QuadTreeLeaf]:
-        if len(coords) == 0:
-            return []
-
-        root_bounds = self._initial_bounds(coords, block_geom, start_polygon)
-
-        leaves: List[QuadTreeLeaf] = []
-
-        def subdivide(bounds: Tuple[float, float, float, float], depth: int,
-                      indices: Sequence[int], path: str) -> None:
-            if not indices:
-                return
-            width = bounds[2] - bounds[0]
-            height = bounds[3] - bounds[1]
-            stop = (
-                depth >= self.params.max_depth
-                or len(indices) <= self.params.min_points
-                or width <= self.params.min_size
-                or height <= self.params.min_size
-            )
-            polygon = box(*bounds).intersection(block_geom)
-            if polygon.is_empty:
-                return
-            polygon = polygon.buffer(0)
-            if stop:
-                leaves.append(
-                    QuadTreeLeaf(
-                        polygon=polygon,
-                        indices=list(indices),
-                        path=path,
-                        depth=depth,
-                        bounds=bounds,
-                    )
-                )
-                return
-
-            midx = (bounds[0] + bounds[2]) / 2.0
-            midy = (bounds[1] + bounds[3]) / 2.0
-            children = [
-                (bounds[0], midy, midx, bounds[3]),  # северо-запад
-                (midx, midy, bounds[2], bounds[3]),  # северо-восток
-                (midx, bounds[1], bounds[2], midy),  # юго-восток
-                (bounds[0], bounds[1], midx, midy),  # юго-запад
-            ]
-            child_indices: List[List[int]] = [[] for _ in range(4)]
-            eps = 1e-9
-            for idx in indices:
-                x, y = coords[idx]
-                assigned = False
-                for ci, child in enumerate(children):
-                    if (
-                        x >= child[0] - eps
-                        and x <= child[2] + eps
-                        and y >= child[1] - eps
-                        and y <= child[3] + eps
-                    ):
-                        child_indices[ci].append(idx)
-                        assigned = True
-                        break
-                if not assigned:
-                    # на случай численных артефактов
-                    closest = min(
-                        range(4),
-                        key=lambda ci: _distance_to_bounds(x, y, children[ci]),
-                    )
-                    child_indices[closest].append(idx)
-
-            for ci, child_bounds in enumerate(children):
-                child_path = f"{path}{ci}"
-                subdivide(child_bounds, depth + 1, child_indices[ci], child_path)
-
-        subdivide(root_bounds, 0, list(range(len(coords))), "0")
-        return leaves
-
-    def _initial_bounds(
-        self,
-        coords: np.ndarray,
-        block_geom: Polygon,
-        start_polygon: Polygon | None = None,
-    ) -> Tuple[float, float, float, float]:
-        coords_minx = float(np.min(coords[:, 0]))
-        coords_maxx = float(np.max(coords[:, 0]))
-        coords_miny = float(np.min(coords[:, 1]))
-        coords_maxy = float(np.max(coords[:, 1]))
-
-        minx, miny, maxx, maxy = block_geom.bounds
-        width = maxx - minx
-        height = maxy - miny
-        if width <= 0:
-            padding = max(self.params.min_size, coords_maxx - coords_minx)
-            minx -= padding / 2.0
-            maxx += padding / 2.0
-        if height <= 0:
-            padding = max(self.params.min_size, coords_maxy - coords_miny)
-            miny -= padding / 2.0
-            maxy += padding / 2.0
-        return (float(minx), float(miny), float(maxx), float(maxy))
+def _compute_elongation(coords: np.ndarray) -> Tuple[float, float | None]:
+    if coords.shape[0] < 2:
+        return 0.0, None
+    centered = coords - coords.mean(axis=0, keepdims=True)
+    if np.allclose(centered, 0.0):
+        return 0.0, None
+    cov = np.cov(centered, rowvar=False)
+    if cov.shape != (2, 2):
+        return 0.0, None
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    major = float(max(eigvals[order[0]], 0.0))
+    minor = float(max(eigvals[order[-1]], 0.0))
+    elongation = 1.0
+    if minor <= 1e-9 and major <= 1e-9:
+        elongation = 1.0
+    else:
+        elongation = (major + 1e-9) / (minor + 1e-9)
+    direction = eigvecs[:, order[0]]
+    angle_rad = math.atan2(direction[1], direction[0])
+    angle_deg = math.degrees(angle_rad)
+    # ориентация без направления: нормируем к [0, 180)
+    if angle_deg < 0:
+        angle_deg += 180.0
+    angle_deg = angle_deg % 180.0
+    return float(elongation), float(angle_deg)
 
 
-def _distance_to_bounds(x: float, y: float,
-                        bounds: Tuple[float, float, float, float]) -> float:
-    minx, miny, maxx, maxy = bounds
-    dx = max(minx - x, 0.0, x - maxx)
-    dy = max(miny - y, 0.0, y - maxy)
-    return dx * dx + dy * dy
+def _cluster_cells(vectors: Sequence[Sequence[float]], max_clusters: int = 4,
+                   max_iter: int = 50) -> List[int]:
+    data = np.array(vectors, dtype=float)
+    n = data.shape[0]
+    if n == 0:
+        return []
+    k = min(max_clusters, n)
+    if k <= 1:
+        return [0] * n
 
+    mean = data.mean(axis=0)
+    std = data.std(axis=0)
+    std[std < 1e-9] = 1.0
+    normed = (data - mean) / std
 
-def aggregate_segment_attributes(indices: List[int], props: List[Dict[str, Any]]) -> Dict[str, Any]:
-    agg = _aggregate_points(indices, props)
-    agg["point_count"] = len(indices)
-    return agg
+    indices = np.linspace(0, n - 1, k).astype(int)
+    centroids = normed[indices].copy()
+    labels = np.zeros(n, dtype=int)
+
+    for _ in range(max_iter):
+        distances = np.linalg.norm(normed[:, None, :] - centroids[None, :, :], axis=2)
+        new_labels = np.argmin(distances, axis=1)
+
+        for ci in range(k):
+            if not np.any(new_labels == ci):
+                farthest = int(np.argmax(distances.min(axis=1)))
+                new_labels[farthest] = ci
+
+        if np.array_equal(new_labels, labels):
+            break
+        labels = new_labels
+
+        for ci in range(k):
+            members = normed[labels == ci]
+            if members.size == 0:
+                continue
+            centroids[ci] = members.mean(axis=0)
+
+    return labels.tolist()
 
 
 # ---- Основной цикл ----
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch infer + quad-tree segmentation")
+    ap = argparse.ArgumentParser(description="Batch infer + regular grid clustering")
     ap.add_argument("--blocks", required=True, help="GeoJSON FeatureCollection кварталов")
     ap.add_argument("--model-ckpt", required=True, help="Путь к чекпойнту модели (.pt)")
     ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
@@ -225,20 +213,10 @@ def main():
     ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON квадратов")
     ap.add_argument("--out-centroids", default=None, help="Выход GeoJSON центроидов")
     ap.add_argument("--out-epsg", type=int, default=32636)
-    ap.add_argument("--quad-max-depth", type=int, default=8, help="Максимальная глубина quad-tree")
-    ap.add_argument("--quad-min-points", type=int, default=10,
-                    help="Минимальное число точек в квадрате перед остановкой деления")
-    ap.add_argument("--quad-min-size", type=float, default=15.0,
-                    help="Минимальный размер стороны квадрата в метрах")
+    ap.add_argument("--grid-size", type=float, default=15.0,
+                    help="Размер стороны квадрата сетки в метрах")
     ap.add_argument("--temp-dir", default=None)
     args = ap.parse_args()
-
-    qt_params = QuadTreeParams(
-        max_depth=max(0, args.quad_max_depth),
-        min_points=max(1, args.quad_min_points),
-        min_size=max(0.1, float(args.quad_min_size)),
-    )
-    segmenter = QuadTreeSegmenter(qt_params)
 
     blocks = read_geojson(args.blocks)
     features = blocks.get("features", [])
@@ -375,76 +353,68 @@ def main():
             })
 
         coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
-        inner_clip = None
+        grid_area = None
         try:
-            inner_candidate = geom.buffer(-10.0)
-            if inner_candidate is not None and not inner_candidate.is_empty:
-                inner_clip = inner_candidate
+            inner_area = geom.buffer(-10.0)
+            if inner_area is not None and not inner_area.is_empty:
+                grid_area = inner_area
         except Exception:
-            inner_clip = None
+            grid_area = None
+        if grid_area is None:
+            grid_area = geom
 
-        leaves = segmenter.segment(coords, geom, start_polygon=None)
-        if not leaves:
+        grid_cells = _generate_square_grid(grid_area, max(0.1, float(args.grid_size)))
+        if not grid_cells:
             continue
 
-        grouped_by_depth: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-        for leaf in leaves:
-            if leaf.depth < 5:
-                continue
-            attrs = aggregate_segment_attributes(leaf.indices, moved_props)
-            e_max = attrs.get("e_max")
-            if e_max is None or e_max < 0.9:
-                continue
-            geometry = leaf.polygon
-            if inner_clip is not None and not inner_clip.is_empty:
-                try:
-                    geometry = geometry.intersection(inner_clip).buffer(0)
-                except Exception:
-                    geometry = geometry.intersection(inner_clip)
-            if geometry.is_empty:
-                continue
-            grouped_by_depth[leaf.depth].append({
-                "leaf": leaf,
-                "attrs": attrs,
-                "geometry": geometry,
+        cell_vectors: List[List[float]] = []
+        cell_infos: List[Dict[str, Any]] = []
+
+        for cell_idx, cell in enumerate(grid_cells):
+            indices = _points_in_polygon(moved_points, cell)
+            agg_attrs = _aggregate_points(indices, moved_props) if indices else {}
+            point_count = len(indices)
+            area_m2 = float(cell.area) if cell.area else 0.0
+            density = point_count / area_m2 if area_m2 > 1e-9 else 0.0
+            if indices:
+                cell_coords = coords[indices]
+            else:
+                cell_coords = np.empty((0, 2), dtype=float)
+            elongation, direction = _compute_elongation(cell_coords) if indices else (0.0, None)
+            cell_vectors.append([float(point_count), float(density), float(elongation)])
+            cell_infos.append({
+                "geometry": cell,
+                "indices": indices,
+                "agg": agg_attrs,
+                "point_count": point_count,
+                "point_density": density,
+                "elongation": elongation,
+                "direction": direction,
+                "area": area_m2,
+                "grid_idx": cell_idx,
             })
 
-        for depth, items in grouped_by_depth.items():
-            if not items:
-                continue
-            for component in _merge_touching(items):
-                comp_indices: List[int] = []
-                comp_paths: List[str] = []
-                polygons: List[Polygon] = []
-                for item in component:
-                    leaf = item["leaf"]
-                    polygons.append(item["geometry"])
-                    comp_paths.append(leaf.path)
-                    comp_indices.extend(leaf.indices)
-                merged_polygon = unary_union(polygons).buffer(0)
-                if merged_polygon.is_empty:
-                    continue
-                if merged_polygon.geom_type == "MultiPolygon":
-                    geoms = [poly for poly in merged_polygon.geoms if not poly.is_empty]
-                    if not geoms:
-                        continue
-                    merged_polygon = max(geoms, key=lambda poly: poly.area)
+        cluster_ids = _cluster_cells(cell_vectors, max_clusters=4)
 
-                agg_attrs = aggregate_segment_attributes(comp_indices, moved_props)
-                props = {
-                    "block_index": block_idx,
-                    "zone": zone_label,
-                    "quad_path": "|".join(sorted(comp_paths)),
-                    "quad_depth": depth,
-                    "quad_bounds": list(merged_polygon.bounds),
-                    "quad_area": float(merged_polygon.area),
-                }
-                props.update(agg_attrs)
-                out_square_features.append({
-                    "type": "Feature",
-                    "geometry": mapping(merged_polygon),
-                    "properties": props,
-                })
+        for info, cluster_id in zip(cell_infos, cluster_ids):
+            props = {
+                "block_index": block_idx,
+                "zone": zone_label,
+                "grid_index": int(info["grid_idx"]),
+                "grid_area": float(info["area"]),
+                "point_count": int(info["point_count"]),
+                "point_density": float(info["point_density"]),
+                "elongation": float(info["elongation"]),
+                "cluster_id": int(cluster_id),
+            }
+            if info["direction"] is not None:
+                props["elongation_dir_deg"] = float(info["direction"])
+            props.update(info["agg"])
+            out_square_features.append({
+                "type": "Feature",
+                "geometry": mapping(info["geometry"]),
+                "properties": props,
+            })
 
     if out_square_features:
         write_geojson(args.out_buildings, {
@@ -457,57 +427,6 @@ def main():
             "type": "FeatureCollection",
             "features": out_centroids_features,
         }, epsg=args.out_epsg)
-
-def _merge_touching(items: List[Dict[str, Any]]) -> Iterable[List[Dict[str, Any]]]:
-    n = len(items)
-    if n == 0:
-        return []
-
-    adjacency: List[List[int]] = [[] for _ in range(n)]
-    for i in range(n):
-        poly_i = items[i]["geometry"]
-        if poly_i is None or poly_i.is_empty:
-            continue
-        for j in range(i + 1, n):
-            poly_j = items[j]["geometry"]
-            if poly_j is None or poly_j.is_empty:
-                continue
-            share_boundary = False
-            try:
-                inter = poly_i.intersection(poly_j)
-            except Exception:
-                inter = poly_i.boundary.intersection(poly_j.boundary)
-            try:
-                if hasattr(inter, "area") and inter.area > 0:
-                    share_boundary = True
-                elif hasattr(inter, "length") and inter.length > 1e-6:
-                    share_boundary = True
-            except Exception:
-                share_boundary = False
-            if share_boundary:
-                adjacency[i].append(j)
-                adjacency[j].append(i)
-
-    visited = [False] * n
-    components: List[List[Dict[str, Any]]] = []
-    for i in range(n):
-        if visited[i]:
-            continue
-        stack = [i]
-        comp_indices = []
-        while stack:
-            cur = stack.pop()
-            if visited[cur]:
-                continue
-            visited[cur] = True
-            comp_indices.append(cur)
-            for nb in adjacency[cur]:
-                if not visited[nb]:
-                    stack.append(nb)
-        components.append([items[idx] for idx in comp_indices])
-
-    return components
-
 
 def json_dumps(obj: Any) -> str:
     try:
