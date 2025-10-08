@@ -1,845 +1,202 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-batch_infer_blocks.py — пакетная генерация застройки через train.py --mode infer
-с последующим слиянием центроидов внутри кварталов, возможным смещением точек на
-срединную линию буфера квартала и построением гекс-сетки зданий. После фильтрации
-гексов (≥2 точек) формируется граф соседства, упрощается до одной основной линии с
-ветвями, затем по ним строятся прямоугольные буферы и полигоны зданий с агрегацией
-атрибутов.
+"""batch_infer_blocks.py
 
-Совместимо с Shapely < 2.0 (проверено на 1.7/1.8).
-Зависимости: shapely, tqdm (опц.).
+Актуализированная утилита для пакетного инференса кварталов.
+Инференс и подготовка точек совпадают с исходной версией: вызывается
+модель, центроиды при необходимости смещаются ко второму кольцу.
+Далее строится регулярная сетка квадратов 15×15 м, обрезанная по
+внутренней границе первого кольца, в ячейках подсчитывается статистика
+по точкам и выполняется кластеризация по плотности и вытянутости.
 
-ВЫХОДЫ (4 шт):
-  1) --out                 : линии графа зданий по гексам (LineString) — основная линия и ветви.
-  2) --out-infer-polys     : полигоны зданий, построенные из буферов линий (Polygon).
-  3) --out-infer-centroids : исходные (слитые и, при необходимости, смещённые) точки зданий (Point).
-  4) --out-hex-grid        : гексы с агрегированными показателями по точкам (Polygon).
+Выходные данные:
+  --out-buildings : квадраты сетки (Polygon) с агрегированными атрибутами.
+  --out-centroids : (опц.) итоговые (слитые и смещённые) точки зданий (Point).
 
-В полигоны зданий записываются:
-  - e_max             : максимальная вероятность e среди точек;
-  - living_area_sum   : суммарная жилая площадь;
-  - is_living_max     : максимальное значение is_living;
-  - floors_avg_round  : средняя этажность, округлённая до целого;
-  - pts_count         : количество точек в объекте.
-
-Примечания:
-- Расстояния считаются в единицах CRS входа — используйте метрическую проекцию.
-- Второе кольцо: 10–30 м внутрь от внешней границы квартала; срединная линия — 20 м.
-- Если второе кольцо пусто (слишком узкий квартал), смещение происходит только для тех,
-  кто попал в доступные линии.
 """
 
 from __future__ import annotations
-import os, sys, json, argparse, tempfile, subprocess, shutil, math
-from typing import Dict, Any, List, Tuple, Optional
-from pathlib import Path
 
-try:
+import argparse
+import math
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Sequence, Tuple
+
+try:  # tqdm опционален
     from tqdm import tqdm
-except Exception:
+except Exception:  # pragma: no cover - резерв
     tqdm = lambda x, **k: x
 
-# --- Гео-зависимости (Shapely < 2.0 поддерживается) ---
 try:
-    from shapely.geometry import shape, mapping, Point, Polygon, MultiPolygon, LineString, MultiLineString
-    from shapely.ops import nearest_points, unary_union, linemerge
-except Exception:
+    import numpy as np
+except Exception as exc:  # pragma: no cover
+    print("[FATAL] Требуется NumPy: {}".format(exc), file=sys.stderr)
+    raise
+
+try:
+    from shapely.geometry import Point, Polygon, box, mapping, shape
+    from shapely.prepared import prep
+except Exception:  # pragma: no cover
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
 
-# ---- I/O ----
+from batch_infer_blocks import (  # noqa: E402
+    build_rings,
+    get_people,
+    infer_slots_from_block_bbox,
+    lines_of,
+    load_json_maybe,
+    load_services_vocab_from_artifacts,
+    nearest_on_lines,
+    normalize_targets_map,
+    pick_service_keys,
+    read_geojson,
+    write_geojson,
+    zone_label_of,
+    _aggregate_points,
+)
 
-def read_geojson(path: str) -> Dict[str,Any]:
-    with open(path, "r", encoding="utf-8") as f:
-        gj = json.load(f)
-    if gj.get("type") != "FeatureCollection":
-        if gj.get("type") == "Feature":
-            feats = [gj]
-        else:
-            feats = [{"type":"Feature","geometry":gj,"properties":{}}]
-        gj = {"type":"FeatureCollection", "features": feats}
-    return gj
 
-def write_geojson(path: str, fc: Dict[str,Any], epsg: Optional[int] = None) -> None:
-    Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
-    if epsg:
-        fc = dict(fc)
-        fc["crs"] = {"type": "name", "properties": {"name": f"EPSG:{int(epsg)}"}}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(fc, f, ensure_ascii=False, indent=2)
+def _generate_square_grid(area: Polygon, cell_size: float) -> List[Polygon]:
+    if area is None or area.is_empty or cell_size <= 0:
+        return []
 
-def zone_label_of(feat: Dict[str,Any], zone_attr: str) -> Optional[str]:
-    props = feat.get("properties") or {}
-    z = props.get(zone_attr)
-    return z if isinstance(z, str) else None
+    minx, miny, maxx, maxy = area.bounds
+    if maxx - minx <= 0 or maxy - miny <= 0:
+        return []
 
-# ---- Совместимость (targets) ----
+    start_x = math.floor(minx / cell_size) * cell_size
+    start_y = math.floor(miny / cell_size) * cell_size
+    end_x = math.ceil(maxx / cell_size) * cell_size
+    end_y = math.ceil(maxy / cell_size) * cell_size
 
-SYNONYMS = {
-    "school":       ["school", "школа", "общеобразовательная школа", "образовательная организация"],
-    "kindergarten": ["kindergarten", "детский сад", "детсад", "дошкольное", "д/с"],
-    "polyclinic":   ["polyclinic", "clinic", "поликлиника", "амбулатория", "клиника"],
-}
-
-def load_services_vocab_from_artifacts(model_ckpt: str) -> Dict[str, int] | None:
-    aux_dir = os.path.join(os.path.dirname(model_ckpt) or ".", "artifacts")
-    sj = os.path.join(aux_dir, "services.json")
-    if os.path.exists(sj):
-        try:
-            with open(sj, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-def pick_service_keys(vocab: Dict[str,int] | None) -> Dict[str,str]:
-    out = {"school":"school", "kindergarten":"kindergarten", "polyclinic":"polyclinic"}
-    if not vocab:
-        return out
-    names = list(vocab.keys())
-    lowered = [s.casefold() for s in names]
-    for canon, syns in SYNONYMS.items():
-        for syn in syns:
-            cf = syn.casefold()
-            if cf in lowered:
-                out[canon] = names[lowered.index(cf)]; break
-            idx = next((i for i,s in enumerate(lowered) if cf in s), None)
-            if idx is not None:
-                out[canon] = names[idx]; break
-    return out
-
-def get_people(props: Dict[str,Any], default_people: int) -> int:
-    for k in ("population","people","POPULATION","num_people"):
-        if k in props:
+    grid: List[Polygon] = []
+    y = start_y
+    while y < end_y - 1e-9:
+        x = start_x
+        while x < end_x - 1e-9:
+            cell = box(x, y, x + cell_size, y + cell_size)
             try:
-                v = int(float(props[k]))
-                if v > 0: return v
+                clipped = cell.intersection(area)
+            except Exception:
+                clipped = cell
+            if clipped.is_empty:
+                x += cell_size
+                continue
+            try:
+                clipped = clipped.buffer(0)
             except Exception:
                 pass
-    return int(default_people)
+            if not clipped.is_empty and clipped.area > 1e-4:
+                grid.append(clipped)
+            x += cell_size
+        y += cell_size
+    return grid
 
-def load_json_maybe(path_or_json: str) -> Any:
-    try:
-        if path_or_json is None:
-            return None
-        if os.path.exists(path_or_json):
-            with open(path_or_json, "r", encoding="utf-8") as f:
-                return json.load(f)
-        else:
-            return json.loads(path_or_json)
-    except Exception as e:
-        print(f"[WARN] failed to read JSON '{path_or_json}': {e}", file=sys.stderr)
-        return None
 
-def normalize_targets_map(raw: Any) -> Dict[str, Dict[str, float]]:
-    out: Dict[str, Dict[str, float]] = {}
-    if not isinstance(raw, dict):
-        return out
-    for zone, val in raw.items():
-        if not isinstance(zone, str) or not isinstance(val, dict): 
-            continue
-        la = None; fl = None
-        for k in ("la", "living_area", "la_target"):
-            if k in val and val[k] is not None:
-                try:
-                    la = float(val[k]); break
-                except Exception:
-                    pass
-        for k in ("floors_avg", "floors"):
-            if k in val and val[k] is not None:
-                try:
-                    fl = float(val[k]); break
-                except Exception:
-                    pass
-        out[zone] = {"la": la, "floors_avg": fl}
-    return out
-
-# ---- Вспомогательные извлечения атрибутов ----
-
-def _flatten_polygons(g):
-    """Достаёт список Polygon из произвольной геометрии (Polygon/MultiPolygon/GeometryCollection)."""
-    if g is None or g.is_empty:
+def _points_in_polygon(points: Sequence[Point], polygon: Polygon) -> List[int]:
+    if not points:
         return []
-    polys = []
-    if isinstance(g, Polygon):
-        polys.append(g)
-    elif isinstance(g, MultiPolygon):
-        polys.extend(list(g.geoms))
-    else:
-        # Например, GeometryCollection: вытаскиваем полигоны рекурсивно
-        if hasattr(g, "geoms"):
-            for sub in g.geoms:
-                polys.extend(_flatten_polygons(sub))
-    return polys
-
-def postprocess_building_geom(geom,
-                              simplify_m=0.75,
-                              fill_buffer_m=1.5,
-                              min_area_m2=4.0,
-                              clip_to=None):
-    """
-    Морфологическая пост-обработка итоговой геометрии здания(ий):
-      1) Закрытие мелких дыр и щелей: buffer(+d) -> buffer(-d) (d = fill_buffer_m).
-      2) Топологически безопасное упрощение: simplify(simplify_m, preserve_topology=True).
-      3) Удаление микрополигонов: площадь < min_area_m2.
-      4) Починка валидности: buffer(0).
-      5) (Опц.) Клип по кварталу (clip_to).
-
-    Совместимо с Shapely < 2.0.
-    """
-    if geom is None or geom.is_empty:
-        return geom
-
-    g = geom
-
-    # 1) «Заливка» отверстий/щелей через плюс-минус буфер
-    if abs(float(fill_buffer_m)) > 0.0:
-        try:
-            g = g.buffer(float(fill_buffer_m),  join_style=3)
-            g = g.buffer(-float(fill_buffer_m), join_style=3)
-        except Exception:
-            # Если что-то пошло не так — починим и попробуем минимально
-            g = g.buffer(0)
-
-    # 2) Упрощение контура с сохранением топологии
-    if float(simplify_m) > 0.0:
-        try:
-            g = g.simplify(float(simplify_m), preserve_topology=True)
-        except Exception:
-            pass
-
-    # 3) Отсев микрополигонов
-    polys = _flatten_polygons(g)
-    if polys:
-        polys = [p if p.is_valid else p.buffer(0) for p in polys]
-        polys = [p for p in polys if (p and (p.area or 0.0) >= float(min_area_m2))]
-        if polys:
-            g = unary_union(polys)
-        else:
-            return Polygon()  # пусто после отсева
-    else:
-        # Если это не полигоны (вдруг), починим и вернём как есть
-        g = g.buffer(0)
-
-    # 4) Починка валидности
     try:
-       g = g.buffer(0, join_style=3)
+        prepared = prep(polygon)
     except Exception:
-        pass
-
-    # 5) (Опционально) ограничиваем границами квартала,
-    #    чтобы буфер не «выползал» за пределы
-    if clip_to is not None and (not clip_to.is_empty):
+        prepared = None
+    indices: List[int] = []
+    for idx, point in enumerate(points):
+        inside = False
         try:
-            g = g.intersection(clip_to)
-            g = g.buffer(0)  # ещё раз на всякий
-        except Exception:
-            pass
-
-    return g
-
-def _angle_deg(p_prev: Point, p_mid: Point, p_next: Point) -> float:
-    """Внутренний угол в градусах в вершине p_mid для полилинии p_prev -> p_mid -> p_next."""
-    ax, ay = p_prev.x - p_mid.x, p_prev.y - p_mid.y
-    bx, by = p_next.x - p_mid.x, p_next.y - p_mid.y
-    la = math.hypot(ax, ay); lb = math.hypot(bx, by)
-    if la <= 1e-9 or lb <= 1e-9:
-        return 180.0
-    cosv = max(-1.0, min(1.0, (ax*bx + ay*by) / (la*lb)))
-    return math.degrees(math.acos(cosv))
-
-def _hexes_touch(poly_a: Polygon, poly_c: Polygon) -> bool:
-    """Соприкасаются ли гексы (общая граница/вершина)."""
-    try:
-        return poly_a.touches(poly_c) or poly_a.intersection(poly_c).length > 0.0
-    except Exception:
-        return poly_a.touches(poly_c)
-
-def simplify_main_path_by_angles(main_path: List[int],
-                                 hex_nodes: List[Dict[str, Any]],
-                                 angle_thr_deg: float,
-                                 require_touch: bool) -> List[int]:
-    """
-    Удаляет «острые» переломы: для троек (a,b,c) с углом < angle_thr_deg
-    заменяем отрезки a-b, b-c на прямой a-c, если (опц.) гексы a и c соприкасаются.
-    Повторяем до стабилизации.
-    """
-    if len(main_path) < 3:
-        return main_path[:]
-    path = main_path[:]
-    changed = True
-    safe_iters = 0
-    while changed and len(path) >= 3 and safe_iters < 100:
-        changed = False
-        safe_iters += 1
-        i = 1
-        while i < len(path) - 1:
-            a, b, c = path[i-1], path[i], path[i+1]
-            pa = hex_nodes[a]["centroid"]; pb = hex_nodes[b]["centroid"]; pc = hex_nodes[c]["centroid"]
-            ang = _angle_deg(pa, pb, pc)
-            ok_touch = True
-            if require_touch:
-                ok_touch = _hexes_touch(hex_nodes[a]["polygon"], hex_nodes[c]["polygon"])
-            if ang < angle_thr_deg and ok_touch:
-                # выкидываем b
-                path.pop(i)
-                changed = True
+            if prepared is not None:
+                inside = prepared.contains(point) or prepared.intersects(point)
             else:
-                i += 1
-    return path
+                inside = polygon.contains(point) or polygon.touches(point)
+        except Exception:
+            inside = polygon.distance(point) <= 1e-6
+        if inside:
+            indices.append(idx)
+    return indices
 
-def _bbox_from_points(pts: List[Point]) -> Optional[Polygon]:
-    if not pts:
-        return None
-    xs = [p.x for p in pts]; ys = [p.y for p in pts]
-    minx, maxx = min(xs), max(xs)
-    miny, maxy = min(ys), max(ys)
-    if maxx - minx <= 0 or maxy - miny <= 0:
-        return None
-    return Polygon([(minx, miny),(maxx, miny),(maxx, maxy),(minx, maxy)])
 
-def _inset_bbox_rect(rect: Polygon, inset: float) -> Optional[Polygon]:
-    """Вычисляет внутренний прямоугольник, сдвинутый на inset со всех сторон."""
-    if rect is None or rect.is_empty:
-        return None
-    minx, miny, maxx, maxy = rect.bounds
-    minx2 = minx + inset; maxx2 = maxx - inset
-    miny2 = miny + inset; maxy2 = maxy - inset
-    if minx2 >= maxx2 or miny2 >= maxy2:
-        return None
-    return Polygon([(minx2, miny2),(maxx2, miny2),(maxx2, maxy2),(minx2, maxy2)])
-
-def is_almost_closed_loop(main_path: List[int],
-                          hex_nodes: List[Dict[str, Any]],
-                          main_width: float,
-                          min_nodes: int,
-                          close_thr_mult: float) -> bool:
-    if len(main_path) < max(3, min_nodes):
-        return False
-    p0 = hex_nodes[main_path[0]]["centroid"]
-    pN = hex_nodes[main_path[-1]]["centroid"]
-    # «почти замкнуто»: концы достаточно близко
-    return p0.distance(pN) <= close_thr_mult * max(main_width, 1.0)
-
-def _to_float(x) -> Optional[float]:
-    try:
-        if isinstance(x, bool): return 1.0 if x else 0.0
-        if isinstance(x, (int, float)): return float(x)
-        if isinstance(x, str):
-            xs = x.strip().lower()
-            if xs in ("true","yes","y","t","1"): return 1.0
-            if xs in ("false","no","n","f","0"): return 0.0
-            return float(x)
-    except Exception:
-        return None
-    return None
-
-def get_floors_value(props: Dict[str,Any]) -> Optional[float]:
-    for k in ("floors", "floors_avg", "floors_num"):
-        if k in props and props[k] is not None:
-            v = _to_float(props[k])
-            if v is not None and v > 0:
-                return v
-    return None
-
-def get_is_living_value(props: Dict[str,Any]) -> Optional[float]:
-    for k in ("is_living", "living", "is_residential"):
-        if k in props and props[k] is not None:
-            v = _to_float(props[k])
-            if v is not None:
-                return max(0.0, min(1.0, v))
-    return None
-
-def get_living_area_value(props: Dict[str,Any]) -> Optional[float]:
-    for k in ("living_area", "la", "area_living", "la_target"):
-        if k in props and props[k] is not None:
-            v = _to_float(props[k])
-            if v is not None and v >= 0:
-                return v
-    return None
-
-# ---- Гео-хелперы для колец и линий ----
-def lines_of(geom) -> List[LineString]:
-    if geom is None or geom.is_empty:
-        return []
-    if isinstance(geom, LineString):
-        return [geom]
-    if isinstance(geom, MultiLineString):
-        return list(geom.geoms)
-    # boundary может вернуть LinearRing — он является LineString в геометриях Shapely
-    return []
-
-def build_rings(block: Polygon) -> Tuple[Any, Any, Any]:
-    """Возвращает (ring1, ring2, midline) где:
-       ring1 = 0–10 м, ring2 = 10–30 м, midline = граница buffer(-20) ∩ ring2 (MultiLineString/LineString).
-       Если ring2 пуст, midline пуст.
-    """
-    inner10 = block.buffer(-10.0)
-    ring1 = block.difference(inner10)
-    inner30 = block.buffer(-30.0)
-    ring2 = inner10.difference(inner30) if (inner30 and not inner30.is_empty) else inner10.difference(Polygon())
-    # если после вычитания получилось пусто (узкий квартал) — обнулим
-    if ring2 is None or ring2.is_empty:
-        return ring1, ring2, LineString()
-    mid20_poly = block.buffer(-20.0)
-    midline_raw = mid20_poly.boundary
-    midline = midline_raw.intersection(ring2)
-    return ring1, ring2, midline
-
-def nearest_on_lines(lines: List[LineString], p: Point) -> Tuple[int, Point, float]:
-    """Находит ближайший компонент линии и возвращает (index, point_on_line, m_along)."""
-    best_i = -1
-    best_q = None
-    best_d = 1e100
-    best_m = 0.0
-    for i, ln in enumerate(lines):
-        # ближайшая точка на конкретной линии
-        m = ln.project(p)
-        q = ln.interpolate(m)
-        d = q.distance(p)
-        if d < best_d:
-            best_d = d; best_q = q; best_i = i; best_m = m
-    if best_q is None:
-        return -1, p, 0.0
-    return best_i, best_q, best_m
-
-# ------ вычисление сетки ---------
-def infer_slots_from_block_bbox(block_geom, cell_size_m: float = 100.0) -> int:
-    """
-    Возвращает число КВАДРАТОВ по стороне прямоугольной сетки (N),
-    построенной по bbox квартала при размере ячейки cell_size_m (м).
-    Используется как значение для --infer-slots (то есть N, а не N*N).
-
-    ВАЖНО: CRS должен быть метрическим.
-    """
-    if block_geom is None or block_geom.is_empty:
-        return 1
-    minx, miny, maxx, maxy = block_geom.bounds
-    w = float(maxx - minx)
-    h = float(maxy - miny)
-    if w <= 0.0 or h <= 0.0:
-        return 1
-    nx = int(math.ceil(w / cell_size_m))
-    ny = int(math.ceil(h / cell_size_m))
-    n_side = max(nx, ny)
-    if max(1, n_side) > 5000:
-        return 5000
+def _compute_elongation(coords: np.ndarray) -> Tuple[float, float | None]:
+    if coords.shape[0] < 2:
+        return 0.0, None
+    centered = coords - coords.mean(axis=0, keepdims=True)
+    if np.allclose(centered, 0.0):
+        return 0.0, None
+    cov = np.cov(centered, rowvar=False)
+    if cov.shape != (2, 2):
+        return 0.0, None
+    eigvals, eigvecs = np.linalg.eigh(cov)
+    order = np.argsort(eigvals)[::-1]
+    major = float(max(eigvals[order[0]], 0.0))
+    minor = float(max(eigvals[order[-1]], 0.0))
+    elongation = 1.0
+    if minor <= 1e-9 and major <= 1e-9:
+        elongation = 1.0
     else:
-        return max(1, n_side)
+        elongation = (major + 1e-9) / (minor + 1e-9)
+    direction = eigvecs[:, order[0]]
+    angle_rad = math.atan2(direction[1], direction[0])
+    angle_deg = math.degrees(angle_rad)
+    # ориентация без направления: нормируем к [0, 180)
+    if angle_deg < 0:
+        angle_deg += 180.0
+    angle_deg = angle_deg % 180.0
+    return float(elongation), float(angle_deg)
 
 
-# ---- Слияние центроидов внутри квартала ----
-
-def merge_centroids(points: List[Point],
-                    props_list: List[Dict[str,Any]],
-                    radius_m: float,
-                    prob_field: str = "e") -> Tuple[List[Point], List[Dict[str,Any]]]:
-    """
-    Кластеризуем центроиды внутри квартала: сортировка по убыванию prob_field,
-    якорь поглощает соседей в радиусе radius_m с меньшей/равной вероятностью.
-    Геометрия кластера = точка якоря.
-    """
-    n = len(points)
-    if n <= 1:
-        return list(points), list(props_list)
-
-    order = sorted(range(n), key=lambda i: _to_float(props_list[i].get(prob_field)) or 0.0, reverse=True)
-    taken = [False]*n
-    m_points: List[Point] = []
-    m_props:  List[Dict[str,Any]] = []
-
-    for idx in order:
-        if taken[idx]:
-            continue
-        anchor_i = idx
-        anchor_p = points[anchor_i]
-        anchor_pr = props_list[anchor_i]
-        anchor_e = _to_float(anchor_pr.get(prob_field)) or 0.0
-
-        cluster_ids = [anchor_i]
-        taken[anchor_i] = True
-
-        for j in order:
-            if taken[j]:
-                continue
-            pj = points[j]
-            ej = _to_float(props_list[j].get(prob_field)) or 0.0
-            if ej <= anchor_e + 1e-12 and anchor_p.distance(pj) <= radius_m:
-                cluster_ids.append(j)
-                taken[j] = True
-
-        # агрегаты
-        floors_vals = [get_floors_value(props_list[k]) for k in cluster_ids]
-        floors_vals = [v for v in floors_vals if v is not None]
-        is_living_vals = [get_is_living_value(props_list[k]) for k in cluster_ids]
-        is_living_vals = [v for v in is_living_vals if v is not None]
-        living_area_vals = [get_living_area_value(props_list[k]) for k in cluster_ids]
-        living_area_vals = [v for v in living_area_vals if v is not None]
-
-        merged = dict(anchor_pr)  # переносим e и др.
-        if floors_vals:
-            mean_fl = float(sum(floors_vals)/len(floors_vals))
-            merged["floors_avg"] = mean_fl
-            merged["floors"] = int(math.ceil(mean_fl))
-        if is_living_vals:
-            merged["is_living"] = float(sum(is_living_vals)/len(is_living_vals))
-        if living_area_vals:
-            merged["living_area"] = float(sum(living_area_vals))
-
-        infer_ids = []
-        for k in cluster_ids:
-            fid = props_list[k].get("infer_fid")
-            if fid is not None:
-                try:
-                    infer_ids.append(int(fid))
-                except Exception:
-                    pass
-        infer_ids = sorted(set(infer_ids))
-        merged["merged_from"] = infer_ids
-        merged["merged_count"] = int(len(cluster_ids))
-
-        m_points.append(anchor_p)
-        m_props.append(merged)
-
-    return m_points, m_props
-
-# ---- Гекс-сетка (pointy-top, сторона side_m) ----
-
-def _hex_polygon(cx: float, cy: float, side_m: float) -> Polygon:
-    """Единичный гекс (pointy-top). Углы: 30°, 90°, 150°, 210°, 270°, 330°."""
-    pts = []
-    for i in range(6):
-        ang = math.radians(60 * i + 30.0)
-        pts.append((cx + side_m * math.cos(ang), cy + side_m * math.sin(ang)))
-    pts.append(pts[0])
-    return Polygon(pts)
-
-def hex_grid_covering_polygon(block_geom, side_m: float) -> List[Polygon]:
-    """
-    Строит pointy-top гекс-сетку с длиной стороны side_m, покрывающую bbox квартала,
-    и возвращает ТОЛЬКО те гексы, которые целиком лежат внутри квартала (hex.within(block)).
-    """
-    if block_geom is None or block_geom.is_empty:
+def _cluster_cells(vectors: Sequence[Sequence[float]], max_clusters: int = 4,
+                   max_iter: int = 50) -> List[int]:
+    data = np.array(vectors, dtype=float)
+    n = data.shape[0]
+    if n == 0:
         return []
+    k = min(max_clusters, n)
+    if k <= 1:
+        return [0] * n
 
-    # Геометрические параметры pointy-top
-    s = float(side_m)
-    width = math.sqrt(3.0) * s      # расстояние между центрами по X
-    height = 2.0 * s                # полная высота гекса
-    dx = width                      # шаг по X
-    dy = 1.5 * s                    # шаг по Y
-    x_off_odd = width / 2.0         # сдвиг "нечётных" рядов
+    mean = data.mean(axis=0)
+    std = data.std(axis=0)
+    std[std < 1e-9] = 1.0
+    normed = (data - mean) / std
 
-    minx, miny, maxx, maxy = block_geom.bounds
-    # небольшой запас, чтобы «закрыть» край
-    pad = max(width, height)
-    minx -= pad; miny -= pad; maxx += pad; maxy += pad
+    indices = np.linspace(0, n - 1, k).astype(int)
+    centroids = normed[indices].copy()
+    labels = np.zeros(n, dtype=int)
 
-    hexes: List[Polygon] = []
-    row = 0
-    y = miny
-    while y <= maxy + 1e-9:
-        x0 = minx + (x_off_odd if (row % 2) else 0.0)
-        x = x0
-        while x <= maxx + 1e-9:
-            h = _hex_polygon(x, y, s)
-            # берём ТОЛЬКО целиком лежащие в квартале гексы
-            if h.within(block_geom):
-                hexes.append(h)
-            x += dx
-        row += 1
-        y += dy
-    return hexes
+    for _ in range(max_iter):
+        distances = np.linalg.norm(normed[:, None, :] - centroids[None, :, :], axis=2)
+        new_labels = np.argmin(distances, axis=1)
 
-def hex_characteristic_width(hex_poly: Polygon) -> float:
-    minx, miny, maxx, maxy = hex_poly.bounds
-    width = min(maxx - minx, maxy - miny)
-    area = hex_poly.area
-    if width <= 0 and area > 0:
-        width = math.sqrt(area)
-    return float(max(width, 1e-6))
+        for ci in range(k):
+            if not np.any(new_labels == ci):
+                farthest = int(np.argmax(distances.min(axis=1)))
+                new_labels[farthest] = ci
 
-
-def build_hex_nodes(block_geom,
-                    moved_points: List[Point],
-                    moved_props: List[Dict[str, Any]],
-                    side_m: float,
-                    block_index: int,
-                    zone_label: str) -> List[Dict[str, Any]]:
-    hexes = hex_grid_covering_polygon(block_geom, side_m)
-    nodes: List[Dict[str, Any]] = []
-
-    for hex_poly in hexes:
-        idxs = [i for i, p in enumerate(moved_points) if hex_poly.covers(p)]
-        if len(idxs) <= 1:
-            continue
-
-        e_vals = [_to_float(moved_props[i].get("e")) for i in idxs]
-        e_vals = [v for v in e_vals if v is not None]
-
-        floors_vals = [get_floors_value(moved_props[i]) for i in idxs]
-        floors_vals = [v for v in floors_vals if v is not None]
-
-        is_living_vals = [get_is_living_value(moved_props[i]) for i in idxs]
-        is_living_vals = [v for v in is_living_vals if v is not None]
-
-        living_area_vals = [get_living_area_value(moved_props[i]) for i in idxs]
-        living_area_vals = [v for v in living_area_vals if v is not None]
-
-        props = {
-            "block_index": int(block_index),
-            "zone": zone_label,
-            "side_m": float(side_m),
-            "pts_count": int(len(idxs)),
-            "e_max": (max(e_vals) if e_vals else None),
-            "floors_avg": (sum(floors_vals) / len(floors_vals) if floors_vals else None),
-            "is_living_avg": (sum(is_living_vals) / len(is_living_vals) if is_living_vals else None),
-            "living_area_sum": float(sum(living_area_vals)) if living_area_vals else 0.0,
-        }
-
-        nodes.append({
-            "polygon": hex_poly,
-            "centroid": hex_poly.centroid,
-            "width": hex_characteristic_width(hex_poly),
-            "point_indices": idxs,
-            "props": props,
-        })
-
-    return nodes
-
-
-def build_hex_neighbor_edges(nodes: List[Dict[str, Any]]) -> List[Tuple[int, int, float]]:
-    edges: List[Tuple[int, int, float]] = []
-    for i in range(len(nodes)):
-        for j in range(i + 1, len(nodes)):
-            a = nodes[i]["polygon"]
-            b = nodes[j]["polygon"]
-            try:
-                touches = a.touches(b) or a.intersection(b).length > 0.0
-            except Exception:
-                touches = a.touches(b)
-            if touches:
-                w = nodes[i]["centroid"].distance(nodes[j]["centroid"])
-                edges.append((i, j, float(w)))
-    return edges
-
-
-def _components_from_edges(n_nodes: int, edges: List[Tuple[int, int, float]]) -> Tuple[List[List[int]], Dict[int, List[Tuple[int, float]]]]:
-    adjacency: Dict[int, List[Tuple[int, float]]] = {i: [] for i in range(n_nodes)}
-    for u, v, w in edges:
-        adjacency[u].append((v, w))
-        adjacency[v].append((u, w))
-
-    visited = [False] * n_nodes
-    components: List[List[int]] = []
-    for i in range(n_nodes):
-        if visited[i]:
-            continue
-        stack = [i]
-        comp: List[int] = []
-        while stack:
-            cur = stack.pop()
-            if visited[cur]:
-                continue
-            visited[cur] = True
-            comp.append(cur)
-            for nb, _w in adjacency[cur]:
-                if not visited[nb]:
-                    stack.append(nb)
-        components.append(comp)
-    return components, adjacency
-
-
-def _prim_mst(component_nodes: List[int], adjacency: Dict[int, List[Tuple[int, float]]]) -> List[Tuple[int, int, float]]:
-    if len(component_nodes) <= 1:
-        return []
-
-    start = component_nodes[0]
-    visited = {start}
-    edges_out: List[Tuple[int, int, float]] = []
-
-    import heapq
-
-    heap: List[Tuple[float, int, int]] = []
-    for nb, w in adjacency[start]:
-        if nb in visited:
-            continue
-        heapq.heappush(heap, (w, start, nb))
-
-    component_set = set(component_nodes)
-    while heap and len(visited) < len(component_nodes):
-        w, u, v = heapq.heappop(heap)
-        if v in visited:
-            continue
-        visited.add(v)
-        edges_out.append((u, v, w))
-        for nb, w2 in adjacency[v]:
-            if nb in visited or nb not in component_set:
-                continue
-            heapq.heappush(heap, (w2, v, nb))
-    return edges_out
-
-
-def _longest_path_in_tree(tree_edges: List[Tuple[int, int, float]]) -> List[int]:
-    if not tree_edges:
-        return []
-
-    adjacency: Dict[int, List[int]] = {}
-    weights: Dict[Tuple[int, int], float] = {}
-    nodes_set = set()
-    for u, v, w in tree_edges:
-        adjacency.setdefault(u, []).append(v)
-        adjacency.setdefault(v, []).append(u)
-        weights[(u, v)] = w
-        weights[(v, u)] = w
-        nodes_set.add(u)
-        nodes_set.add(v)
-
-    def farthest(start: int) -> Tuple[int, Dict[int, Optional[int]], Dict[int, float]]:
-        stack: List[Tuple[int, Optional[int]]] = [(start, None)]
-        parent: Dict[int, Optional[int]] = {start: None}
-        dist: Dict[int, float] = {start: 0.0}
-        order: List[int] = []
-        while stack:
-            node, par = stack.pop()
-            order.append(node)
-            for nb in adjacency.get(node, []):
-                if nb == par:
-                    continue
-                parent[nb] = node
-                dist[nb] = dist[node] + weights.get((node, nb), 0.0)
-                stack.append((nb, node))
-        far_node = max(order, key=lambda n: dist.get(n, 0.0)) if order else start
-        return far_node, parent, dist
-
-    start = next(iter(nodes_set))
-    a, _, _ = farthest(start)
-    b, parent, _ = farthest(a)
-    path: List[int] = []
-    cur = b
-    while cur is not None:
-        path.append(cur)
-        if cur == a:
+        if np.array_equal(new_labels, labels):
             break
-        cur = parent.get(cur)
-    path.reverse()
-    return path
+        labels = new_labels
 
-
-def _branch_components(branch_edges: List[Tuple[int, int, float]]) -> List[Tuple[set[int], List[Tuple[int, int, float]]]]:
-    if not branch_edges:
-        return []
-    adjacency: Dict[int, List[Tuple[int, float]]] = {}
-    for u, v, w in branch_edges:
-        adjacency.setdefault(u, []).append((v, w))
-        adjacency.setdefault(v, []).append((u, w))
-
-    visited: set[int] = set()
-    comps: List[Tuple[set[int], List[Tuple[int, int, float]]]] = []
-    for node in list(adjacency.keys()):
-        if node in visited:
-            continue
-        stack = [node]
-        comp_nodes: set[int] = set()
-        comp_edges: List[Tuple[int, int, float]] = []
-        seen_edges: set[Tuple[int, int]] = set()
-        while stack:
-            cur = stack.pop()
-            if cur in visited:
+        for ci in range(k):
+            members = normed[labels == ci]
+            if members.size == 0:
                 continue
-            visited.add(cur)
-            comp_nodes.add(cur)
-            for nb, w in adjacency.get(cur, []):
-                ek = (min(cur, nb), max(cur, nb))
-                if ek not in seen_edges:
-                    seen_edges.add(ek)
-                    comp_edges.append((cur, nb, w))
-                if nb not in visited:
-                    stack.append(nb)
-        comps.append((comp_nodes, comp_edges))
-    return comps
+            centroids[ci] = members.mean(axis=0)
+
+    return labels.tolist()
 
 
-def _rectangle_for_segment(p0: Point, p1: Point, width: float) -> Optional[Polygon]:
-    if width <= 0:
-        return None
-    dx = p1.x - p0.x
-    dy = p1.y - p0.y
-    length = math.hypot(dx, dy)
-    if length <= 1e-9:
-        return None
-    ux = dx / length
-    uy = dy / length
-    px = -uy
-    py = ux
-    half_w = width / 2.0
-    extend = half_w
-    p0x = p0.x - ux * extend
-    p0y = p0.y - uy * extend
-    p1x = p1.x + ux * extend
-    p1y = p1.y + uy * extend
-    corners = [
-        (p0x - px * half_w, p0y - py * half_w),
-        (p0x + px * half_w, p0y + py * half_w),
-        (p1x + px * half_w, p1y + py * half_w),
-        (p1x - px * half_w, p1y - py * half_w),
-        (p0x - px * half_w, p0y - py * half_w),
-    ]
-    poly = Polygon(corners)
-    return poly if poly.is_valid else poly.buffer(0)
-
-
-def _aggregate_points(point_indices: List[int], moved_props: List[Dict[str, Any]]) -> Dict[str, Any]:
-    idx_set = sorted(set(point_indices))
-    e_vals = []
-    floors_vals = []
-    is_living_vals = []
-    living_area_vals = []
-    for idx in idx_set:
-        pr = moved_props[idx]
-        v = _to_float(pr.get("e"))
-        if v is not None:
-            e_vals.append(v)
-        fl = get_floors_value(pr)
-        if fl is not None:
-            floors_vals.append(fl)
-        il = get_is_living_value(pr)
-        if il is not None:
-            is_living_vals.append(il)
-        la = get_living_area_value(pr)
-        if la is not None:
-            living_area_vals.append(la)
-
-    floors_avg_round = None
-    if floors_vals:
-        floors_avg_round = int(round(sum(floors_vals) / len(floors_vals)))
-
-    return {
-        "pts_count": len(idx_set),
-        "e_max": (max(e_vals) if e_vals else None),
-        "is_living_max": (max(is_living_vals) if is_living_vals else None),
-        "living_area_sum": float(sum(living_area_vals)) if living_area_vals else 0.0,
-        "floors_avg_round": floors_avg_round,
-    }
-
-# ---- Основной скрипт ----
+# ---- Основной цикл ----
 
 def main():
-    ap = argparse.ArgumentParser(description="Batch infer + centroid merge + hex building graph (Shapely < 2.0)")
-    ap.add_argument("--blocks", required=True, help="Входной GeoJSON (FeatureCollection) кварталов")
-    ap.add_argument("--out", required=True, help="Выходной GeoJSON линий графа зданий (LineString)")
-    ap.add_argument("--out-infer-polys", default=None, help="Выход GeoJSON полигонов зданий (Polygon)")
-    ap.add_argument("--out-infer-centroids", default=None, help="Выход GeoJSON исходных точек зданий (Point)")
-    ap.add_argument("--out-hex-grid", default=None,
-                help="Выход GeoJSON гекс-сетки зданий (Polygon)")
-    ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
+    ap = argparse.ArgumentParser(description="Batch infer + regular grid clustering")
+    ap.add_argument("--blocks", required=True, help="GeoJSON FeatureCollection кварталов")
     ap.add_argument("--model-ckpt", required=True, help="Путь к чекпойнту модели (.pt)")
+    ap.add_argument("--train-script", default="./train.py", help="Путь к train.py")
     ap.add_argument("--config", default=None)
-    ap.add_argument("--device", default=None, help="cuda|cpu")
-    ap.add_argument("--zone-attr", default="zone", help="Имя свойства зоны в кварталах")
-    # targets совместимость
+    ap.add_argument("--device", default=None)
+    ap.add_argument("--zone-attr", default="zone")
     ap.add_argument("--zones-json", default=None)
     ap.add_argument("--services-json", default=None)
     ap.add_argument("--targets-by-zone", default=None)
@@ -847,414 +204,238 @@ def main():
     ap.add_argument("--people", type=int, default=1000)
     ap.add_argument("--min-services", dest="min_services", action="store_true", default=True)
     ap.add_argument("--no-min-services", dest="min_services", action="store_false")
-    # инференс
-    ap.add_argument("--infer-slots", type=int, default=256)
+    ap.add_argument("--infer-slots", type=int, default=None,
+                    help="Число слотов инференса. По умолчанию вычисляется по bbox квартала")
     ap.add_argument("--infer-knn", type=int, default=8)
     ap.add_argument("--infer-e-thr", type=float, default=0.5)
     ap.add_argument("--infer-il-thr", type=float, default=0.5)
     ap.add_argument("--infer-sv1-thr", type=float, default=0.5)
-    # слияние центроидов
-    ap.add_argument("--merge-centroids-radius-m", type=float, default=10.0,
-                    help="Радиус слияния центроидов внутри квартала (м)")
-    ap.add_argument("--prob-field", default="e",
-                    help="Имя поля вероятности для сортировки якорей (по умолчанию 'e')")
-    # сетка
-    ap.add_argument("--hex-side-m", type=float, default=5.0,
-                    help="Длина стороны гекса в метрах (по умолчанию 5.0)")
-    # crs
-    ap.add_argument("--out-epsg", type=int, default=32636,
-                    help="EPSG-код для записи всех выходных GeoJSON (по умолчанию 32636)")
-     # пост-обработка полигонов
-    ap.add_argument("--poly-simplify-m", type=float, default=0.75,
-                    help="Допуск упрощения полигонов зданий (м), preserve_topology=True (по умолчанию 0.75)")
-    ap.add_argument("--poly-fill-buffer-m", type=float, default=1.5,
-                    help="Дельта морфологического закрытия дыр: buffer(+d)->buffer(-d) (м), по умолчанию 1.5")
-    ap.add_argument("--poly-min-area-m2", type=float, default=4.0,
-                    help="Минимальная площадь части полигона (м²) после обработки (по умолчанию 4.0)")
-    ap.add_argument("--clip-to-block", dest="clip_to_block", action="store_true", default=True,
-                    help="Обрезать финальные полигоны по границе квартала (вкл. по умолчанию)")
-    ap.add_argument("--no-clip-to-block", dest="clip_to_block", action="store_false")
-    # режим построения полигонов
-    ap.add_argument("--poly-main-only", dest="poly_main_only", action="store_true", default=False,
-                    help="Создавать полигоны только по рёбрам основной ветки (longest path) MST в компоненте")
-    ap.add_argument("--poly-all-branches", dest="poly_main_only", action="store_false",
-                    help="(По умолчанию) Использовать и основную ветку, и ветви при построении полигонов")
-        # выпрямление главной цепочки и двор-колецо
-    ap.add_argument("--main-angle-straighten-deg", type=float, default=70.0,
-                    help="Порог острого угла (в градусах) для выпрямления главной цепочки (по умолчанию 70)")
-    ap.add_argument("--main-angle-require-touch", action="store_true", default=True,
-                    help="Требовать соприкосновение гексов концов при выпрямлении (по умолчанию да)")
-    ap.add_argument("--loop-min-nodes", type=int, default=6,
-                    help="Мин. число узлов в главной цепочке для проверки почти-цикла")
-    ap.add_argument("--loop-close-thr-mult", type=float, default=1.2,
-                    help="Порог замыкания: dist(start,end) <= mult * main_width (по умолчанию 1.2)")
-    ap.add_argument("--poly-rect-courtyard-if-loop", dest="poly_rect_courtyard_if_loop",
-                    action="store_true", default=True,
-                    help="Если главная цепочка почти замкнута — строить прямоугольник с внутренним двором")
-    ap.add_argument("--no-poly-rect-courtyard-if-loop", dest="poly_rect_courtyard_if_loop",
-                    action="store_false")
-
+    ap.add_argument("--out-buildings", required=True, help="Выход GeoJSON квадратов")
+    ap.add_argument("--out-centroids", default=None, help="Выход GeoJSON центроидов")
+    ap.add_argument("--out-epsg", type=int, default=32636)
+    ap.add_argument("--grid-size", type=float, default=15.0,
+                    help="Размер стороны квадрата сетки в метрах")
+    ap.add_argument("--temp-dir", default=None)
     args = ap.parse_args()
 
-    stem = os.path.splitext(args.out)[0]
-    out_hex_grid_path = args.out_hex_grid or (stem + "_hexes.geojson")
-    out_buildings_path = args.out_infer_polys or (stem + "_buildings.geojson")
-    out_points_path = args.out_infer_centroids or (stem + "_points.geojson")
+    blocks = read_geojson(args.blocks)
+    features = blocks.get("features", [])
+    targets_map = normalize_targets_map(load_json_maybe(args.targets_by_zone))
+    la_by_zone = normalize_targets_map(load_json_maybe(args.la_by_zone))
+    services_vocab = load_services_vocab_from_artifacts(args.model_ckpt)
+    service_keys = pick_service_keys(services_vocab)
 
-    vocab = load_services_vocab_from_artifacts(args.model_ckpt)
-    svc_keys = pick_service_keys(vocab)
-    targets_by_zone: Dict[str, Dict[str, float]] = {}
-    raw_targets = load_json_maybe(args.targets_by_zone) or load_json_maybe(args.la_by_zone)
-    if raw_targets:
-        if args.targets_by_zone:
-            targets_by_zone = normalize_targets_map(raw_targets)
-        else:
-            if isinstance(raw_targets, dict):
-                targets_by_zone = {z: {"la": (float(v) if v is not None else None), "floors_avg": None}
-                                   for z, v in raw_targets.items()}
+    out_square_features: List[Dict[str, Any]] = []
+    out_centroids_features: List[Dict[str, Any]] = []
 
-    fc_blocks = read_geojson(args.blocks)
-    out_point_feats: List[Dict[str,Any]] = []
-    out_hex_feats: List[Dict[str,Any]] = []
-    out_graph_feats: List[Dict[str,Any]] = []
-    out_building_feats: List[Dict[str,Any]] = []
-    global_hex_id = 0
-    global_component_id = 0
-    infer_uid = 0  # общий идентификатор пар (полигон<->центроид до слияния)
-    
-    tmpdir = tempfile.mkdtemp(prefix="ked_infer_")
+    temp_root = Path(args.temp_dir or "./_infer_tmp")
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    for bi, feat in enumerate(tqdm(features, desc="blocks")):
+        geom = shape(feat.get("geometry"))
+        if geom is None or geom.is_empty:
+            continue
+        zone_label = zone_label_of(feat, args.zone_attr) or "unknown"
+        block_idx = bi
+        infer_slots = args.infer_slots or infer_slots_from_block_bbox(geom, cell_size_m=100.0)
+
+        people = get_people(feat.get("properties") or {}, args.people)
+        services_target = None
+        if args.min_services:
+            services_target = {
+                k: people for k in service_keys.values()
+            }
+        la_target = None
+        floors_avg = None
+        targets = targets_map.get(zone_label)
+        if targets:
+            la_target = targets.get("la")
+            floors_avg = targets.get("floors_avg")
+        elif zone_label in la_by_zone:
+            la_target = la_by_zone[zone_label].get("la")
+
+        in_path = temp_root / f"block_{bi:05d}_in.geojson"
+        out_path = temp_root / f"block_{bi:05d}_out.geojson"
+        write_geojson(str(in_path), {
+            "type": "FeatureCollection",
+            "features": [feat],
+        })
+
+        cmd = [
+            sys.executable,
+            args.train_script,
+            "--mode", "infer",
+            "--model-ckpt", args.model_ckpt,
+            "--infer-geojson-in", str(in_path),
+            "--infer-out", str(out_path),
+            "--infer-knn", str(args.infer_knn),
+            "--infer-e-thr", str(args.infer_e_thr),
+            "--infer-il-thr", str(args.infer_il_thr),
+            "--infer-sv1-thr", str(args.infer_sv1_thr),
+            "--infer-slots", str(infer_slots),
+            "--zone", str(zone_label),
+        ]
+        if args.config:
+            cmd.extend(["--config", args.config])
+        if args.device:
+            cmd.extend(["--device", args.device])
+        if services_target:
+            cmd.extend(["--services-target", json_dumps(services_target)])
+        if la_target is not None:
+            cmd.extend(["--la-target", str(la_target)])
+        if floors_avg is not None:
+            cmd.extend(["--floors-avg", str(floors_avg)])
+
+        subprocess.run(cmd, check=True)
+        infer_out = read_geojson(str(out_path))
+
+        centroids_raw: List[Point] = []
+        cprops_raw: List[Dict[str, Any]] = []
+        infer_uid = 0
+        for block in infer_out.get("features", []):
+            try:
+                g = shape(block.get("geometry"))
+            except Exception:
+                continue
+            if g is None or g.is_empty:
+                continue
+            if g.geom_type == "MultiPolygon":
+                geoms = [poly for poly in g.geoms if not poly.is_empty]
+                if not geoms:
+                    continue
+                g = max(geoms, key=lambda poly: poly.area)
+            if g.geom_type != "Polygon" or g.area <= 0:
+                continue
+            raw_props = dict(block.get("properties") or {})
+            raw_props.setdefault(args.zone_attr, zone_label)
+            raw_props.setdefault("_source_block_index", block_idx)
+            infer_uid += 1
+            raw_props["infer_fid"] = infer_uid
+            centroids_raw.append(g.centroid)
+            cprops_raw.append(raw_props)
+
+        if not centroids_raw:
+            continue
+
+        merged_points = list(centroids_raw)
+        merged_props = list(cprops_raw)
+
+        ring1, ring2, midline = build_rings(geom)
+        mid_lines = lines_of(midline)
+
+        moved_points: List[Point] = []
+        moved_props: List[Dict[str, Any]] = []
+        for point, props in zip(merged_points, merged_props):
+            q = point
+            status = "none"
+            props_copy = dict(props)
+            if ring2 and not ring2.is_empty and mid_lines:
+                in_r1 = ring1.contains(point) or ring1.touches(point)
+                in_r2 = ring2.contains(point) or ring2.touches(point)
+                if in_r1 or in_r2:
+                    status = "first" if in_r1 and not in_r2 else "second"
+                    li, q_on, _ = nearest_on_lines(mid_lines, point)
+                    if li >= 0:
+                        q = q_on
+                    props_copy["ring_snap"] = "to_ring2_midline"
+                    props_copy["ring_zone"] = status
+            if "ring_snap" not in props_copy:
+                props_copy["ring_snap"] = "none"
+                props_copy["ring_zone"] = status
+            moved_points.append(q)
+            moved_props.append(props_copy)
+
+        for point, props in zip(moved_points, moved_props):
+            out_centroids_features.append({
+                "type": "Feature",
+                "geometry": mapping(point),
+                "properties": props,
+            })
+
+        coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
+        grid_area = None
+        try:
+            inner_area = geom.buffer(-10.0)
+            if inner_area is not None and not inner_area.is_empty:
+                grid_area = inner_area
+        except Exception:
+            grid_area = None
+        if grid_area is None:
+            grid_area = geom
+
+        grid_cells = _generate_square_grid(grid_area, max(0.1, float(args.grid_size)))
+        if not grid_cells:
+            continue
+
+        cell_vectors: List[List[float]] = []
+        cell_infos: List[Dict[str, Any]] = []
+
+        for cell_idx, cell in enumerate(grid_cells):
+            indices = _points_in_polygon(moved_points, cell)
+            agg_attrs = _aggregate_points(indices, moved_props) if indices else {}
+            point_count = len(indices)
+            area_m2 = float(cell.area) if cell.area else 0.0
+            density = point_count / area_m2 if area_m2 > 1e-9 else 0.0
+            if indices:
+                cell_coords = coords[indices]
+            else:
+                cell_coords = np.empty((0, 2), dtype=float)
+            elongation, direction = _compute_elongation(cell_coords) if indices else (0.0, None)
+            cell_vectors.append([float(point_count), float(density), float(elongation)])
+            cell_infos.append({
+                "geometry": cell,
+                "indices": indices,
+                "agg": agg_attrs,
+                "point_count": point_count,
+                "point_density": density,
+                "elongation": elongation,
+                "direction": direction,
+                "area": area_m2,
+                "grid_idx": cell_idx,
+            })
+
+        cluster_ids = _cluster_cells(cell_vectors, max_clusters=4)
+
+        for info, cluster_id in zip(cell_infos, cluster_ids):
+            props = {
+                "block_index": block_idx,
+                "zone": zone_label,
+                "grid_index": int(info["grid_idx"]),
+                "grid_area": float(info["area"]),
+                "point_count": int(info["point_count"]),
+                "point_density": float(info["point_density"]),
+                "elongation": float(info["elongation"]),
+                "cluster_id": int(cluster_id),
+            }
+            if info["direction"] is not None:
+                props["elongation_dir_deg"] = float(info["direction"])
+            props.update(info["agg"])
+            out_square_features.append({
+                "type": "Feature",
+                "geometry": mapping(info["geometry"]),
+                "properties": props,
+            })
+
+    if out_square_features:
+        write_geojson(args.out_buildings, {
+            "type": "FeatureCollection",
+            "features": out_square_features,
+        }, epsg=args.out_epsg)
+
+    if args.out_centroids:
+        write_geojson(args.out_centroids, {
+            "type": "FeatureCollection",
+            "features": out_centroids_features,
+        }, epsg=args.out_epsg)
+
+def json_dumps(obj: Any) -> str:
     try:
-        for bi, feat in enumerate(tqdm(fc_blocks.get("features", []), desc="Blocks")):
-            z = zone_label_of(feat, args.zone_attr)
-            if not z:
-                print(f"[WARN] feature #{bi}: нет properties['{args.zone_attr}'] — пропуск", file=sys.stderr)
-                continue
+        import json
 
-            block_geom = shape(feat["geometry"])
-            if block_geom.is_empty:
-                continue
+        return json.dumps(obj)
+    except Exception:  # pragma: no cover
+        raise
 
-            slots_side = infer_slots_from_block_bbox(block_geom)
 
-            # Временные файлы для инференса
-            in_path  = os.path.join(tmpdir, f"blk_{bi:06d}.geojson")
-            out_path = os.path.join(tmpdir, f"blk_{bi:06d}_out.geojson")
-            write_geojson(in_path, {"type":"FeatureCollection","features":[feat]})
-
-            # Цели (если нужны train.py)
-            la_target = None; floors_avg = None; services_target = {}
-            tz = targets_by_zone.get(z or "", {})
-            la_target = tz.get("la")
-            floors_avg = tz.get("floors_avg")
-
-            if (la_target is None) and (str(z).casefold() == "residential"):
-                people = get_people(feat.get("properties") or {}, args.people)
-                la_target = float(15.0 * people)
-                if args.min_services and vocab:
-                    services_target[svc_keys["school"]]       = 1.0
-                    services_target[svc_keys["polyclinic"]]   = 1.0
-                    services_target[svc_keys["kindergarten"]] = 1.0
-
-            # Инференс квартала
-            cmd = [
-                sys.executable, args.train_script,
-                "--mode", "infer",
-                "--model-ckpt", args.model_ckpt,
-                "--infer-geojson-in", in_path,
-                "--infer-out", out_path,
-                "--zone", str(z),
-                "--infer-slots", str(args.infer_slots),
-                "--infer-knn",   str(args.infer_knn),
-                "--infer-e-thr", str(args.infer_e_thr),
-                "--infer-il-thr", str(args.infer_il_thr),
-                "--infer-sv1-thr", str(args.infer_sv1_thr),
-            ]
-            if args.device:
-                cmd += ["--device", args.device]
-            if args.config:
-                cmd += ["--config", args.config]
-            if args.zones_json:
-                cmd += ["--zones-json", args.zones_json]
-            if args.services_json:
-                cmd += ["--services-json", args.services_json]
-            if la_target is not None:
-                cmd += ["--la-target", str(la_target)]
-            if floors_avg is not None:
-                cmd += ["--floors-avg", str(floors_avg)]
-            if services_target:
-                cmd += ["--services-target", json.dumps(services_target, ensure_ascii=False)]
-
-            try:
-                subprocess.run(cmd, check=True, stdout=sys.stdout, stderr=sys.stderr)
-            except subprocess.CalledProcessError as e:
-                print(f"[ERROR] infer failed for block #{bi} (zone={z}): {e}", file=sys.stderr)
-                continue
-
-            # Читаем результат квартала и вытаскиваем полигоны + центроиды (до слияния)
-            try:
-                blk_out = read_geojson(out_path)
-            except Exception as e:
-                print(f"[WARN] failed to read output for block #{bi}: {e}", file=sys.stderr)
-                continue
-
-            centroids_raw: List[Point] = []
-            cprops_raw: List[Dict[str,Any]] = []
-
-            for b in blk_out.get("features", []):
-                try:
-                    g = shape(b["geometry"])
-                    raw_props = dict(b.get("properties") or {})
-                    shared_props = dict(raw_props)
-                    shared_props.setdefault(args.zone_attr, z)
-                    shared_props.setdefault("_source_block_index", bi)
-
-                    if isinstance(g, (Polygon, MultiPolygon)) and (not g.is_empty) and (g.area > 0):
-                        infer_uid += 1
-                        shared_props["infer_fid"] = infer_uid
-                        # исходный центроид — идёт только во «внутренний» список для слияния
-                        c = g.centroid
-                        centroids_raw.append(c)
-                        cprops_raw.append(shared_props)
-                    else:
-                        continue
-                except Exception:
-                    continue
-
-            # Слияние центроидов внутри квартала
-            if not centroids_raw:
-                continue
-
-            m_points, m_props = merge_centroids(
-                points=centroids_raw,
-                props_list=cprops_raw,
-                radius_m=float(args.merge_centroids_radius_m),
-                prob_field=str(args.prob_field),
-            )
-
-            # Построение колец и срединной линии 20 м
-            ring1, ring2, midline = build_rings(block_geom)
-            mid_lines = lines_of(midline)
-
-            # Сдвиг центроидов: те, что в 0–10 м и 10–30 м — на срединную линию (20 м)
-            moved_points: List[Point] = []
-            moved_props:  List[Dict[str,Any]] = []
-            for p, pr in zip(m_points, m_props):
-                status = "none"
-                q = p
-                if (ring2 and not ring2.is_empty and mid_lines):
-                    in_r1 = ring1.contains(p) or ring1.touches(p)
-                    in_r2 = ring2.contains(p) or ring2.touches(p)
-                    if in_r1 or in_r2:
-                        status = "first" if in_r1 and not in_r2 else "second"
-                        li, q_on, _m = nearest_on_lines(mid_lines, p)
-                        if li >= 0:
-                            q = q_on
-                        pr = dict(pr)
-                        pr["ring_snap"] = "to_ring2_midline"
-                        pr["ring_zone"] = status
-                if "ring_snap" not in pr:
-                    pr = dict(pr)
-                    pr["ring_snap"] = "none"
-                    pr["ring_zone"] = status
-                moved_points.append(q)
-                moved_props.append(pr)
-
-            # Записываем СЛИТЫЕ и (возможные) СДВИНУТЫЕ центроиды
-            for p, pr in zip(moved_points, moved_props):
-                out_point_feats.append({
-                    "type": "Feature", "geometry": mapping(p), "properties": pr
-                })
-
-            hex_nodes = build_hex_nodes(
-                block_geom=block_geom,
-                moved_points=moved_points,
-                moved_props=moved_props,
-                side_m=float(args.hex_side_m),
-                block_index=bi,
-                zone_label=z,
-            )
-
-            if not hex_nodes:
-                continue
-
-            for node in hex_nodes:
-                props = dict(node["props"])
-                props["hex_id"] = int(global_hex_id)
-                node["hex_id"] = int(global_hex_id)
-                out_hex_feats.append({
-                    "type": "Feature",
-                    "geometry": mapping(node["polygon"]),
-                    "properties": props,
-                })
-                global_hex_id += 1
-
-            hex_edges = build_hex_neighbor_edges(hex_nodes)
-            components, adjacency = _components_from_edges(len(hex_nodes), hex_edges)
-
-            for comp in components:
-                if not comp:
-                    continue
-
-                tree_edges = _prim_mst(comp, adjacency)
-                if tree_edges:
-                    main_path = _longest_path_in_tree(tree_edges)
-                    if not main_path:
-                        main_path = [comp[0]]
-                else:
-                    main_path = [comp[0]]
-
-                main_path = simplify_main_path_by_angles(
-                    main_path, hex_nodes,
-                    angle_thr_deg=float(args.main_angle_straighten_deg),
-                    require_touch=bool(args.main_angle_require_touch)
-                )
-
-                main_edge_keys: set[Tuple[int,int]] = set()
-                for i in range(len(main_path) - 1):
-                    a = main_path[i]; b = main_path[i + 1]
-                    main_edge_keys.add((min(a, b), max(a, b)))
-
-                comp_widths = [hex_nodes[idx]["width"] for idx in comp if hex_nodes[idx]["width"] > 0]
-                default_width = float(sum(comp_widths) / len(comp_widths)) if comp_widths else float(args.hex_side_m)
-
-                main_widths = [hex_nodes[idx]["width"] for idx in main_path if hex_nodes[idx]["width"] > 0]
-                main_width = float(sum(main_widths) / len(main_widths)) if main_widths else default_width
-
-                loop_detected = is_almost_closed_loop(
-                    main_path, hex_nodes,
-                    main_width=main_width,
-                    min_nodes=int(args.loop_min_nodes),
-                    close_thr_mult=float(args.loop_close_thr_mult)
-                )
-
-                branch_edges = [e for e in tree_edges if (min(e[0], e[1]), max(e[0], e[1])) not in main_edge_keys]
-                branch_comps = _branch_components(branch_edges)
-
-                edge_widths: Dict[Tuple[int, int], float] = {}
-                for key in main_edge_keys:
-                    edge_widths[key] = main_width
-
-                for nodes_set, branch_edge_list in branch_comps:
-                    b_widths = [hex_nodes[idx]["width"] for idx in nodes_set if hex_nodes[idx]["width"] > 0]
-                    branch_width = float(sum(b_widths) / len(b_widths)) if b_widths else default_width
-                    for u, v, _w in branch_edge_list:
-                        key = (min(u, v), max(u, v))
-                        edge_widths[key] = branch_width
-
-                main_lines = []
-                for i in range(len(main_path) - 1):
-                    u = main_path[i]; v = main_path[i + 1]
-                    main_lines.append(LineString([hex_nodes[u]["centroid"], hex_nodes[v]["centroid"]]))
-                merged_main_line = None
-                if main_lines:
-                    try:
-                        merged_main_line = linemerge(MultiLineString(main_lines))
-                    except Exception:
-                        merged_main_line = unary_union(main_lines)
-
-                # --- RECTANGLES & LINES (как раньше, для вывода линий и/или ветвей) ---
-                rectangles_main: List[Polygon] = []
-                rectangles_all:  List[Polygon] = []
-                for u, v, _w in tree_edges:
-                    key = (min(u, v), max(u, v))
-                    width = edge_widths.get(key, default_width)
-
-                    # прямоугольник по ребру (оставим; нужен для ветвей и общего режима)
-                    rect = _rectangle_for_segment(hex_nodes[u]["centroid"], hex_nodes[v]["centroid"], width)
-                    if rect and not rect.is_empty:
-                        rectangles_all.append(rect)
-                        if key in main_edge_keys:
-                            rectangles_main.append(rect)
-
-                    # запись линий графа — как было
-                    out_graph_feats.append({
-                        "type": "Feature",
-                        "geometry": mapping(LineString([hex_nodes[u]["centroid"], hex_nodes[v]["centroid"]])),
-                        "properties": {
-                            "component_id": int(global_component_id),
-                            "block_index": int(bi),
-                            "zone": z,
-                            "line_type": "main" if key in main_edge_keys else "branch",
-                            "buffer_width_m": float(width),
-                            "hex_u": int(hex_nodes[u]["hex_id"]),
-                            "hex_v": int(hex_nodes[v]["hex_id"]),
-                        },
-                    })
-
-                # --- ГЕОМЕТРИЯ ЗДАНИЙ ---
-                if args.poly_main_only and merged_main_line and (not merged_main_line.is_empty):
-                    if args.poly_rect_courtyard_if_loop and loop_detected:
-                        # Прямоугольник с внутренним двором из bbox
-                        bbox_poly = _bbox_from_points([hex_nodes[i]["centroid"] for i in main_path])
-                        inner = _inset_bbox_rect(bbox_poly, inset=float(main_width))
-                        if bbox_poly is not None and inner is not None:
-                            building_geom = bbox_poly.difference(inner)
-                        else:
-                            # fallback: обычный буфер
-                            building_geom = merged_main_line.buffer(float(main_width)/2.0, cap_style=2, join_style=3)
-                    else:
-                        # Обычный коридор по слитой линии главной цепочки
-                        building_geom = merged_main_line.buffer(float(main_width)/2.0, cap_style=2, join_style=3)
-                    node_ids_for_poly = main_path
-                else:
-                    # общий режим: используем либо все прямоугольники, либо только главные
-                    rectangles_to_use = rectangles_main if args.poly_main_only else rectangles_all
-                    node_ids_for_poly = main_path if args.poly_main_only else comp
-                    if rectangles_to_use:
-                        building_geom = unary_union(rectangles_to_use)
-                    else:
-                        building_geom = unary_union([hex_nodes[idx]["polygon"] for idx in node_ids_for_poly]) if node_ids_for_poly else None
-
-                # пост-обработка (как раньше)
-                building_geom = postprocess_building_geom(
-                    building_geom,
-                    simplify_m=float(args.poly_simplify_m),
-                    fill_buffer_m=float(args.poly_fill_buffer_m),
-                    min_area_m2=float(args.poly_min_area_m2),
-                    clip_to=(block_geom if args.clip_to_block else None),
-                )
-                if building_geom is None or building_geom.is_empty:
-                    global_component_id += 1
-                    continue
-
-                # агрегации — без изменений
-                point_indices: List[int] = []
-                for idx in node_ids_for_poly:
-                    point_indices.extend(hex_nodes[idx]["point_indices"])
-
-                agg = _aggregate_points(point_indices, moved_props)
-                poly_props = {
-                    "component_id": int(global_component_id),
-                    "block_index": int(bi),
-                    "zone": z,
-                    "pts_count": int(agg["pts_count"]),
-                    "e_max": (float(agg["e_max"]) if agg["e_max"] is not None else None),
-                    "living_area_sum": float(agg["living_area_sum"]),
-                    "is_living_max": (float(agg["is_living_max"]) if agg["is_living_max"] is not None else None),
-                    "floors_avg_round": (int(agg["floors_avg_round"]) if agg["floors_avg_round"] is not None else None),
-                }
-
-                out_building_feats.append({
-                    "type": "Feature",
-                    "geometry": mapping(building_geom),
-                    "properties": poly_props,
-                })
-
-                global_component_id += 1
-
-        # Запись результатов
-        write_geojson(args.out, {"type": "FeatureCollection", "features": out_graph_feats}, epsg=args.out_epsg)
-        write_geojson(out_buildings_path, {"type": "FeatureCollection", "features": out_building_feats}, epsg=args.out_epsg)
-        write_geojson(out_points_path, {"type": "FeatureCollection", "features": out_point_feats}, epsg=args.out_epsg)
-        write_geojson(out_hex_grid_path, {"type": "FeatureCollection", "features": out_hex_feats}, epsg=args.out_epsg)
-
-        print(f"[OK] hex cells:              {len(out_hex_feats)} → {out_hex_grid_path}")
-        print(f"[OK] building graph lines:   {len(out_graph_feats)} → {args.out}")
-        print(f"[OK] building polygons:      {len(out_building_feats)} → {out_buildings_path}")
-        print(f"[OK] points:                 {len(out_point_feats)} → {out_points_path}")
-
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == "__main__":  # pragma: no cover
+    main()
