@@ -42,7 +42,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
-from geo_common import (
+from scripts.geo_common import (
     load_vector,
     ensure_valid_series,
     normalize_crs_str,
@@ -50,14 +50,14 @@ from geo_common import (
     geom_to_wkb,
     geom_from_wkb,
 )
-from assign_blocks_cli import fast_assign_blocks
-from services_processing import (
+from scripts.assign_blocks_cli import fast_assign_blocks
+from scripts.services_processing import (
     DEFAULT_CAPACITY_FIELDS,
     DEFAULT_EXCLUDED_SERVICES,
     attach_services_to_buildings,
     write_service_schema,
 )
-from per_block_worker import worker_process_block
+from scripts.per_block_worker import worker_process_block
 
 log = logging.getLogger("transform_pipeline")
 

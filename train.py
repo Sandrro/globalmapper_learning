@@ -58,7 +58,7 @@ from shapely.ops import unary_union
 import math as _math
 from PIL import Image, ImageDraw
 
-from services_processing import (
+from scripts.services_processing import (
     infer_service_schema_from_nodes,
     load_service_schema,
     write_service_schema,
