@@ -1,3 +1,5 @@
 __pycache__/
 dataset
-out
+out*
+*.geojson
+_infer_tmp/

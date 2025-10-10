@@ -7,30 +7,11 @@ import random
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from shapely.geometry import LineString
+from shapely.geometry import LineString, CAP_STYLE, JOIN_STYLE
 from shapely.ops import unary_union
 
-# ------------------------------
-# ВСПОМОГАТЕЛЬНЫЕ ОБЁРТКИ SJOIN
-# ------------------------------
-def _sjoin(left: gpd.GeoDataFrame, right: gpd.GeoDataFrame, predicate: str, how: str = "left", **kwargs) -> gpd.GeoDataFrame:
-    """Совместимость gpd.sjoin для разных версий geopandas."""
-    try:
-        return gpd.sjoin(left, right, predicate=predicate, how=how, **kwargs)
-    except TypeError:  # старые версии
-        return gpd.sjoin(left, right, op=predicate, how=how, **kwargs)
-
-
-def _make_valid(g):
-    try:
-        gg = g.buffer(0)
-        return gg if not gg.is_empty else g
-    except Exception:
-        return g
-
-
 @dataclass
-class BuildingPlacer:
+class BuildingGenerator:
     """
     Размещение сервисных зданий и участков на регулярной сетке клеток.
 
@@ -152,7 +133,7 @@ class BuildingPlacer:
         if zname_col not in zones.columns:
             zones[zname_col] = "unknown"
 
-        cells_zone = _sjoin(
+        cells_zone = self._sjoin(
             cells[["geometry"]].reset_index().rename(columns={"index": "cell_idx"}),
             zones[[zid_col, zname_col, "geometry"]],
             predicate="within", how="left"
@@ -351,13 +332,9 @@ class BuildingPlacer:
                 cells.at[i, "is_diag_only"] = True
 
         records_geom, records_attrs = [], []
-        try:
-            from shapely.geometry import CAP_STYLE, JOIN_STYLE
-            cap_style = CAP_STYLE.flat
-            join_style = JOIN_STYLE.mitre
-        except Exception:
-            cap_style = 2
-            join_style = 2
+
+        cap_style = CAP_STYLE.flat
+        join_style = JOIN_STYLE.mitre
 
         buf_dist = float(self.cell_size_m) / 2.0
         centroids = cells.geometry.centroid
@@ -374,7 +351,7 @@ class BuildingPlacer:
                 continue
             line = LineString(ordered_pts)
             poly = line.buffer(buf_dist, cap_style=cap_style, join_style=join_style)
-            records_geom.append(_make_valid(poly))
+            records_geom.append(self._make_valid(poly))
             records_attrs.append({
                 "building_id": f"D{str(k).zfill(5)}",
                 "type": "diag_buffer",
@@ -386,7 +363,7 @@ class BuildingPlacer:
         # Простые жилые клетки
         simple_ids = [i for i in range(len(cells)) if cells.at[i, "is_building"] and not cells.at[i, "is_diag_only"]]
         for i in simple_ids:
-            records_geom.append(_make_valid(cells.geometry[i]))
+            records_geom.append(self._make_valid(cells.geometry[i]))
             zid_mode = int(cells.at[i, zid_col]) if zid_col in cells.columns and not pd.isna(cells.at[i, zid_col]) else None
             records_attrs.append({
                 "building_id": f"C{str(i).zfill(6)}",
@@ -408,7 +385,7 @@ class BuildingPlacer:
         # --- MERGE по типам (не склеиваем разные service) ---
         left = buildings_rects[["geometry"]].reset_index().rename(columns={"index": "i"})
         right = buildings_rects[["geometry"]].reset_index().rename(columns={"index": "j"})
-        pairs = _sjoin(left, right, predicate=self.merge_predicate)
+        pairs = self._sjoin(left, right, predicate=self.merge_predicate)
         pairs = pairs[(pairs["i"] != pairs["j"]) & pairs["j"].notna()].copy()
         pairs["j"] = pairs["j"].astype(int)
 
@@ -427,9 +404,9 @@ class BuildingPlacer:
         for gid, comp in enumerate(groups):
             geoms = buildings_rects.geometry.iloc[comp].tolist()
             if self.merge_fix_eps and self.merge_fix_eps > 0:
-                u = unary_union([_make_valid(g.buffer(self.merge_fix_eps)) for g in geoms]).buffer(-self.merge_fix_eps)
+                u = unary_union([self._make_valid(g.buffer(self.merge_fix_eps)) for g in geoms]).buffer(-self.merge_fix_eps)
             else:
-                u = unary_union([_make_valid(g) for g in geoms])
+                u = unary_union([self._make_valid(g) for g in geoms])
             comp_svc = list({svc_vals[i] for i in comp})
             merged_service = comp_svc[0] if len(comp_svc) == 1 else "mixed"
             types = ",".join(sorted(set(buildings_rects.loc[comp, "type"].astype(str).tolist())))
@@ -501,6 +478,21 @@ class BuildingPlacer:
     # --------------------------
     # ХЕЛПЕРЫ: геометрия/индексы
     # --------------------------
+    def _sjoin(self, left: gpd.GeoDataFrame, right: gpd.GeoDataFrame, predicate: str, how: str = "left", **kwargs) -> gpd.GeoDataFrame:
+        """Совместимость gpd.sjoin для разных версий geopandas."""
+        try:
+            return gpd.sjoin(left, right, predicate=predicate, how=how, **kwargs)
+        except TypeError:  # старые версии
+            return gpd.sjoin(left, right, op=predicate, how=how, **kwargs)
+
+    @staticmethod
+    def _make_valid(g):
+        try:
+            gg = g.buffer(0)
+            return gg if not gg.is_empty else g
+        except Exception:
+            return g
+
     def _grid_indices(self, gdf: gpd.GeoDataFrame):
         c = gdf.geometry.centroid
         x = c.x.values; y = c.y.values
@@ -514,7 +506,7 @@ class BuildingPlacer:
         """Соседство по стороне/диагонали и подсчёт пустых соседей. Надёжная версия с проверкой длины общего ребра."""
         left = cells[["geometry"]].reset_index().rename(columns={"index": "ida"})
         right = cells[["geometry"]].reset_index().rename(columns={"index": "idb"})
-        pairs = _sjoin(left, right, predicate="touches", how="left")
+        pairs = self._sjoin(left, right, predicate="touches", how="left")
         if "idb" not in pairs.columns and "index_right" in pairs.columns:
             pairs = pairs.rename(columns={"index_right": "idb"})
         pairs = pairs[(pairs["ida"] != pairs["idb"]) & pairs["idb"].notna()].copy()
@@ -914,8 +906,8 @@ class BuildingPlacer:
                         reserved_service_cells.add(idx)
                         cells.loc[idx, "service"] = svc
 
-                    site_poly = _make_valid(unary_union([cells.geometry[i] for i in site_idxs]))
-                    svc_poly = _make_valid(unary_union([cells.geometry[i] for i in svc_cell_idxs]))
+                    site_poly = self._make_valid(unary_union([cells.geometry[i] for i in site_idxs]))
+                    svc_poly = self._make_valid(unary_union([cells.geometry[i] for i in svc_cell_idxs]))
 
                     service_sites_geom.append(site_poly)
                     service_sites_attrs.append({
@@ -1024,8 +1016,8 @@ class BuildingPlacer:
                         reserved_service_cells.add(idx)
                         cells.loc[idx, "service"] = svc
 
-                    site_poly = _make_valid(unary_union([cells.geometry[i] for i in site_idxs]))
-                    svc_poly = _make_valid(unary_union([cells.geometry[i] for i in svc_cell_idxs]))
+                    site_poly = self._make_valid(unary_union([cells.geometry[i] for i in site_idxs]))
+                    svc_poly = self._make_valid(unary_union([cells.geometry[i] for i in svc_cell_idxs]))
 
                     service_sites_geom.append(site_poly)
                     service_sites_attrs.append({

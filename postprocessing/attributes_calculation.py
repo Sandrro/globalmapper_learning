@@ -7,89 +7,12 @@ import pandas as pd
 import geopandas as gpd
 from shapely.ops import unary_union
 
-
-# =============================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# =============================
-
-def _round_int(x: float) -> int:
-    return int(np.floor(x + 0.5))
-
-
-def _to_metric_crs(
-    gdf: gpd.GeoDataFrame,
-    like: gpd.GeoDataFrame | None = None,
-    fallback_epsg: int = 3857,
-) -> gpd.GeoDataFrame:
-    """Гарантирует метрическую CRS: приводим к CRS `like` или назначаем/проецируем в fallback."""
-    if like is not None and like.crs is not None:
-        try:
-            return gdf.to_crs(like.crs)
-        except Exception:
-            # если у входа нет CRS — назначим
-            if gdf.crs is None:
-                return gdf.set_crs(like.crs, allow_override=True)
-            raise
-    if gdf.crs is None:
-        return gdf.set_crs(epsg=fallback_epsg, allow_override=True)
-    if getattr(gdf.crs, "is_projected", None) is True:
-        return gdf
-    return gdf.to_crs(epsg=fallback_epsg)
-
-
-def _zone_cols(zones: gpd.GeoDataFrame) -> tuple[str, str]:
-    """Определяем имена колонок идентификатора и имени зоны, создаём при отсутствии."""
-    zid = "zone_id" if "zone_id" in zones.columns else ("id" if "id" in zones.columns else "ZONE_ID")
-    if zid not in zones.columns:
-        zones[zid] = np.arange(len(zones))
-    zname = "zone"
-    if zname not in zones.columns:
-        for alt in ["zone_name", "zone_type", "functional_zone_type_name"]:
-            if alt in zones.columns:
-                zname = alt
-                break
-        else:
-            zones["zone"] = "unknown"
-            zname = "zone"
-    return zid, zname
-
-
-def _waterfill_with_caps(weights: np.ndarray, caps: np.ndarray, demand: float, eps: float = 1e-9) -> np.ndarray:
-    """
-    Распределяем объём `demand` пропорционально `weights` с верхними ограничениями `caps` для каждого элемента.
-    Возвращает массив x, 0<=x<=caps, sum(x)<=demand. Итеративная схема с выбыванием насыщённых элементов.
-    """
-    n = len(weights)
-    x = np.zeros(n, dtype=float)
-    remain = np.arange(n)
-    D = float(max(demand, 0.0))
-    w = np.asarray(weights, dtype=float).copy()
-    w[w < 0] = 0.0
-    caps = np.asarray(caps, dtype=float)
-    while len(remain) > 0 and D > eps:
-        sw = float(w[remain].sum())
-        if sw <= eps:
-            break
-        inc = np.zeros_like(x)
-        # раздаём пропорционально весам, но не превышая оставшиеся локальные капы
-        for i in remain:
-            quota = D * (w[i] / sw)
-            inc[i] = min(quota, caps[i] - x[i])
-        inc_sum = float(inc[remain].sum())
-        if inc_sum <= eps:
-            break
-        x += inc
-        D -= inc_sum
-        remain = np.array([i for i in remain if (caps[i] - x[i]) > eps], dtype=int)
-    return x
-
-
 # =============================
 # ОСНОВНОЙ КЛАСС
 # =============================
 
 @dataclass
-class LivingAreaAllocator:
+class BuildingAttributes:
     """
     Расчёт этажности и распределение жилой площади по жилым домам.
 
@@ -148,11 +71,11 @@ class LivingAreaAllocator:
     ) -> Dict[str, object]:
         # CRS/копии
         buildings = buildings_gdf.copy()
-        zones = _to_metric_crs(zones_gdf.copy(), like=buildings, fallback_epsg=self.fallback_epsg)
-        buildings = _to_metric_crs(buildings, like=zones, fallback_epsg=self.fallback_epsg)
+        zones = self._to_metric_crs(zones_gdf.copy(), like=buildings, fallback_epsg=self.fallback_epsg)
+        buildings = self._to_metric_crs(buildings, like=zones, fallback_epsg=self.fallback_epsg)
 
         # Определяем колонки зон
-        zid_col, zname_col = _zone_cols(zones)
+        zid_col, zname_col = self._zone_cols(zones)
 
         # Если в buildings нет zone_id/name или есть пропуски — подставим по representative_point within зоны
         need_zone_join = (zid_col not in buildings.columns) or buildings[zid_col].isna().any()
@@ -207,7 +130,7 @@ class LivingAreaAllocator:
             1,
             np.minimum(
                 buildings.loc[is_living, "max_floor_zone"].astype(int).values,
-                np.vectorize(_round_int)(buildings.loc[is_living, "area_m2"].values / float(self.area_per_floor_m2)),
+                np.vectorize(self._round_int)(buildings.loc[is_living, "area_m2"].values / float(self.area_per_floor_m2)),
             ),
         )
         buildings.loc[is_living, "floors_count"] = floors_living
@@ -273,7 +196,7 @@ class LivingAreaAllocator:
 
             deltas = (cap_max - cap_min).astype(float).values
             D = T - cap_min_tot
-            x = _waterfill_with_caps(weights, deltas, D)
+            x = self._waterfill_with_caps(weights, deltas, D)
 
             living = cap_min.values + x
             denom = (sub["area_m2"].values * sub["floors_count"].values)
@@ -317,3 +240,75 @@ class LivingAreaAllocator:
             "buildings": buildings,
             "summary": summary_df,
         }
+    
+    @staticmethod
+    def _round_int(x: float) -> int:
+        return int(np.floor(x + 0.5))
+
+    @staticmethod
+    def _to_metric_crs(
+        gdf: gpd.GeoDataFrame,
+        like: gpd.GeoDataFrame | None = None,
+        fallback_epsg: int = 3857,
+    ) -> gpd.GeoDataFrame:
+        """Гарантирует метрическую CRS: приводим к CRS `like` или назначаем/проецируем в fallback."""
+        if like is not None and like.crs is not None:
+            try:
+                return gdf.to_crs(like.crs)
+            except Exception:
+                # если у входа нет CRS — назначим
+                if gdf.crs is None:
+                    return gdf.set_crs(like.crs, allow_override=True)
+                raise
+        if gdf.crs is None:
+            return gdf.set_crs(epsg=fallback_epsg, allow_override=True)
+        if getattr(gdf.crs, "is_projected", None) is True:
+            return gdf
+        return gdf.to_crs(epsg=fallback_epsg)
+
+    @staticmethod
+    def _zone_cols(zones: gpd.GeoDataFrame) -> tuple[str, str]:
+        """Определяем имена колонок идентификатора и имени зоны, создаём при отсутствии."""
+        zid = "zone_id" if "zone_id" in zones.columns else ("id" if "id" in zones.columns else "ZONE_ID")
+        if zid not in zones.columns:
+            zones[zid] = np.arange(len(zones))
+        zname = "zone"
+        if zname not in zones.columns:
+            for alt in ["zone_name", "zone_type", "functional_zone_type_name"]:
+                if alt in zones.columns:
+                    zname = alt
+                    break
+            else:
+                zones["zone"] = "unknown"
+                zname = "zone"
+        return zid, zname
+
+    @staticmethod
+    def _waterfill_with_caps(weights: np.ndarray, caps: np.ndarray, demand: float, eps: float = 1e-9) -> np.ndarray:
+        """
+        Распределяем объём `demand` пропорционально `weights` с верхними ограничениями `caps` для каждого элемента.
+        Возвращает массив x, 0<=x<=caps, sum(x)<=demand. Итеративная схема с выбыванием насыщённых элементов.
+        """
+        n = len(weights)
+        x = np.zeros(n, dtype=float)
+        remain = np.arange(n)
+        D = float(max(demand, 0.0))
+        w = np.asarray(weights, dtype=float).copy()
+        w[w < 0] = 0.0
+        caps = np.asarray(caps, dtype=float)
+        while len(remain) > 0 and D > eps:
+            sw = float(w[remain].sum())
+            if sw <= eps:
+                break
+            inc = np.zeros_like(x)
+            # раздаём пропорционально весам, но не превышая оставшиеся локальные капы
+            for i in remain:
+                quota = D * (w[i] / sw)
+                inc[i] = min(quota, caps[i] - x[i])
+            inc_sum = float(inc[remain].sum())
+            if inc_sum <= eps:
+                break
+            x += inc
+            D -= inc_sum
+            remain = np.array([i for i in remain if (caps[i] - x[i]) > eps], dtype=int)
+        return x

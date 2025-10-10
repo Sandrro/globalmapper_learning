@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""batch_infer_blocks.py
+"""batch_infer_blocks_clustered.py
 
 Актуализированная утилита для пакетного инференса кварталов.
 Инференс и подготовка точек совпадают с исходной версией: вызывается
@@ -21,8 +21,10 @@ import argparse
 import math
 import subprocess
 import sys
+import os, sys, json, argparse, subprocess, math
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Tuple, Optional
+import geopandas as gpd
 
 try:  # tqdm опционален
     from tqdm import tqdm
@@ -30,161 +32,233 @@ except Exception:  # pragma: no cover - резерв
     tqdm = lambda x, **k: x
 
 try:
-    import numpy as np
-except Exception as exc:  # pragma: no cover
-    print("[FATAL] Требуется NumPy: {}".format(exc), file=sys.stderr)
-    raise
-
-try:
-    from shapely.geometry import Point, Polygon, box, mapping, shape
-    from shapely.prepared import prep
+    from shapely.geometry import Point, Polygon, LineString, MultiLineString, mapping, shape
 except Exception:  # pragma: no cover
     print("[FATAL] Требуется shapely и её зависимости (GEOS).", file=sys.stderr)
     raise
 
-from batch_infer_blocks import (  # noqa: E402
-    build_rings,
-    get_people,
-    infer_slots_from_block_bbox,
-    lines_of,
-    load_json_maybe,
-    load_services_vocab_from_artifacts,
-    nearest_on_lines,
-    normalize_targets_map,
-    pick_service_keys,
-    read_geojson,
-    write_geojson,
-    zone_label_of,
-    _aggregate_points,
-)
+from postprocessing import DensityIsolines, GridGenerator, BuildingGenerator, BuildingAttributes
 
 
-def _generate_square_grid(area: Polygon, cell_size: float) -> List[Polygon]:
-    if area is None or area.is_empty or cell_size <= 0:
-        return []
+SYNONYMS = {
+    "school":       ["school", "школа", "общеобразовательная школа", "образовательная организация"],
+    "kindergarten": ["kindergarten", "детский сад", "детсад", "дошкольное", "д/с"],
+    "polyclinic":   ["polyclinic", "clinic", "поликлиника", "амбулатория", "клиника"],
+}
 
-    minx, miny, maxx, maxy = area.bounds
-    if maxx - minx <= 0 or maxy - miny <= 0:
-        return []
 
-    start_x = math.floor(minx / cell_size) * cell_size
-    start_y = math.floor(miny / cell_size) * cell_size
-    end_x = math.ceil(maxx / cell_size) * cell_size
-    end_y = math.ceil(maxy / cell_size) * cell_size
+def build_rings(block: Polygon) -> Tuple[Any, Any, Any]:
+    """Возвращает (ring1, ring2, midline) где:
+       ring1 = 0–10 м, ring2 = 10–30 м, midline = граница buffer(-20) ∩ ring2 (MultiLineString/LineString).
+       Если ring2 пуст, midline пуст.
+    """
+    inner10 = block.buffer(-10.0)
+    ring1 = block.difference(inner10)
+    inner30 = block.buffer(-30.0)
+    ring2 = inner10.difference(inner30) if (inner30 and not inner30.is_empty) else inner10.difference(Polygon())
+    # если после вычитания получилось пусто (узкий квартал) — обнулим
+    if ring2 is None or ring2.is_empty:
+        return ring1, ring2, LineString()
+    mid20_poly = block.buffer(-20.0)
+    midline_raw = mid20_poly.boundary
+    midline = midline_raw.intersection(ring2)
+    return ring1, ring2, midline
 
-    grid: List[Polygon] = []
-    y = start_y
-    while y < end_y - 1e-9:
-        x = start_x
-        while x < end_x - 1e-9:
-            cell = box(x, y, x + cell_size, y + cell_size)
+def get_people(props: Dict[str,Any], default_people: int) -> int:
+    for k in ("population","people","POPULATION","num_people"):
+        if k in props:
             try:
-                clipped = cell.intersection(area)
-            except Exception:
-                clipped = cell
-            if clipped.is_empty:
-                x += cell_size
-                continue
-            try:
-                clipped = clipped.buffer(0)
+                v = int(float(props[k]))
+                if v > 0: return v
             except Exception:
                 pass
-            if not clipped.is_empty and clipped.area > 1e-4:
-                grid.append(clipped)
-            x += cell_size
-        y += cell_size
-    return grid
+    return int(default_people)
 
+def infer_slots_from_block_bbox(block_geom, cell_size_m: float = 100.0) -> int:
+    """
+    Возвращает число КВАДРАТОВ по стороне прямоугольной сетки (N),
+    построенной по bbox квартала при размере ячейки cell_size_m (м).
+    Используется как значение для --infer-slots (то есть N, а не N*N).
 
-def _points_in_polygon(points: Sequence[Point], polygon: Polygon) -> List[int]:
-    if not points:
-        return []
-    try:
-        prepared = prep(polygon)
-    except Exception:
-        prepared = None
-    indices: List[int] = []
-    for idx, point in enumerate(points):
-        inside = False
-        try:
-            if prepared is not None:
-                inside = prepared.contains(point) or prepared.intersects(point)
-            else:
-                inside = polygon.contains(point) or polygon.touches(point)
-        except Exception:
-            inside = polygon.distance(point) <= 1e-6
-        if inside:
-            indices.append(idx)
-    return indices
-
-
-def _compute_elongation(coords: np.ndarray) -> Tuple[float, float | None]:
-    if coords.shape[0] < 2:
-        return 0.0, None
-    centered = coords - coords.mean(axis=0, keepdims=True)
-    if np.allclose(centered, 0.0):
-        return 0.0, None
-    cov = np.cov(centered, rowvar=False)
-    if cov.shape != (2, 2):
-        return 0.0, None
-    eigvals, eigvecs = np.linalg.eigh(cov)
-    order = np.argsort(eigvals)[::-1]
-    major = float(max(eigvals[order[0]], 0.0))
-    minor = float(max(eigvals[order[-1]], 0.0))
-    elongation = 1.0
-    if minor <= 1e-9 and major <= 1e-9:
-        elongation = 1.0
+    ВАЖНО: CRS должен быть метрическим.
+    """
+    if block_geom is None or block_geom.is_empty:
+        return 1
+    minx, miny, maxx, maxy = block_geom.bounds
+    w = float(maxx - minx)
+    h = float(maxy - miny)
+    if w <= 0.0 or h <= 0.0:
+        return 1
+    nx = int(math.ceil(w / cell_size_m))
+    ny = int(math.ceil(h / cell_size_m))
+    n_side = max(nx, ny)
+    if max(1, n_side) > 5000:
+        return 5000
     else:
-        elongation = (major + 1e-9) / (minor + 1e-9)
-    direction = eigvecs[:, order[0]]
-    angle_rad = math.atan2(direction[1], direction[0])
-    angle_deg = math.degrees(angle_rad)
-    # ориентация без направления: нормируем к [0, 180)
-    if angle_deg < 0:
-        angle_deg += 180.0
-    angle_deg = angle_deg % 180.0
-    return float(elongation), float(angle_deg)
-
-
-def _cluster_cells(vectors: Sequence[Sequence[float]], max_clusters: int = 4,
-                   max_iter: int = 50) -> List[int]:
-    data = np.array(vectors, dtype=float)
-    n = data.shape[0]
-    if n == 0:
+        return max(1, n_side)
+    
+def lines_of(geom) -> List[LineString]:
+    if geom is None or geom.is_empty:
         return []
-    k = min(max_clusters, n)
-    if k <= 1:
-        return [0] * n
+    if isinstance(geom, LineString):
+        return [geom]
+    if isinstance(geom, MultiLineString):
+        return list(geom.geoms)
+    # boundary может вернуть LinearRing — он является LineString в геометриях Shapely
+    return []
 
-    mean = data.mean(axis=0)
-    std = data.std(axis=0)
-    std[std < 1e-9] = 1.0
-    normed = (data - mean) / std
+def load_json_maybe(path_or_json: str) -> Any:
+    try:
+        if path_or_json is None:
+            return None
+        if os.path.exists(path_or_json):
+            with open(path_or_json, "r", encoding="utf-8") as f:
+                return json.load(f)
+        else:
+            return json.loads(path_or_json)
+    except Exception as e:
+        print(f"[WARN] failed to read JSON '{path_or_json}': {e}", file=sys.stderr)
+        return None
+    
+def load_services_vocab_from_artifacts(model_ckpt: str) -> Dict[str, int] | None:
+    aux_dir = os.path.join(os.path.dirname(model_ckpt) or ".", "artifacts")
+    sj = os.path.join(aux_dir, "services.json")
+    if os.path.exists(sj):
+        try:
+            with open(sj, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
 
-    indices = np.linspace(0, n - 1, k).astype(int)
-    centroids = normed[indices].copy()
-    labels = np.zeros(n, dtype=int)
+def lines_of(geom) -> List[LineString]:
+    if geom is None or geom.is_empty:
+        return []
+    if isinstance(geom, LineString):
+        return [geom]
+    if isinstance(geom, MultiLineString):
+        return list(geom.geoms)
+    # boundary может вернуть LinearRing — он является LineString в геометриях Shapely
+    return []
 
-    for _ in range(max_iter):
-        distances = np.linalg.norm(normed[:, None, :] - centroids[None, :, :], axis=2)
-        new_labels = np.argmin(distances, axis=1)
 
-        for ci in range(k):
-            if not np.any(new_labels == ci):
-                farthest = int(np.argmax(distances.min(axis=1)))
-                new_labels[farthest] = ci
 
-        if np.array_equal(new_labels, labels):
-            break
-        labels = new_labels
+def nearest_on_lines(lines: List[LineString], p: Point) -> Tuple[int, Point, float]:
+    """Находит ближайший компонент линии и возвращает (index, point_on_line, m_along)."""
+    best_i = -1
+    best_q = None
+    best_d = 1e100
+    best_m = 0.0
+    for i, ln in enumerate(lines):
+        # ближайшая точка на конкретной линии
+        m = ln.project(p)
+        q = ln.interpolate(m)
+        d = q.distance(p)
+        if d < best_d:
+            best_d = d; best_q = q; best_i = i; best_m = m
+    if best_q is None:
+        return -1, p, 0.0
+    return best_i, best_q, best_m
 
-        for ci in range(k):
-            members = normed[labels == ci]
-            if members.size == 0:
-                continue
-            centroids[ci] = members.mean(axis=0)
+def normalize_targets_map(raw: Any) -> Dict[str, Dict[str, float]]:
+    out: Dict[str, Dict[str, float]] = {}
+    if not isinstance(raw, dict):
+        return out
+    for zone, val in raw.items():
+        if not isinstance(zone, str) or not isinstance(val, dict): 
+            continue
+        la = None; fl = None
+        for k in ("la", "living_area", "la_target"):
+            if k in val and val[k] is not None:
+                try:
+                    la = float(val[k]); break
+                except Exception:
+                    pass
+        for k in ("floors_avg", "floors"):
+            if k in val and val[k] is not None:
+                try:
+                    fl = float(val[k]); break
+                except Exception:
+                    pass
+        out[zone] = {"la": la, "floors_avg": fl}
+    return out
 
-    return labels.tolist()
+def pick_service_keys(vocab: Dict[str,int] | None) -> Dict[str,str]:
+    out = {"school":"school", "kindergarten":"kindergarten", "polyclinic":"polyclinic"}
+    if not vocab:
+        return out
+    names = list(vocab.keys())
+    lowered = [s.casefold() for s in names]
+    for canon, syns in SYNONYMS.items():
+        for syn in syns:
+            cf = syn.casefold()
+            if cf in lowered:
+                out[canon] = names[lowered.index(cf)]; break
+            idx = next((i for i,s in enumerate(lowered) if cf in s), None)
+            if idx is not None:
+                out[canon] = names[idx]; break
+    return out
+
+def read_geojson(path: str) -> Dict[str,Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        gj = json.load(f)
+    if gj.get("type") != "FeatureCollection":
+        if gj.get("type") == "Feature":
+            feats = [gj]
+        else:
+            feats = [{"type":"Feature","geometry":gj,"properties":{}}]
+        gj = {"type":"FeatureCollection", "features": feats}
+    return gj
+
+def write_geojson(path: str, fc: Dict[str,Any], epsg: Optional[int] = None) -> None:
+    Path(os.path.dirname(path) or ".").mkdir(parents=True, exist_ok=True)
+    if epsg:
+        fc = dict(fc)
+        fc["crs"] = {"type": "name", "properties": {"name": f"EPSG:{int(epsg)}"}}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(fc, f, ensure_ascii=False, indent=2)
+
+def zone_label_of(feat: Dict[str,Any], zone_attr: str) -> Optional[str]:
+    props = feat.get("properties") or {}
+    z = props.get(zone_attr)
+    return z if isinstance(z, str) else None
+
+def _to_float(x) -> Optional[float]:
+    try:
+        if isinstance(x, bool): return 1.0 if x else 0.0
+        if isinstance(x, (int, float)): return float(x)
+        if isinstance(x, str):
+            xs = x.strip().lower()
+            if xs in ("true","yes","y","t","1"): return 1.0
+            if xs in ("false","no","n","f","0"): return 0.0
+            return float(x)
+    except Exception:
+        return None
+    return None
+
+def get_floors_value(props: Dict[str,Any]) -> Optional[float]:
+    for k in ("floors", "floors_avg", "floors_num"):
+        if k in props and props[k] is not None:
+            v = _to_float(props[k])
+            if v is not None and v > 0:
+                return v
+    return None
+
+def get_is_living_value(props: Dict[str,Any]) -> Optional[float]:
+    for k in ("is_living", "living", "is_residential"):
+        if k in props and props[k] is not None:
+            v = _to_float(props[k])
+            if v is not None:
+                return max(0.0, min(1.0, v))
+    return None
+
+def get_living_area_value(props: Dict[str,Any]) -> Optional[float]:
+    for k in ("living_area", "la", "area_living", "la_target"):
+        if k in props and props[k] is not None:
+            v = _to_float(props[k])
+            if v is not None and v >= 0:
+                return v
+    return None
 
 
 # ---- Основной цикл ----
@@ -225,7 +299,6 @@ def main():
     services_vocab = load_services_vocab_from_artifacts(args.model_ckpt)
     service_keys = pick_service_keys(services_vocab)
 
-    out_square_features: List[Dict[str, Any]] = []
     out_centroids_features: List[Dict[str, Any]] = []
 
     temp_root = Path(args.temp_dir or "./_infer_tmp")
@@ -352,81 +425,26 @@ def main():
                 "properties": props,
             })
 
-        coords = np.array([[p.x, p.y] for p in moved_points], dtype=float)
-        grid_area = None
-        try:
-            inner_area = geom.buffer(-10.0)
-            if inner_area is not None and not inner_area.is_empty:
-                grid_area = inner_area
-        except Exception:
-            grid_area = None
-        if grid_area is None:
-            grid_area = geom
+        empty_grid = GridGenerator.make_grid_for_blocks(
+            blocks_gdf=blocks,
+            cell_size_m=args.grid_size, 
+            midlines=gpd.GeoSeries([midline], crs=blocks.crs),
+            block_id_col="block_id",
+            offset_m=20.0
+        )
+        preicted_points = gpd.GeoDataFrame.from_features(out_centroids_features, crs="EPSG:32636")
+        isolines = DensityIsolines.build(blocks, preicted_points, zone_id_col='zone')
+        grid = GridGenerator.fit_transform(empty_grid, isolines)
+        generation_result = BuildingGenerator.fit_transform(grid, blocks, zone_name_aliases=['zone'])
+        buildings = generation_result["buildings_rects"]
+        service_territories = generation_result["service_sites"]
+        buildings = BuildingAttributes.fit_transform(buildings, blocks)["buildings"]
 
-        grid_cells = _generate_square_grid(grid_area, max(0.1, float(args.grid_size)))
-        if not grid_cells:
-            continue
-
-        cell_vectors: List[List[float]] = []
-        cell_infos: List[Dict[str, Any]] = []
-
-        for cell_idx, cell in enumerate(grid_cells):
-            indices = _points_in_polygon(moved_points, cell)
-            agg_attrs = _aggregate_points(indices, moved_props) if indices else {}
-            point_count = len(indices)
-            area_m2 = float(cell.area) if cell.area else 0.0
-            density = point_count / area_m2 if area_m2 > 1e-9 else 0.0
-            if indices:
-                cell_coords = coords[indices]
-            else:
-                cell_coords = np.empty((0, 2), dtype=float)
-            elongation, direction = _compute_elongation(cell_coords) if indices else (0.0, None)
-            cell_vectors.append([float(point_count), float(density), float(elongation)])
-            cell_infos.append({
-                "geometry": cell,
-                "indices": indices,
-                "agg": agg_attrs,
-                "point_count": point_count,
-                "point_density": density,
-                "elongation": elongation,
-                "direction": direction,
-                "area": area_m2,
-                "grid_idx": cell_idx,
-            })
-
-        cluster_ids = _cluster_cells(cell_vectors, max_clusters=4)
-
-        for info, cluster_id in zip(cell_infos, cluster_ids):
-            props = {
-                "block_index": block_idx,
-                "zone": zone_label,
-                "grid_index": int(info["grid_idx"]),
-                "grid_area": float(info["area"]),
-                "point_count": int(info["point_count"]),
-                "point_density": float(info["point_density"]),
-                "elongation": float(info["elongation"]),
-                "cluster_id": int(cluster_id),
-            }
-            if info["direction"] is not None:
-                props["elongation_dir_deg"] = float(info["direction"])
-            props.update(info["agg"])
-            out_square_features.append({
-                "type": "Feature",
-                "geometry": mapping(info["geometry"]),
-                "properties": props,
-            })
-
-    if out_square_features:
-        write_geojson(args.out_buildings, {
-            "type": "FeatureCollection",
-            "features": out_square_features,
-        }, epsg=args.out_epsg)
-
-    if args.out_centroids:
-        write_geojson(args.out_centroids, {
-            "type": "FeatureCollection",
-            "features": out_centroids_features,
-        }, epsg=args.out_epsg)
+        preicted_points.to_file('centroids.geojson')
+        isolines.to_file('isolines.geojson')
+        grid.to_file('grid.geojson')
+        service_territories.to_file('service_territories.geojson')
+        buildings.to_file('buildings.geojson')
 
 def json_dumps(obj: Any) -> str:
     try:

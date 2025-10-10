@@ -8,17 +8,8 @@ import pandas as pd
 import geopandas as gpd
 from shapely.geometry import Polygon, MultiPolygon
 
-
-def _sjoin(left: gpd.GeoDataFrame, right: gpd.GeoDataFrame, predicate: str, how: str = "left", **kwargs) -> gpd.GeoDataFrame:
-    """Совместимость gpd.sjoin для разных версий (predicate/op)."""
-    try:
-        return gpd.sjoin(left, right, predicate=predicate, how=how, **kwargs)
-    except TypeError:
-        return gpd.sjoin(left, right, op=predicate, how=how, **kwargs)
-
-
 @dataclass
-class IsolineCellTagger:
+class GridGenerator:
     """
     Теггер клеток по изолиниям:
       1) Линии→полосы (buffer), оценка вложенности полос (iso_level).
@@ -79,7 +70,7 @@ class IsolineCellTagger:
         cells = grid[["cell_id", "geometry"]].copy()
 
         # 3.1 пересечения с полосами
-        hit = _sjoin(cells, iso_polys[["iso_pid", "iso_level", "geometry"]], predicate="intersects", how="left")
+        hit = self._sjoin(cells, iso_polys[["iso_pid", "iso_level", "geometry"]], predicate="intersects", how="left")
         hit_nonnull = hit[hit["iso_pid"].notna()].copy()
         agg_inter = (
             hit_nonnull.groupby("cell_id", dropna=False)
@@ -98,7 +89,7 @@ class IsolineCellTagger:
         if len(iso_fill) > 0:
             cells_pts = cells.copy()
             cells_pts["geometry"] = grid.geometry.representative_point().values
-            hit_fill = _sjoin(cells_pts, iso_fill[["fill_id", "fill_level", "geometry"]], predicate="within", how="left")
+            hit_fill = self._sjoin(cells_pts, iso_fill[["fill_id", "fill_level", "geometry"]], predicate="within", how="left")
             hit_fill_nonnull = hit_fill[hit_fill["fill_id"].notna()].copy()
             agg_fill = (
                 hit_fill_nonnull.groupby("cell_id", dropna=False)
@@ -171,6 +162,144 @@ class IsolineCellTagger:
     # ---------------------------
     # ВНУТРЕННИЕ ХЕЛПЕРЫ
     # ---------------------------
+    def make_grid_for_blocks(
+        self,
+        blocks_gdf: gpd.GeoDataFrame,
+        cell_size_m: float = 15.0,
+        midlines: Optional[gpd.GeoDataFrame | gpd.GeoSeries | List] = None,
+        block_id_col: Optional[str] = None,
+        offset_m: float = 20.0,
+        output_crs: Optional[str | int] = None,
+    ) -> gpd.GeoDataFrame:
+        """
+        Построить регулярную сетку по каждому кварталу:
+            - Сначала накрываем bbox квартала квадратной сеткой (шаг = cell_size_m).
+            - Затем обрезаем клетки по «внутренней» области, ограниченной midline.
+            Практически: clip_area = block.buffer(-offset_m)  (совпадает с вашей логикой midline = boundary(buffer(-offset_m))).
+            Если отрицательный буфер даёт пустоту (узкий квартал) — fallback: clip_area = block.buffer(-1e-6)
+            Если и это пусто — clip_area = сам квартал.
+
+        Параметры:
+            blocks_gdf : GeoDataFrame с Polygon кварталов. Может иметь столбец идентификатора (block_id_col).
+            cell_size_m: размер стороны клетки в метрах (по умолчанию 15).
+            midlines   : (необязательно) GeoSeries/GeoDataFrame/список LineString/MultiLineString.
+                        Нужны лишь для выравнивания CRS и будущих проверок; clip идёт по offset_m.
+            block_id_col: имя столбца кварталов, который писать в результат как block_id; если None — берём индекс.
+            offset_m   : величина «сдвига внутрь квартала» для определения области клиппинга (по умолчанию 20 м).
+            output_crs : если задан, результат будет перепроецирован в эту CRS.
+
+        Возвращает:
+            GeoDataFrame с колонками:
+            - block_id : идентификатор квартала
+            - cell_id  : локальный ID клетки внутри квартала (0..N_i-1)
+            - geometry : Polygon/MultiPolygon (ячейка, обрезанная по clip_area)
+        """
+        from shapely.geometry import box as _box
+
+        if blocks_gdf is None or len(blocks_gdf) == 0:
+            return gpd.GeoDataFrame({"block_id": [], "cell_id": []}, geometry=[], crs=self.fallback_epsg)
+
+        # --- CRS и репроекция ---
+        blocks = blocks_gdf.copy()
+        blocks = self._ensure_grid_crs(blocks)
+        if midlines is not None and self.auto_reproject:
+            try:
+                if isinstance(midlines, (gpd.GeoDataFrame, gpd.GeoSeries)) and midlines.crs != blocks.crs:
+                    midlines = midlines.to_crs(blocks.crs)
+            except Exception:
+                pass  # midlines могут прийти как список «сырой» геометрии
+
+        # Подготовим идентификатор квартала
+        if block_id_col and block_id_col in blocks.columns:
+            block_ids = list(blocks[block_id_col].values)
+        else:
+            block_ids = list(range(len(blocks)))
+
+        out_rows = []
+        out_geoms = []
+
+        # Основной цикл по кварталам
+        for i, (bid, geom) in enumerate(zip(block_ids, blocks.geometry.values)):
+            if geom is None or geom.is_empty:
+                continue
+
+            # 1) bbox сетка
+            minx, miny, maxx, maxy = geom.bounds
+            if maxx - minx <= 0 or maxy - miny <= 0:
+                continue
+
+            # нормированные границы по шагу, чтобы сетка "ложилась" аккуратно
+            start_x = np.floor(minx / cell_size_m) * cell_size_m
+            start_y = np.floor(miny / cell_size_m) * cell_size_m
+            end_x   = np.ceil(maxx / cell_size_m) * cell_size_m
+            end_y   = np.ceil(maxy / cell_size_m) * cell_size_m
+
+            # 2) область клиппинга по midline (через отрицательный буфер offset_m)
+            clip_area = None
+            try:
+                if offset_m > 0:
+                    clip_area = geom.buffer(-float(offset_m))
+            except Exception:
+                clip_area = None
+
+            if clip_area is None or clip_area.is_empty:
+                # узкий квартал → попробуем минимальный «внутрь», иначе оставим целый квартал
+                try:
+                    clip_area = geom.buffer(-1e-6)
+                except Exception:
+                    clip_area = None
+
+            if clip_area is None or clip_area.is_empty:
+                clip_area = geom
+
+            # 3) итеративно создаём клетки и обрезаем их по clip_area
+            cell_id = 0
+            y = start_y
+            while y < end_y - 1e-9:
+                x = start_x
+                while x < end_x - 1e-9:
+                    cell = _box(x, y, x + cell_size_m, y + cell_size_m)
+                    # Быстрый предикат: пересекается ли клетка с bbox clip_area?
+                    if not cell.intersects(clip_area):
+                        x += cell_size_m
+                        continue
+                    try:
+                        clipped = cell.intersection(clip_area)
+                        # починим валидность по необходимости
+                        if not clipped.is_empty:
+                            try:
+                                clipped = clipped.buffer(0)
+                            except Exception:
+                                pass
+                    except Exception:
+                        clipped = cell.intersection(geom)  # запасной вариант
+
+                    if clipped is not None and (not clipped.is_empty) and clipped.area > 1e-6:
+                        out_rows.append({"block_id": bid, "cell_id": cell_id})
+                        out_geoms.append(clipped)
+                        cell_id += 1
+
+                    x += cell_size_m
+                y += cell_size_m
+
+        grid = gpd.GeoDataFrame(out_rows, geometry=out_geoms, crs=blocks.crs)
+
+        if output_crs is not None:
+            grid = grid.to_crs(output_crs)
+
+        if self.verbose:
+            n_blocks = len(set(grid["block_id"])) if len(grid) else 0
+            print(f"GRID | blocks={n_blocks}, cells={len(grid)}, cell_size={cell_size_m} m, offset={offset_m} m")
+
+        return grid
+
+    def _sjoin(self, left: gpd.GeoDataFrame, right: gpd.GeoDataFrame, predicate: str, how: str = "left", **kwargs) -> gpd.GeoDataFrame:
+        """Совместимость gpd.sjoin для разных версий (predicate/op)."""
+        try:
+            return gpd.sjoin(left, right, predicate=predicate, how=how, **kwargs)
+        except TypeError:
+            return gpd.sjoin(left, right, op=predicate, how=how, **kwargs)
+
     def _ensure_grid_crs(self, grid: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         if grid.crs is None:
             warnings.warn(f"CRS сетки отсутствует, назначаю EPSG:{self.fallback_epsg}")
