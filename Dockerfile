@@ -22,7 +22,14 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir torch-scatter torch-sparse torch-cluster torch-spline-conv -f https://data.pyg.org/whl/torch-2.1.0+cpu.html \
     && pip install --no-cache-dir torch-geometric
 
-COPY . .
+COPY service ./service
+COPY scripts ./scripts
+COPY train.py ./train.py
+COPY inference.py ./inference.py
+COPY train_gnn.yaml ./train_gnn.yaml
+COPY building_shape_params.yaml ./building_shape_params.yaml
+COPY ./out_2/checkpoints/artifacts ./artifacts/
+
 
 ENV PYTHONPATH=/app
 

@@ -17,7 +17,7 @@ from scripts.centroid_runner import (
     run_centroid_inference,
 )
 
-app = FastAPI(title="Centroid Inference Service")
+app = FastAPI(title="Genbuilder v1.0. Centroids generator")
 
 _TASK_HISTORY_LIMIT = 200
 _TASKS: Dict[str, "_TaskRecord"] = {}
