@@ -1,0 +1,15 @@
+uvicorn[standard]
+requests
+httpx
+pydantic
+numpy
+pandas
+geopandas
+shapely
+scikit-learn
+scipy
+pyyaml
+tqdm
+huggingface_hub
+tensorboard
+tensorboard-logger

@@ -19,12 +19,16 @@ from __future__ import annotations
 
 import argparse
 import math
-import subprocess
+import asyncio
+import json
 import sys
-import os, sys, json, argparse, subprocess, math
+import os
+from dataclasses import dataclass
+from urllib.parse import urljoin
 from pathlib import Path
 from typing import Any, Dict, List, Tuple, Optional
 import geopandas as gpd
+import httpx
 
 try:  # tqdm опционален
     from tqdm import tqdm
@@ -45,6 +49,64 @@ SYNONYMS = {
     "kindergarten": ["kindergarten", "детский сад", "детсад", "дошкольное", "д/с"],
     "polyclinic":   ["polyclinic", "clinic", "поликлиника", "амбулатория", "клиника"],
 }
+
+@dataclass(frozen=True)
+class _BlockInferenceTask:
+    """Holds metadata for async centroid generation requests."""
+
+    block_idx: int
+    zone_label: str
+    geometry: Polygon
+    payload: Dict[str, Any]
+
+
+async def _call_centroid_service(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    task: _BlockInferenceTask,
+) -> List[Dict[str, Any]]:
+    """Submit a centroid generation request and return raw features."""
+
+    try:
+        response = await client.post(endpoint, json=task.payload)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Failed to obtain centroids for block {task.block_idx}: {exc}") from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            f"Centroid service returned invalid JSON for block {task.block_idx}"
+        ) from exc
+
+    infer_features = payload.get("features", [])
+    if not isinstance(infer_features, list):
+        raise RuntimeError(
+            "Centroid service returned malformed payload: 'features' must be a list"
+        )
+
+    return infer_features
+
+
+async def _gather_centroid_tasks(
+    tasks: List[_BlockInferenceTask],
+    endpoint: str,
+    timeout: float,
+) -> List[List[Dict[str, Any]]]:
+    """Execute centroid requests concurrently and collect responses."""
+
+    if not tasks:
+        return []
+
+    timeout_value = timeout if timeout and timeout > 0 else None
+    timeout_config = httpx.Timeout(timeout_value)
+    async with httpx.AsyncClient(timeout=timeout_config) as client:
+        async_tasks = [
+            asyncio.create_task(_call_centroid_service(client, endpoint, task))
+            for task in tasks
+        ]
+        return await asyncio.gather(*async_tasks)
 
 
 def build_rings(block: Polygon) -> Tuple[Any, Any, Any]:
@@ -289,7 +351,10 @@ def main():
     ap.add_argument("--out-epsg", type=int, default=32636)
     ap.add_argument("--grid-size", type=float, default=15.0,
                     help="Размер стороны квадрата сетки в метрах")
-    ap.add_argument("--temp-dir", default=None)
+    ap.add_argument("--centroid-service-url", default="http://localhost:8000",
+                    help="Базовый URL сервиса генерации центроидов")
+    ap.add_argument("--centroid-service-timeout", type=float, default=120.0,
+                    help="Таймаут запроса к сервису центроидов, сек")
     args = ap.parse_args()
 
     blocks = read_geojson(args.blocks)
@@ -299,10 +364,10 @@ def main():
     services_vocab = load_services_vocab_from_artifacts(args.model_ckpt)
     service_keys = pick_service_keys(services_vocab)
 
+    block_tasks: List[_BlockInferenceTask] = []
     out_centroids_features: List[Dict[str, Any]] = []
 
-    temp_root = Path(args.temp_dir or "./_infer_tmp")
-    temp_root.mkdir(parents=True, exist_ok=True)
+    service_endpoint = urljoin(args.centroid_service_url.rstrip("/") + "/", "centroids")
 
     for bi, feat in enumerate(tqdm(features, desc="blocks")):
         geom = shape(feat.get("geometry"))
@@ -327,45 +392,57 @@ def main():
         elif zone_label in la_by_zone:
             la_target = la_by_zone[zone_label].get("la")
 
-        in_path = temp_root / f"block_{bi:05d}_in.geojson"
-        out_path = temp_root / f"block_{bi:05d}_out.geojson"
-        write_geojson(str(in_path), {
-            "type": "FeatureCollection",
-            "features": [feat],
-        })
+        feat_payload = dict(feat)
+        feat_payload_props = dict(feat_payload.get("properties") or {})
+        feat_payload_props.setdefault(args.zone_attr, zone_label)
+        feat_payload["properties"] = feat_payload_props
 
-        cmd = [
-            sys.executable,
-            args.train_script,
-            "--mode", "infer",
-            "--model-ckpt", args.model_ckpt,
-            "--infer-geojson-in", str(in_path),
-            "--infer-out", str(out_path),
-            "--infer-knn", str(args.infer_knn),
-            "--infer-e-thr", str(args.infer_e_thr),
-            "--infer-il-thr", str(args.infer_il_thr),
-            "--infer-sv1-thr", str(args.infer_sv1_thr),
-            "--infer-slots", str(infer_slots),
-            "--zone", str(zone_label),
-        ]
+        request_payload: Dict[str, Any] = {
+            "train_script": args.train_script,
+            "model_ckpt": args.model_ckpt,
+            "zone_attr": args.zone_attr,
+            "zone_label": str(zone_label),
+            "request_id": f"block-{block_idx}",
+            "feature": feat_payload,
+            "infer_params": {
+                "slots": int(infer_slots),
+                "knn": int(args.infer_knn),
+                "e_thr": float(args.infer_e_thr),
+                "il_thr": float(args.infer_il_thr),
+                "sv1_thr": float(args.infer_sv1_thr),
+            },
+        }
         if args.config:
-            cmd.extend(["--config", args.config])
+            request_payload["config"] = args.config
         if args.device:
-            cmd.extend(["--device", args.device])
+            request_payload["device"] = args.device
         if services_target:
-            cmd.extend(["--services-target", json_dumps(services_target)])
+            request_payload["services_target"] = services_target
         if la_target is not None:
-            cmd.extend(["--la-target", str(la_target)])
+            request_payload["la_target"] = la_target
         if floors_avg is not None:
-            cmd.extend(["--floors-avg", str(floors_avg)])
+            request_payload["floors_avg"] = floors_avg
 
-        subprocess.run(cmd, check=True)
-        infer_out = read_geojson(str(out_path))
+        block_tasks.append(
+            _BlockInferenceTask(
+                block_idx=block_idx,
+                zone_label=str(zone_label),
+                geometry=geom,
+                payload=request_payload,
+            )
+        )
 
+        centroid_batches: List[List[Dict[str, Any]]] = []
+    if block_tasks:
+        centroid_batches = asyncio.run(
+            _gather_centroid_tasks(block_tasks, service_endpoint, args.centroid_service_timeout)
+        )
+
+    for task, infer_features in zip(block_tasks, centroid_batches):
         centroids_raw: List[Point] = []
         cprops_raw: List[Dict[str, Any]] = []
         infer_uid = 0
-        for block in infer_out.get("features", []):
+        for block in infer_features:
             try:
                 g = shape(block.get("geometry"))
             except Exception:
@@ -380,8 +457,8 @@ def main():
             if g.geom_type != "Polygon" or g.area <= 0:
                 continue
             raw_props = dict(block.get("properties") or {})
-            raw_props.setdefault(args.zone_attr, zone_label)
-            raw_props.setdefault("_source_block_index", block_idx)
+            raw_props.setdefault(args.zone_attr, task.zone_label)
+            raw_props.setdefault("_source_block_index", task.block_idx)
             infer_uid += 1
             raw_props["infer_fid"] = infer_uid
             centroids_raw.append(g.centroid)
@@ -393,7 +470,7 @@ def main():
         merged_points = list(centroids_raw)
         merged_props = list(cprops_raw)
 
-        ring1, ring2, midline = build_rings(geom)
+        ring1, ring2, midline = build_rings(task.geometry)
         mid_lines = lines_of(midline)
 
         moved_points: List[Point] = []
@@ -445,15 +522,6 @@ def main():
         grid.to_file('grid.geojson')
         service_territories.to_file('service_territories.geojson')
         buildings.to_file('buildings.geojson')
-
-def json_dumps(obj: Any) -> str:
-    try:
-        import json
-
-        return json.dumps(obj)
-    except Exception:  # pragma: no cover
-        raise
-
 
 if __name__ == "__main__":  # pragma: no cover
     main()
